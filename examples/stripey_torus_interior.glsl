@@ -1,3 +1,5 @@
+#!/usr/bin/env -S python -m shaderbang.shadertoy
+
 // Copied from https://www.shadertoy.com/view/MsX3Wj
 // Created by https://www.shadertoy.com/user/fb39ca4
 

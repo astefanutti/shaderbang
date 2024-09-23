@@ -1,4 +1,4 @@
-// python glsl.py tests/mouse.glsl
+#!/usr/bin/env -S python -m shaderbang.shadertoy
 
 // Created by inigo quilez - iq/2013
 // https://www.youtube.com/c/InigoQuilez

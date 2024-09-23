@@ -1,4 +1,4 @@
-// python glsl.py examples/starry_landscape.glsl -v iChannel0 presets/vol_grey_noise_3D.bin
+#!/usr/bin/env -S python -m shaderbang.shadertoy -v iChannel0 presets/vol_grey_noise_3D.bin
 
 // Copied from https://www.shadertoy.com/view/WlGGRV
 // Created by https://www.shadertoy.com/user/Klems
