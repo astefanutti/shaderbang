@@ -43,9 +43,7 @@
 #define MIN3( A, B, C ) ((A) < (B) ? MIN2(A, C) : MIN2(B, C))
 #define MAX3( A, B, C ) ((A) > (B) ? MAX2(A, C) : MAX2(B, C))
 
-static inline unsigned
-u_minify(unsigned value, unsigned levels)
-{
+static inline unsigned u_minify(unsigned value, unsigned levels) {
 	return MAX2(1, value >> levels);
 }
 
@@ -116,6 +114,17 @@ struct options {
 	unsigned int frames;
 };
 
+typedef int (*onInitCallback)(unsigned int width, unsigned int height);
+typedef int (*onRenderCallback)(uint64_t frame, float time);
+
+typedef struct {
+	void (**callbacks)();
+	size_t length;
+} Callbacks;
+
+int callInitCallbacks(unsigned int width, unsigned int height);
+int callRenderCallbacks(uint64_t frame, float time);
+
 struct gbm {
 	const struct drm *drm;
 	struct gbm_device *dev;
@@ -169,11 +178,10 @@ struct egl {
 	EGLuint64KHR *modifiers;
 	EGLint num_modifiers;
 
-	void (*draw)(uint64_t start_time, unsigned frame);
+	int (*draw)(uint64_t start_time, unsigned frame);
 };
 
-static inline int __egl_check(void *ptr, const char *name)
-{
+static inline int __egl_check(void *ptr, const char *name) {
 	if (!ptr) {
 		printf("no %s\n", name);
 		return -1;
@@ -188,6 +196,7 @@ const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfa
 int create_program(const char *vs_src, const char *fs_src);
 int link_program(unsigned program);
 
+int init_shaderbang(const struct gbm *gbm, struct egl *egl);
 int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *shadertoy);
 
 void init_perfcntrs(const struct egl *egl, const char *perfcntrs);

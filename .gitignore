@@ -3,5 +3,7 @@
 glsl
 
 __pycache__/
-.venv
+.venv/
 venv/
+
+.idea/

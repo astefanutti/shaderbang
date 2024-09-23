@@ -30,6 +30,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <regex.h>
 #include <stdlib.h>
 
@@ -139,7 +140,7 @@ static const char *load_shader(const char *file) {
 	return mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 }
 
-#define GLSL_VERSION_REGEX "GLSL[[:space:]]*(ES)?[[:space:]]*([[:digit:]]+)\\.([[:digit:]]+)"
+#define GLSL_VERSION_REGEX "(GLSL[[:space:]]*(ES)?[[:space:]]*)?([[:digit:]]+)\\.([[:digit:]]+)"
 
 static char *extract_group(const char *str, regmatch_t group) {
 	char *c = calloc(group.rm_eo - group.rm_so, sizeof(char));
@@ -161,7 +162,7 @@ static char *glsl_version() {
 		return version;
 	}
 
-	size_t nGroups = 4;
+	size_t nGroups = 5;
 	regmatch_t groups[nGroups];
 	ret = regexec(&regex, glsl_version, nGroups, groups, 0);
 	if (ret == REG_NOMATCH) {
@@ -169,9 +170,9 @@ static char *glsl_version() {
 	} else if (ret != 0) {
 		err(ret, "failed to match GLSL version '%s'", glsl_version);
 	} else {
-		char *es = extract_group(glsl_version, groups[1]);
-		char *major = extract_group(glsl_version, groups[2]);
-		char *minor = extract_group(glsl_version, groups[3]);
+		char *es = extract_group(glsl_version, groups[2]);
+		char *major = extract_group(glsl_version, groups[3]);
+		char *minor = extract_group(glsl_version, groups[4]);
 
 		if (strcmp(minor, "0") == 0) {
 			free(minor);
@@ -193,60 +194,32 @@ static char *glsl_version() {
 	return version;
 }
 
-typedef void (*onInitCallback)(uint program, uint width, uint height);
-typedef void (*onRenderCallback)(uint64_t frame, float time);
-
-typedef struct {
-	void (**callbacks)();
-	size_t length;
-} Callbacks;
-
-void addCallback(Callbacks *callbacks, void callback()) {
-	if (!callbacks->callbacks) {
-		callbacks->length = 1;
-		callbacks->callbacks = malloc(sizeof(callbacks->callbacks));
-		callbacks->callbacks[0] = callback;
-	} else {
-		callbacks->length++;
-		callbacks->callbacks = realloc(callbacks->callbacks, callbacks->length * sizeof(callbacks->callbacks));
-		callbacks->callbacks[callbacks->length - 1] = callback;
-	}
-}
-
-Callbacks onInitCallbacks;
-void onInit(onInitCallback callback) {
-	addCallback(&onInitCallbacks, (void (*)) callback);
-}
-
-Callbacks onRenderCallbacks;
-void onRender(onRenderCallback callback) {
-	addCallback(&onRenderCallbacks, (void (*)) callback);
-}
-
-static void draw_shadertoy(uint64_t start_time, unsigned frame) {
-	float time = ((float) (get_time_ns() - start_time)) / NSEC_PER_SEC;
+static int render_shadertoy(uint64_t start_time, unsigned frame) {
+	const float time = (float) (get_time_ns() - start_time) / NSEC_PER_SEC;
 
 	glUniform1f(iTime, time);
 	// Replace the above to input elapsed time relative to 60 FPS
 	// glUniform1f(iTime, (GLfloat) frame / 60.0f);
 	glUniform1ui(iFrame, frame);
 
-	for (uint i = 0; i < onRenderCallbacks.length; i++) {
-		((onRenderCallback) onRenderCallbacks.callbacks[i])(frame, time);
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	int ret = callRenderCallbacks(frame, time);
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+	if (ret) {
+		return -1;
 	}
 
 	start_perfcntrs();
-
 	glDrawArrays(GL_TRIANGLES, 0, 6);
-
 	end_perfcntrs();
+
+	return 0;
 }
 
 int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 	int ret;
 	char *shadertoy_vs, *shadertoy_fs;
-	GLuint program, vbo;
-	GLint iResolution;
+	GLuint vbo;
 
 	const char *shader = load_shader(file);
 
@@ -276,7 +249,7 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 		return -1;
 	}
 
-	program = ret;
+	const GLuint program = ret;
 
 	ret = link_program(program);
 	if (ret) {
@@ -289,11 +262,13 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 
 	iTime = glGetUniformLocation(program, "iTime");
 	iFrame = glGetUniformLocation(program, "iFrame");
-	iResolution = glGetUniformLocation(program, "iResolution");
+	const GLint iResolution = glGetUniformLocation(program, "iResolution");
 	glUniform3f(iResolution, gbm->width, gbm->height, 0);
 
-	for (uint i = 0; i < onInitCallbacks.length; i++) {
-		((onInitCallback) onInitCallbacks.callbacks[i])(program, gbm->width, gbm->height);
+	ret = callInitCallbacks(gbm->width, gbm->height);
+	if (ret) {
+		printf("failed to init callbacks\n");
+		return -1;
 	}
 
 	glGenBuffers(1, &vbo);
@@ -303,7 +278,7 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *) (intptr_t) 0);
 	glEnableVertexAttribArray(0);
 
-	egl->draw = draw_shadertoy;
+	egl->draw = render_shadertoy;
 
 	return 0;
 }

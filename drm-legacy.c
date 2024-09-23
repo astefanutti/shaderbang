@@ -101,7 +101,10 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 			glBindFramebuffer(GL_FRAMEBUFFER, egl->fbs[frame % NUM_BUFFERS].fb);
 		}
 
-		egl->draw(start_time, i++);
+		ret = egl->draw(start_time, i++);
+		if (ret) {
+			return -1;
+		}
 
 		/* Block until all the buffered GL operations are completed.
 		 * This is required on NVIDIA GPUs, for which the DRM drivers
@@ -144,10 +147,12 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 				if (ret < 0) {
 					printf("select err: %s\n", strerror(errno));
 					return ret;
-				} else if (ret == 0) {
+				}
+				if (ret == 0) {
 					printf("select timeout!\n");
 					return -1;
-				} else if (FD_ISSET(0, &fds)) {
+				}
+				if (FD_ISSET(0, &fds)) {
 					printf("user interrupted!\n");
 					return 0;
 				}

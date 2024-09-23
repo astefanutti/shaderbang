@@ -39,7 +39,7 @@ class INotify(FileIO):
     def rm_watch(self, wd):
         _libc.inotify_rm_watch(self.fileno(), wd)
 
-    def read(self, timeout=None) -> [Event]:
+    def read(self, timeout=None) -> list[Event]:
         data = self._readall()
         if not data and timeout != 0 and self._poller.poll(timeout):
             data = self._readall()

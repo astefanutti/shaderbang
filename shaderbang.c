@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+* Copyright © 2024 Antonin Stefanutti <antonin.stefanutti@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -21,17 +21,23 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef _GLSL_H
-#define _GLSL_H
+#include <pthread.h>
+#include <stdio.h>
 
 #include "common.h"
 
-extern int init(const char *shadertoy, const struct options *options);
-extern int run();
-extern int join();
-extern void stop();
+static int render_shaderbang(uint64_t start_time, unsigned frame) {
+	float time = ((float) (get_time_ns() - start_time)) / NSEC_PER_SEC;
 
-extern void onInit(int callback(uint width, uint height));
-extern void onRender(int callback(uint64_t frame, float time));
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	int ret = callRenderCallbacks(frame, time);
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
-#endif /* _GLSL_H */
+	return ret;
+}
+
+int init_shaderbang(const struct gbm *gbm, struct egl *egl) {
+	egl->draw = render_shaderbang;
+
+	return callInitCallbacks(gbm->width, gbm->height);
+}
