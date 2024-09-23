@@ -1,150 +1,188 @@
-# KMS GLSL
+# Shaderbang
 
-KMS GLSL is a command line tool that runs OpenGL fragment shaders, using the [DRM/KMS Linux kernel subsystem](https://en.wikipedia.org/wiki/Direct_Rendering_Manager).
-It runs shaders fullscreen, and does not require any windowing system, like X or Wayland.
+Shaderbang is a Python toolkit for OpenGL rendering using [DRM/KMS](https://en.wikipedia.org/wiki/Direct_Rendering_Manager) on Linux.
+It renders fullscreen without requiring any windowing system, like X or Wayland, making it ideal for embedded systems and headless environments.
+It is compatible with shaders from [Shadertoy](https://www.shadertoy.com), and can be used as a library to build interactive applications.
 
-It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi).
-However, it works with any GPU and display controller hardware, provided a DRM/KMS driver is available, like on the [Jetson Nano](https://ttt.io/glsl-jetson-nano).
-Examples of configuration, where it's been reported to run successfully on, are listed in the [compatibility](#compatibility) section.
+It supports hot-pluggable input devices — keyboard, mouse, touchscreen, and trackpad — via [evdev](https://docs.kernel.org/input/input.html#evdev) for interactive rendering.
+Shader files can be made directly executable with [shebangs](#shebangs), and Python scripts can embed their dependencies inline as [single-file scripts](#single-file-scripts) using [PEP 723](https://peps.python.org/pep-0723/).
 
-In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
+It works with any GPU and display controller hardware, provided a DRM/KMS driver is available, from the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi) and [Jetson Nano](https://ttt.io/glsl-jetson-nano) to NVIDIA RTX desktop GPUs.
+More configurations are listed in the [compatibility](#compatibility) section.
+
+In the following picture, a [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
 
 ![A Shadertoy shader running on the Raspberry Pi 4](./raspberry_pi.jpg)
 
-[Another shader](https://www.shadertoy.com/view/fstyD4) that runs on the Jetson Nano in full HD resolution:
+[Another shader](https://www.shadertoy.com/view/fstyD4) running on the Jetson Nano in full HD resolution:
 
 ![A Shadertoy shader running on the Jetson Nano](./jetson_nano.jpg)
 
-## Build
+## Installation
 
-You need to clone the project, and run the following commands:
+### System dependencies
+
+Install the required DRM, GBM, EGL and OpenGL development libraries:
 
 ```shell
-$ sudo apt update
-# Install the build tools
-$ sudo apt install gcc make
-# Install the required DRM, GBM, EGL and OpenGL ES API headers
-$ sudo apt install libdrm-dev libgbm-dev libegl-dev libgles2-mesa-dev
-# Install the X C binding and RandR extension header / library files (optional)
-$ sudo apt install libxcb-randr0-dev
-# Build the glsl binary and library
-$ make
+sudo apt install gcc libdrm-dev libgbm-dev libegl-dev libgles2-mesa-dev
+```
+
+Optionally, install X RandR for display lease support:
+
+```shell
+sudo apt install libxcb-randr0-dev
+```
+
+### Install
+
+```shell
+pip install shaderbang
+```
+
+### Install from source
+
+For development, clone the repository and use an editable install:
+
+```shell
+pip install -e .
+```
+
+The `Makefile` can be used to quickly rebuild the native library during C development:
+
+```shell
+make
+```
+
+### Input device permissions
+
+To handle input devices ([evdev](https://docs.kernel.org/input/input.html#evdev) events) without running as root:
+
+```shell
+sudo adduser $USER input
 ```
 
 ## Usage
 
-Once you've successfully built the binary / library, you can either run it directly, or use the Python wrapper, that adds a layer for managing shader inputs, that you can also extend to add your own custom inputs.
+Shaderbang provides the `shadertoy` command to run [Shadertoy](https://www.shadertoy.com) shaders:
 
-### Native
-
-```console
-$ ./glsl -h
-Usage: ./glsl [-aACDfmnpvx] <shader_file>
-
-options:
-    -a, --async              use async page flipping
-    -A, --atomic             use atomic mode setting and fencing
-    -C, --connector=ID       use the connector with the provided ID (see drm_info)
-    -D, --device=DEVICE      use the given device
-    -f, --format=FOURCC      framebuffer format
-    -h, --help               print usage
-    -m, --modifier=MODIFIER  hardcode the selected modifier
-    -n, --frames=N           run for the given number of frames and exit
-    -p, --perfcntr=LIST      sample specified performance counters using
-                             the AMD_performance_monitor extension (comma
-                             separated list)
-    -v, --vmode=VMODE        specify the video mode in the format
-                             <mode>[-<vrefresh>]
-    -x, --surfaceless        use surfaceless mode, instead of GBM surface
+```
+shadertoy [-h] [--async-page-flip] [--atomic-drm-mode] [-C CONNECTOR]
+          [-D DEVICE] [--mode MODE] [--refresh FREQ] [-n N]
+          [-k UNIFORM] [--touchscreen UNIFORM] [--trackpad UNIFORM]
+          [-c UNIFORM FILE] [-t UNIFORM FILE] [-v UNIFORM FILE]
+          [-m <UNIFORM>.KEY VALUE]
+          FILE
 ```
 
-> [!NOTE]
-> [Shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
+<details>
+<summary>Arguments</summary>
 
-You can try it with the shaders available in the `examples` directory, e.g.:
-
-```shell
-$ ./glsl examples/costal_landscape.glsl
 ```
-
-Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
-You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
-Note the shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
-
-No inputs can be provided using the native CLI directly.
-You can use the Python wrapper, that adds a layer around the native library for managing shader inputs, as explained below.
-
-### Python
-
-```console
-$ python glsl.py -h
-usage: glsl.py [-h] [--async-page-flip | --no-async-page-flip]
-               [--atomic-drm-mode | --no-atomic-drm-mode] [-C CONNECTOR]
-               [-D DEVICE] [--mode MODE] [-n N] [-k UNIFORM]
-               [--touchscreen UNIFORM] [--trackpad UNIFORM] [-c UNIFORM FILE]
-               [-t UNIFORM FILE] [-v UNIFORM FILE] [-m <UNIFORM>.KEY VALUE]
-               FILE
-
-Run OpenGL shaders using DRM/KMS
-
-positional arguments:
-  FILE                  the shader file
-
-options:
+  FILE                  the shadertoy file
   -h, --help            show this help message and exit
   --async-page-flip, --no-async-page-flip
                         use async page flipping
   --atomic-drm-mode, --no-atomic-drm-mode
-                        use atomic mode setting and fencing
+                        use atomic mode setting
   -C CONNECTOR, --connector CONNECTOR
                         the DRM connector
   -D DEVICE, --device DEVICE
                         the DRM device
-  --mode MODE           specify the video mode in the format
-                        <resolution>[-<vrefresh>]
-  -n N, --frames N      run for the given number of frames and exit
+  --mode MODE           the name of the video mode, e.g., 1920x1080
+  --refresh FREQ        the vertical refresh rate in Hz
+  -n N, --frames N      run for N frames and exit
   -k UNIFORM, --keyboard UNIFORM
-                        add keyboard
+                        add a keyboard
   --touchscreen UNIFORM
-                        add touchscreen device
-  --trackpad UNIFORM    add trackpad device
+                        add a touchscreen
+  --trackpad UNIFORM    add a trackpad
   -c UNIFORM FILE, --cubemap UNIFORM FILE
-                        add cubemap
+                        add a cubemap
   -t UNIFORM FILE, --texture UNIFORM FILE
-                        add texture
+                        add a texture
   -v UNIFORM FILE, --volume UNIFORM FILE
-                        add volume
+                        add a volume
   -m <UNIFORM>.KEY VALUE, --metadata <UNIFORM>.KEY VALUE
                         set uniform metadata
 ```
 
-> [!NOTE]
-> Python 3.10+ is required.
+</details>
 
-You'll have to install the required dependencies once, e.g., with [venv](https://docs.python.org/3.10/library/venv.html):
-
-```shell
-$ python -m venv .venv
-$ source .venv/bin/activate
-$ pip install libevdev pillow
-```
-
-You may also want to be in the `input` group, so `/dev/input/eventX` devices can be open to handle [evdev](https://docs.kernel.org/input/input.html#evdev) events, without running as root, e.g.:
+### Examples
 
 ```shell
-$ sudo adduser $USER input
+# Basic shader
+shadertoy examples/costal_landscape.glsl
+
+# With a texture
+shadertoy examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
 ```
 
-You can then try it with the shaders available in the `examples` directory, e.g.:
+You can also run it as a Python module:
 
 ```shell
-$ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
+python -m shaderbang.shadertoy examples/plasma_globe.glsl
 ```
 
-Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
+Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit.
 You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
 
-If you want to add your own inputs, you can find the documentation and some examples in the `glsl.py` file.
+### Shebangs
+
+Shader files can be made directly executable by adding a shebang line, e.g., in `examples/plasma_globe.glsl`:
+
+```glsl
+#!/usr/bin/env -S python -m shaderbang.shadertoy -t iChannel0 presets/tex_RGBA_noise_medium.png
+```
+
+Then simply run the shader file:
+
+```shell
+./examples/plasma_globe.glsl
+```
+
+### Single-file scripts
+
+Python scripts that depend on Shaderbang can embed their dependencies inline using [PEP 723](https://peps.python.org/pep-0723/), so they run without any prior installation.
+For example, [`examples/cloth.py`](examples/cloth.py) declares its dependencies in a `# /// script` block:
+
+```python
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "shaderbang",
+#     "pyopengl",
+#     "warp-lang",
+# ]
+# ///
+```
+
+Combined with a shebang, the script becomes directly executable with [uv](https://docs.astral.sh/uv/):
+
+```shell
+uv run examples/cloth.py
+```
+
+This also works with remote URLs, without cloning the repository:
+
+```shell
+uv run https://raw.githubusercontent.com/astefanutti/shaderbang/main/examples/cloth.py
+```
+
+### Input devices
+
+Mouse and keyboard devices are automatically detected.
+Touchscreen and trackpad devices require explicit uniform mapping via the `--touchscreen` and `--trackpad` options.
+
+Input devices are hot-pluggable: connecting or disconnecting a device at runtime is handled automatically.
+
+## Library
+
+Shaderbang can be used as a library to build custom rendering applications.
+The `Input` class is the main extension point: subclass it to define custom rendering logic, input handling, or simulation.
+
+See [`examples/cloth.py`](examples/cloth.py) for a complete example that builds a GPU-accelerated cloth simulation using [NVIDIA Warp](https://github.com/NVIDIA/warp) on top of Shaderbang.
 
 ## Compatibility
 
@@ -159,14 +197,8 @@ It's been reported to run successfully on the following configurations:
 | Raspberry Pi Zero W (Broadcom VideoCore IV) | Raspberry Pi OS 2022-09, Linux 5.15        | Mesa VC4 V3D 19.3.2     | 05/2023 |
 | Raspberry Pi 3B+ (Broadcom VideoCore IV)    | Raspberry Pi OS Lite 2020-12, Linux 5.4.79 | Mesa VC4 V3D 19.3.2     | 08/2021 |
 
-## Roadmap
-
-- Add support for texture buffers
-- Add support for audio / video inputs
-- Parse GLSL files to retrieve uniforms metadata
-
 ## Credits
 
-The DRM/KMS ceremony code is copied from [kmscube](https://gitlab.freedesktop.org/mesa/kmscube/).
+The DRM/KMS boilerplate code is based on [kmscube](https://gitlab.freedesktop.org/mesa/kmscube/).
 
 The shader examples are copied from the [Shadertoy](https://www.shadertoy.com) website URLs commented at the top of each file.

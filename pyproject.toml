@@ -1,0 +1,25 @@
+[project]
+name = "shaderbang"
+dynamic = ["version"]
+dependencies = [
+    "libevdev",
+]
+requires-python = ">=3.10"
+authors = [
+    { name = "Antonin Stefanutti" },
+]
+description = "A Python toolkit for OpenGL rendering with EGL/DRM/KMS"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.urls]
+GitHub = "https://github.com/astefanutti/shaderbang"
+
+[project.scripts]
+shadertoy = "shaderbang.shadertoy.__main__:main"
+
+[build-system]
+requires = ["setuptools>=75.3.2", "build", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.cibuildwheel]
