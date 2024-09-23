@@ -1,4 +1,4 @@
-// python glsl.py tests/touch.glsl --trackpad iTouch
+// python shadertoy.py tests/touch.glsl --trackpad iTouch
 
 // Created by inigo quilez - iq/2013
 // https://www.youtube.com/c/InigoQuilez

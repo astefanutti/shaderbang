@@ -144,10 +144,12 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 				if (ret < 0) {
 					printf("select err: %s\n", strerror(errno));
 					return ret;
-				} else if (ret == 0) {
+				}
+				if (ret == 0) {
 					printf("select timeout!\n");
 					return -1;
-				} else if (FD_ISSET(0, &fds)) {
+				}
+				if (FD_ISSET(0, &fds)) {
 					printf("user interrupted!\n");
 					return 0;
 				}

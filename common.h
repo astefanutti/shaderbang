@@ -116,6 +116,17 @@ struct options {
 	unsigned int frames;
 };
 
+typedef void (*onInitCallback)(unsigned int width, unsigned int height);
+typedef void (*onRenderCallback)(uint64_t frame, float time);
+
+typedef struct {
+	void (**callbacks)();
+	size_t length;
+} Callbacks;
+
+void callInitCallbacks(unsigned int width, unsigned int height);
+void callRenderCallbacks(uint64_t frame, float time);
+
 struct gbm {
 	const struct drm *drm;
 	struct gbm_device *dev;
@@ -188,6 +199,7 @@ const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfa
 int create_program(const char *vs_src, const char *fs_src);
 int link_program(unsigned program);
 
+int init_shaderbang(const struct gbm *gbm, struct egl *egl);
 int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *shadertoy);
 
 void init_perfcntrs(const struct egl *egl, const char *perfcntrs);

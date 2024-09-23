@@ -7,12 +7,12 @@ import os
 import stat
 
 from contextlib import ExitStack
-from inotify import INotify, IN_CREATE, IN_ATTRIB
-from input import *
+from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
+from shaderbang.shadertoy import *
 from lib import options
 from libevdev import *
 from signal import pthread_sigmask, pthread_kill, sigwait
-from threading import main_thread
+from threading import main_thread, Thread
 
 '''
 """
@@ -28,26 +28,24 @@ Example #1:
 class Variable(Input):
     value = 0
 
-    def init(self, program, width, height):
+    def init(self, width, height):
         """
         This method is called once after the program has been set up,
         before the rendering starts. It can be used to further initialise
         the input, using the `glsl` variable, that exposes OpenGL ES APIs.
 
         Args:
-          program:
-            The handle to the current program object.
           width:
             The width of the viewport.
           height:
             The height of the viewport.
         """
-        super().init(program, width, height)
+        super().init(width, height)
 
     def render(self, frame, time):
         """
         This method is called for every frame. It can be used to update
-        the rendering state, using the `glsl` variable, that exposes OpenGL ES APIs.
+        the rendering state.
 
         Args:
           frame:
@@ -80,16 +78,14 @@ vAux0 = 0
 vAux1 = [0] * 4
 
 
-@CFUNCTYPE(None, c_uint, c_uint, c_uint)
-def init(program, width, height):
+@CFUNCTYPE(None, c_uint, c_uint)
+def init(width, height):
     """
     This function is called once after the program has been set up,
     before the rendering starts. It can be used to further initialise
     the program, using the `glsl` variable, that exposes OpenGL ES APIs.
 
     Args:
-      program:
-        The handle to the current program object.
       width:
         The width of the viewport.
       height:
@@ -186,6 +182,7 @@ def input_from_device(dev: Device):
         # Touchscreen
         # Only consider direct input devices, like touchscreens and drawing tablets, see:
         # https://www.kernel.org/doc/Documentation/input/event-codes.txt
+        # TODO: keep the touchscreen device that's the same as the display device
         Touchscreen(args.touchscreen if args.touchscreen else 'iTouchscreen', dev)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
         # Trackpad

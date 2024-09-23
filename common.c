@@ -169,9 +169,7 @@ static int match_config_to_visual(EGLDisplay egl_display,
                                   EGLConfig *configs,
                                   int count)
 {
-	int i;
-
-	for (i = 0; i < count; ++i) {
+	for (int i = 0; i < count; ++i) {
 		EGLint id;
 
 		if (!eglGetConfigAttrib(egl_display,
@@ -179,26 +177,26 @@ static int match_config_to_visual(EGLDisplay egl_display,
 				&id))
 			continue;
 
-		if (id == visual_id)
+		if (id == visual_id) {
 			return i;
+		}
 	}
 
 	return -1;
 }
 
-static bool egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
-                              EGLint visual_id, EGLConfig *config_out)
+static bool egl_choose_config(const EGLDisplay egl_display, const EGLint *attribs,
+                              const EGLint visual_id, EGLConfig *config_out)
 {
 	EGLint count = 0;
 	EGLint matched = 0;
-	EGLConfig *configs;
 	int config_index = -1;
 
 	if (!eglGetConfigs(egl_display, NULL, 0, &count) || count < 1) {
 		printf("No EGL configs to choose from.\n");
 		return false;
 	}
-	configs = malloc(count * sizeof *configs);
+	EGLConfig *configs = malloc(count * sizeof *configs);
 	if (!configs)
 		return false;
 
@@ -392,21 +390,6 @@ const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfa
 {
 	EGLint major, minor;
 
-	static const EGLint context_attribs[] = {
-		EGL_CONTEXT_CLIENT_VERSION, 2,
-		EGL_NONE
-	};
-
-	const EGLint config_attribs[] = {
-		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-		EGL_RED_SIZE, 1,
-		EGL_GREEN_SIZE, 1,
-		EGL_BLUE_SIZE, 1,
-		EGL_ALPHA_SIZE, 0,
-		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-		EGL_NONE
-	};
-
 	const char *egl_exts_client, *egl_exts_dpy, *gl_exts;
 
 	int res;
@@ -462,16 +445,45 @@ const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfa
 	printf("  vendor: \"%s\"\n", eglQueryString(egl.display, EGL_VENDOR));
 	printf("===================================\n");
 
-	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		printf("Failed to bind EGL_OPENGL_ES_API\n");
+	if (!eglBindAPI(EGL_OPENGL_API)) {
+		printf("Failed to bind EGL_OPENGL_API\n");
 		return NULL;
 	}
+
+	const EGLint config_attribs[] = {
+		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+		EGL_CONFORMANT, EGL_OPENGL_BIT,
+		EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+		EGL_COLOR_BUFFER_TYPE, EGL_RGB_BUFFER,
+
+		EGL_RED_SIZE, 8,
+		EGL_GREEN_SIZE, 8,
+		EGL_BLUE_SIZE, 8,
+		EGL_DEPTH_SIZE, 24,
+		EGL_STENCIL_SIZE, 8,
+
+		//EGL_RED_SIZE, 1,
+		//EGL_GREEN_SIZE, 1,
+		//EGL_BLUE_SIZE, 1,
+		//EGL_ALPHA_SIZE, 0,
+
+		EGL_NONE
+	};
 
 	if (!egl_choose_config(egl.display, config_attribs, gbm->format,
 			&egl.config)) {
 		printf("Failed to choose EGL config\n");
 		return NULL;
 	}
+
+	static const EGLint context_attribs[] = {
+		//EGL_CONTEXT_CLIENT_VERSION, 5,
+		EGL_CONTEXT_MAJOR_VERSION, 4,
+		EGL_CONTEXT_MINOR_VERSION, 5,
+		//EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+		EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
+		EGL_NONE
+	};
 
 	egl.context = eglCreateContext(egl.display, egl.config,
 			EGL_NO_CONTEXT, context_attribs);
@@ -521,7 +533,7 @@ const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfa
 	eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context);
 
 	gl_exts = (char *) glGetString(GL_EXTENSIONS);
-	printf("OpenGL ES 2.x information:\n");
+	printf("OpenGL information:\n");
 	printf("  version: \"%s\"\n", glGetString(GL_VERSION));
 	printf("  shading language version: \"%s\"\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
 	printf("  vendor: \"%s\"\n", glGetString(GL_VENDOR));
@@ -649,4 +661,39 @@ uint64_t get_time_ns(void)
 	struct timespec tv;
 	clock_gettime(CLOCK_MONOTONIC, &tv);
 	return tv.tv_nsec + tv.tv_sec * NSEC_PER_SEC;
+}
+
+Callbacks onInitCallbacks;
+Callbacks onRenderCallbacks;
+
+void addCallback(Callbacks *callbacks, void callback()) {
+	if (!callbacks->callbacks) {
+		callbacks->length = 1;
+		callbacks->callbacks = malloc(sizeof(callbacks->callbacks));
+		callbacks->callbacks[0] = callback;
+	} else {
+		callbacks->length++;
+		callbacks->callbacks = realloc(callbacks->callbacks, callbacks->length * sizeof(callbacks->callbacks));
+		callbacks->callbacks[callbacks->length - 1] = callback;
+	}
+}
+
+void onInit(const onInitCallback callback) {
+	addCallback(&onInitCallbacks, (void (*)) callback);
+}
+
+void onRender(const onRenderCallback callback) {
+	addCallback(&onRenderCallbacks, (void (*)) callback);
+}
+
+void callInitCallbacks(const unsigned int width, const unsigned int height) {
+	for (uint i = 0; i < onInitCallbacks.length; i++) {
+		((onInitCallback) onInitCallbacks.callbacks[i])(width, height);
+	}
+}
+
+void callRenderCallbacks(const uint64_t frame, const float time) {
+	for (uint i = 0; i < onRenderCallbacks.length; i++) {
+		((onRenderCallback) onRenderCallbacks.callbacks[i])(frame, time);
+	}
 }

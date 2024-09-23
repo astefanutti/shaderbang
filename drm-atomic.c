@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -193,10 +194,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 		glFinish();
 
 		if (gbm->surface) {
-			eglSwapBuffers(egl->display, egl->surface);
-		}
-
-		if (gbm->surface) {
+		    eglSwapBuffers(egl->display, egl->surface);
 			next_bo = gbm_surface_lock_front_buffer(gbm->surface);
 		} else {
 			next_bo = gbm->bos[frame % NUM_BUFFERS];

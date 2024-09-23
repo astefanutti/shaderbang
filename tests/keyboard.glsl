@@ -1,4 +1,4 @@
-// python glsl.py tests/keyboard.glsl -k iChannel1 -t iChannel0 presets/tex_font_01.png -m iChannel0.transpose FLIP_TOP_BOTTOM
+// python shadertoy.py tests/keyboard.glsl -k iChannel1 -t iChannel0 presets/tex_font_01.png -m iChannel0.transpose FLIP_TOP_BOTTOM
 
 // Copied from https://www.shadertoy.com/view/4dGyDm
 // Created by https://www.shadertoy.com/user/mattz
@@ -20,14 +20,12 @@ vec2 font_from_screen(vec2 tpos, float font_size, vec2 char_pos) {
 }
 
 vec3 sample_grad_dist(vec2 uv, float font_size) {
-
     vec3 grad_dist = (textureLod(iChannel0, uv, 0.).yzw - FONT_TEX_BIAS) * font_size;
 
     grad_dist.y = -grad_dist.y;
     grad_dist.xy = normalize(grad_dist.xy + 1e-5);
 
     return grad_dist;
-
 }
 
 const vec2 TABLE_RES = vec2(16, 16);
@@ -37,7 +35,6 @@ const vec2 TABLE_DIMS = TABLE_RES * CELL_DIMS;
 float MARGIN = 2.0;
 
 void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
-
     vec3 color = vec3(1);
 
     float scl = 1.0 / floor( iResolution.y / (TABLE_RES.y + MARGIN) );
@@ -48,7 +45,6 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
     float dbox = max(b.x, b.y);
 
     if (dbox < 0.) {
-
         vec2 cell = floor(p/CELL_DIMS);
 
         int keycode = int(cell.x) + int((15.-cell.y)*16.);
@@ -70,20 +66,16 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
         float i0 = (keycode >= 100 ? 1.0 : keycode >= 10 ? 1.5 : 2.0);
 
         for (int i=0; i<3; ++i) {
-
             int digit = keycode / place[i];
             keycode -= digit * place[i];
 
             if (digit > 0 || nonzero || i == 2) {
-
                 vec2 p0 = (cell + vec2(0.5 + (float(i)-i0)*0.3, 0.5))*CELL_DIMS;
                 vec2 uv = font_from_screen((p - p0), 1.0, vec2(digit, 12));
                 vec2 dbox = abs(p - p0) - 0.5;
                 dtext = min(dtext, max(max(dbox.x, dbox.y), sample_grad_dist(uv, 1.0).z));
                 nonzero = true;
-
             }
-
         }
 
         vec3 textcolor = ktex[2] ? vec3(0) : (ktex[1] || ktex[0]) ? vec3(1) : vec3(0.9);
@@ -99,7 +91,6 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord ) {
         vec2 p0 = floor(p/CELL_DIMS + 0.5)*CELL_DIMS;
         vec2 dp0 = abs(p - p0);
         dbox = min(abs(dbox), min(abs(dp0.x), abs(dp0.y)));
-
     }
 
     color *= smoothstep(0., scl, abs(dbox));

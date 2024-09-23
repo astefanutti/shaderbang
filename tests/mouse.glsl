@@ -1,4 +1,4 @@
-// python glsl.py tests/mouse.glsl
+// python shadertoy.py tests/mouse.glsl
 
 // Created by inigo quilez - iq/2013
 // https://www.youtube.com/c/InigoQuilez

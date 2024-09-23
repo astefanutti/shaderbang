@@ -145,13 +145,17 @@ int init(const char *shadertoy, const struct options *options) {
 		return -1;
 	}
 
-	ret = init_shadertoy(gbm, egl, shadertoy);
+	if (strlen(shadertoy)) {
+		ret = init_shadertoy(gbm, egl, shadertoy);
+	} else {
+		ret = init_shaderbang(gbm, egl);
+	}
 	if (ret < 0) {
 		return -1;
 	}
 
-	glClearColor((GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 1.0);
-	glClear(GL_COLOR_BUFFER_BIT);
+	//glClearColor((GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 1.0);
+	//glClear(GL_COLOR_BUFFER_BIT);
 
 	return 0;
 }

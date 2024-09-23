@@ -138,7 +138,7 @@ $ sudo adduser $USER input
 You can then try it with the shaders available in the `examples` directory, e.g.:
 
 ```shell
-$ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
+$ python shadertoy.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
 ```
 
 Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.

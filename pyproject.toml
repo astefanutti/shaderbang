@@ -1,0 +1,13 @@
+[project]
+name = "shaderbang"
+requires-python = ">=3.10"
+authors = [{ name = "Antonin Stefanutti"}]
+description = "A Python toolkit for OpenGL rendering with EGL/DRM/KMS"
+license = { text = "MIT License" }
+dynamic = ["version"]
+
+[project.urls]
+GitHub = "https://github.com/astefanutti/shaderbang"
+
+[tool.setuptools.packages.find]
+include = ["shaderbang"]
