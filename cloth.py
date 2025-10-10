@@ -35,7 +35,7 @@ import warp as wp
 
 from dataclasses import dataclass
 from enum import auto, Flag
-from typing import Callable, Generic, Optional, Tuple, TypeVar
+from typing import Callable, Generic, Optional, TypeVar
 
 from contextlib import ExitStack
 from pathlib import Path
@@ -104,6 +104,12 @@ class Particle:
     depth: float
     flags = AnchorFlag.ACTIVE
 
+@wp.struct
+class MeshQueryRay:
+    hit: bool
+    face: wp.int32
+    dist: wp.float32
+
 
 class Cloth(Input):
 
@@ -147,7 +153,7 @@ class Cloth(Input):
                 (range(0, num_x, 2), range(num_y + 1), one_x),
                 (range(1, num_x, 2), range(num_y + 1), one_x),
                 parallel=False,
-                ke=1.0e10,
+                ke=1.0e9,
                 kd=10.0,
             ),
             Constraint(
@@ -156,7 +162,7 @@ class Cloth(Input):
                 (range(1, num_x, 2), range(0, num_y, 2), cross),
                 (range(1, num_x, 2), range(1, num_y, 2), cross),
                 parallel=False,
-                ke=1.0e10,
+                ke=1.0e9,
                 kd=10.0,
             ),
             Constraint(
@@ -168,7 +174,7 @@ class Cloth(Input):
                 (range(2, num_x - 1, 3), range(num_y + 1), two_x),
                 parallel=True,
                 scale=0.7,
-                ke=1.0e6,
+                ke=1.0e9,
                 kd=10.0,
             ),
         )
@@ -187,9 +193,9 @@ class Cloth(Input):
                 (range(num_x), range(num_y - 1), diam_y),
                 (range(num_x - 1), range(num_y), diam_x),
                 parallel=True,
-                scale=0.7,
-                ke=1.0e5,
-                kd=10.0,
+                scale=0.5,
+                ke=1.0e4,
+                kd=100.0,
             ),
         )
 
@@ -232,8 +238,10 @@ class Cloth(Input):
         self.normals_gl_buffer = GLuint()
         self.triIds = None
         self.triIds_gl_buffer = GLuint()
+        self.gl_buffers = []
 
         self.grid = wp.HashGrid(128, 128, 128)
+        self.mesh = None
 
         print(str(self.numParticles) + " particles created")
         print(str(self.numTris) + " triangles created")
@@ -649,55 +657,16 @@ class Cloth(Input):
 
     @staticmethod
     @wp.kernel
-    def raycast_triangle(
-            origin: wp.vec3,
-            direction: wp.vec3,
-            pos: wp.array(dtype=wp.vec3),
-            tri_ids: wp.array2d(dtype=wp.int32),
-            dist: wp.array(dtype=float)):
+    def cast_ray(origin: wp.vec3,
+                 direction: wp.vec3,
+                 mesh: wp.uint64,
+                 dist: wp.array(dtype=MeshQueryRay)):
         tid = wp.tid()
-        no_hit = 1.0e6
-
-        id0 = tri_ids[tid, 0]
-        id1 = tri_ids[tid, 1]
-        id2 = tri_ids[tid, 2]
-
-        edge1 = pos[id1] - pos[id0]
-        edge2 = pos[id2] - pos[id0]
-        p = wp.cross(direction, edge2)
-        det = wp.dot(edge1, p)
-
-        if det == 0.0:
-            dist[tid] = no_hit
-            return
-
-        inv_det = 1.0 / det
-        t = origin - pos[id0]
-        u = wp.dot(t, p) * inv_det
-        if u < 0.0 or u > 1.0:
-            dist[tid] = no_hit
-            return
-
-        q = wp.cross(t, edge1)
-        v = wp.dot(direction, q) * inv_det
-        if v < 0.0 or u + v > 1.0:
-            dist[tid] = no_hit
-            return
-
-        dist[tid] = wp.dot(edge2, q) * inv_det
+        query = wp.mesh_query_ray(mesh, origin, direction, 1.0e6)
+        dist[tid] = MeshQueryRay(query.result, query.face, dist=query.t)
 
     def drag_anchor(self, screen_x, screen_y) -> Optional[Particle]:
         origin, direction = ray_from_screen(screen_x, screen_y)
-
-        # Compute the ray to triangle distances
-        pos = self.pos.map(dtype=wp.vec3, shape=(self.numParticles,))
-        tri_ids = self.triIds.map(dtype=wp.int32, shape=(self.numTris, 3))
-        wp.launch(kernel=Cloth.raycast_triangle,
-                  dim=self.numTris,
-                  inputs=[origin, direction, pos, tri_ids],
-                  outputs=[self.triDist])
-        self.pos.unmap()
-        self.triIds.unmap()
 
         # Find the closest locked anchor hit by the ray
         near_anchor: Optional[Particle] = None
@@ -710,21 +679,23 @@ class Cloth(Input):
                 near_anchor = anchor
 
         # Find the closest triangle hit by the ray
-        wp.copy(self.hostTriDist, self.triDist)
-        wp.synchronize_stream()
-        dists = self.hostTriDist.numpy()
-        tri_id = np.argmin(dists)
-        min_tri_dist = dists[tri_id].item()
-        if min_tri_dist >= 1.0e6 and not min_anchor_dist:
+        rays = wp.empty((1,), dtype=MeshQueryRay)
+        wp.launch(kernel=Cloth.cast_ray,
+                  dim=1,
+                  inputs=[origin, direction, self.mesh.id],
+                  outputs=[rays])
+        rays = rays.numpy()
+        hit, tri_id, min_tri_dist = rays[0]
+        if not hit and not min_anchor_dist:
             return None
 
         # Check if with the sphere is hit by the ray before any hit anchor or triangle
         dist = ray_to_sphere(origin, direction, sphere.center, sphere.radius)
-        if dist and (not near_anchor or dist[0] < min_anchor_dist) and dist[0] < min_tri_dist:
+        if dist and (not near_anchor or dist[0] < min_anchor_dist) and (not hit or dist[0] < min_tri_dist):
             return None
 
         # Check if the hit locked anchor is closer than the hit triangle
-        if near_anchor and min_anchor_dist <= min_tri_dist:
+        if near_anchor and (not hit or min_anchor_dist <= min_tri_dist):
             near_anchor.flags |= AnchorFlag.ACTIVE
             near_anchor.depth = min_anchor_dist
             near_anchor.screen = wp.vec2(screen_x, screen_y)
@@ -782,8 +753,7 @@ class Cloth(Input):
     def simulate(self, steps=numSubsteps, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True):
         dt = timeStep / numSubsteps
 
-        pos = self.pos.map(dtype=wp.vec3, shape=(self.numParticles,))
-        wp.copy(pos, self.hostPos)
+        wp.copy(self.pos, self.hostPos)
         wp.copy(self.invMass, self.hostInvMass)
 
         for step in range(steps):
@@ -794,7 +764,7 @@ class Cloth(Input):
                               dt,
                               self.invMass,
                               self.prevPos,
-                              pos,
+                              self.pos,
                               self.vel,
                               sphere.center,
                               sphere.radius,
@@ -804,7 +774,7 @@ class Cloth(Input):
                           ])
 
             if self_collision:
-                self.grid.build(pos, 2.0 * particleRadius)
+                self.grid.build(self.pos, 2.0 * particleRadius)
 
                 self.deltas.zero_()
                 wp.launch(kernel=Cloth.particle_particle_contacts,
@@ -813,7 +783,7 @@ class Cloth(Input):
                               dt,
                               self.grid.id,
                               self.invMass,
-                              pos,
+                              self.pos,
                               self.vel,
                           ],
                           outputs=[
@@ -821,7 +791,7 @@ class Cloth(Input):
                           ])
                 wp.launch(kernel=Cloth.add_deltas,
                           dim=self.numParticles,
-                          inputs=[pos, self.deltas])
+                          inputs=[self.pos, self.deltas])
 
             if not solve_constraints:
                 continue
@@ -841,7 +811,7 @@ class Cloth(Input):
                                       kd,
                                       scale,
                                       offset,
-                                      pos,
+                                      self.pos,
                                       self.prevPos,
                                       self.invMass,
                                       indices,
@@ -851,7 +821,7 @@ class Cloth(Input):
                                   ])
                         wp.launch(kernel=Cloth.add_deltas,
                                   dim=self.numParticles,
-                                  inputs=[pos, self.deltas])
+                                  inputs=[self.pos, self.deltas])
                     else:
                         wp.launch(kernel=kernel,
                                   dim=count,
@@ -861,43 +831,38 @@ class Cloth(Input):
                                       kd,
                                       scale,
                                       offset,
-                                      pos,
+                                      self.pos,
                                       self.prevPos,
                                       self.invMass,
                                       indices,
                                       rests,
                                       lambdas,
-                                      pos,
+                                      self.pos,
                                   ])
 
             wp.launch(kernel=Cloth.update_velocity,
                       dim=self.numParticles,
                       inputs=[
                           dt,
-                          pos,
+                          self.pos,
                           self.prevPos,
                           sphere.center + sphere.dc,
                           sphere.radius + sphere.dr,
                       ],
                       outputs=[self.vel])
 
-        wp.copy(self.hostPos, pos)
-        self.pos.unmap()
+        self.mesh.refit()
+
+        wp.copy(self.hostPos, self.pos)
 
     def update_mesh(self):
-        tri_ids = self.triIds.map(dtype=wp.int32, shape=(self.numTris, 3))
-        normals = self.normals.map(dtype=wp.vec3, shape=(self.numParticles,))
-        pos = self.pos.map(dtype=wp.vec3, shape=(self.numParticles,))
-        normals.zero_()
+        self.normals.zero_()
         wp.launch(kernel=Cloth.add_normals,
                   dim=self.numTris,
-                  inputs=[pos, tri_ids, normals])
+                  inputs=[self.pos, self.triIds, self.normals])
         wp.launch(kernel=Cloth.normalize_normals,
                   dim=self.numParticles,
-                  inputs=[normals])
-        self.pos.unmap()
-        self.normals.unmap()
-        self.triIds.unmap()
+                  inputs=[self.normals])
 
     def init(self, **kwargs):
         self._quad = gluNewQuadric()
@@ -907,29 +872,39 @@ class Cloth(Input):
         glBindBuffer(GL_ARRAY_BUFFER, self.pos_gl_buffer)
         glBufferData(GL_ARRAY_BUFFER, host_pos.nbytes, host_pos, GL_DYNAMIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-        self.pos = wp.RegisteredGLBuffer(int(self.pos_gl_buffer.value),
-                                         flags=wp.RegisteredGLBuffer.NONE)
+        buffer = wp.RegisteredGLBuffer(int(self.pos_gl_buffer.value),
+                                       flags=wp.RegisteredGLBuffer.NONE,
+                                       fallback_to_copy=False)
+        self.gl_buffers.append(buffer)
+        self.pos = buffer.map(dtype=wp.vec3, shape=(self.numParticles,))
 
         normals = wp.zeros(self.numParticles, dtype=wp.vec3).numpy()
         glGenBuffers(1, ctypes.pointer(self.normals_gl_buffer))
         glBindBuffer(GL_ARRAY_BUFFER, self.normals_gl_buffer)
         glBufferData(GL_ARRAY_BUFFER, normals.nbytes, normals, GL_DYNAMIC_DRAW)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-        self.normals = wp.RegisteredGLBuffer(int(self.normals_gl_buffer.value),
-                                             flags=wp.RegisteredGLBuffer.WRITE_DISCARD)
+        buffer = wp.RegisteredGLBuffer(int(self.normals_gl_buffer.value),
+                                       flags=wp.RegisteredGLBuffer.WRITE_DISCARD,
+                                       fallback_to_copy=False)
+        self.gl_buffers.append(buffer)
+        self.normals = buffer.map(dtype=wp.vec3, shape=(self.numParticles,))
 
+        tri_ids = self.hostTriIds
         glGenBuffers(1, ctypes.pointer(self.triIds_gl_buffer))
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.triIds_gl_buffer)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, self.hostTriIds.nbytes, self.hostTriIds, GL_STATIC_DRAW)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, tri_ids.nbytes, tri_ids, GL_STATIC_DRAW)
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
-        self.triIds = wp.RegisteredGLBuffer(int(self.triIds_gl_buffer.value),
-                                            flags=wp.RegisteredGLBuffer.READ_ONLY)
+        buffer = wp.RegisteredGLBuffer(int(self.triIds_gl_buffer.value),
+                                       flags=wp.RegisteredGLBuffer.READ_ONLY,
+                                       fallback_to_copy=False)
+        self.gl_buffers.append(buffer)
+        self.triIds = buffer.map(dtype=wp.int32, shape=(self.numTris, 3))
 
-        pos = self.pos.map(dtype=wp.vec3, shape=(self.numParticles,))
+        self.mesh = wp.Mesh(self.pos, self.triIds.flatten(), self.vel, bvh_constructor="lbvh")
+
         wp.launch(kernel=Cloth.rest_distances,
                   dim=(self.distConstraints.count,),
-                  inputs=[pos, self.distConstraints.indices, self.distConstraints.rests])
-        self.pos.unmap()
+                  inputs=[self.pos, self.distConstraints.indices, self.distConstraints.rests])
 
     def pre_render(self, **kwargs):
         self.update_anchors()
@@ -991,9 +966,7 @@ class Cloth(Input):
 
     def reset(self):
         self.vel.zero_()
-        pos = self.pos.map(dtype=wp.vec3, shape=(self.numParticles,))
-        wp.copy(pos, self.restPos)
-        self.pos.unmap()
+        wp.copy(self.pos, self.restPos)
         wp.copy(self.prevPos, self.restPos)
         wp.copy(self.hostPos, self.restPos)
         for anchor in self.anchors:
@@ -1007,8 +980,6 @@ class Ground(Input):
 
     def __init__(self):
         super().__init__("ground")
-        self.shader = None
-
         num_tiles = 30
         tile_size = 0.5
         vertices = np.zeros(3 * 4 * num_tiles * num_tiles, dtype=float)
@@ -1528,7 +1499,7 @@ class BendConstraints(Constraints[BendIndex]):
         super().__init__(*constraints, dim=4, kernel=Cloth.bending_constraints)
 
 
-def ray_from_screen(screen_x, screen_y) -> (wp.vec3, wp.vec3):
+def ray_from_screen(screen_x, screen_y) -> tuple[wp.vec3f, wp.vec3f]:
     viewport = glGetIntegerv(GL_VIEWPORT)
     model_matrix = glGetDoublev(GL_MODELVIEW_MATRIX)
     proj_matrix = glGetDoublev(GL_PROJECTION_MATRIX)
@@ -1541,7 +1512,7 @@ def ray_from_screen(screen_x, screen_y) -> (wp.vec3, wp.vec3):
     direction = wp.normalize(direction)
     return origin, direction
 
-def ray_to_sphere(origin: wp.vec3, direction: wp.vec3, center: wp.vec3, radius: float) -> Optional[Tuple[float, float]]:
+def ray_to_sphere(origin: wp.vec3, direction: wp.vec3, center: wp.vec3, radius: float) -> Optional[tuple[float, float]]:
     m = origin - center
     b = wp.dot(m, direction)
     c = wp.dot(m, m) - radius * radius
