@@ -69,7 +69,7 @@ particleRadius = 0.0045
 maxVelocity = 1e2
 
 numIterations = 2
-numSubsteps = 50
+numSubsteps = 60
 timeStep = 1.0 / 30.0
 epsilon = sys.float_info.epsilon
 
@@ -162,7 +162,7 @@ class Cloth(Input):
                 (range(1, num_x, 2), range(0, num_y, 2), cross),
                 (range(1, num_x, 2), range(1, num_y, 2), cross),
                 parallel=False,
-                ke=1.0e9,
+                ke=1.0e7,
                 kd=10.0,
             ),
             Constraint(
@@ -173,8 +173,8 @@ class Cloth(Input):
                 (range(1, num_x - 1, 3), range(num_y + 1), two_x),
                 (range(2, num_x - 1, 3), range(num_y + 1), two_x),
                 parallel=True,
-                scale=0.7,
-                ke=1.0e9,
+                scale=0.6,
+                ke=1.0e7,
                 kd=10.0,
             ),
         )
@@ -193,9 +193,9 @@ class Cloth(Input):
                 (range(num_x), range(num_y - 1), diam_y),
                 (range(num_x - 1), range(num_y), diam_x),
                 parallel=True,
-                scale=0.5,
-                ke=1.0e4,
-                kd=100.0,
+                scale=0.6,
+                ke=1.0e5,
+                kd=10.0,
             ),
         )
 
@@ -756,49 +756,58 @@ class Cloth(Input):
         wp.copy(self.pos, self.hostPos)
         wp.copy(self.invMass, self.hostInvMass)
 
+        graph = None
         for step in range(steps):
-            if integrate:
-                wp.launch(kernel=Cloth.integrate,
-                          dim=self.numParticles,
-                          inputs=[
-                              dt,
-                              self.invMass,
-                              self.prevPos,
-                              self.pos,
-                              self.vel,
-                              sphere.center,
-                              sphere.radius,
-                              sphere.dc,
-                              sphere.dr,
-                              sphere.dq,
-                          ])
+            if graph:
+                wp.capture_launch(graph)
+            else:
+                with wp.ScopedCapture() as capture:
+                    self.step(dt, iterations, integrate, self_collision, solve_constraints)
+                graph = capture.graph
 
-            if self_collision:
-                self.grid.build(self.pos, 2.0 * particleRadius)
+        wp.synchronize_device()
+        self.mesh.refit()
+        wp.copy(self.hostPos, self.pos)
 
-                self.deltas.zero_()
-                wp.launch(kernel=Cloth.particle_particle_contacts,
-                          dim=self.numParticles,
-                          inputs=[
-                              dt,
-                              self.grid.id,
-                              self.invMass,
-                              self.pos,
-                              self.vel,
-                          ],
-                          outputs=[
-                              self.deltas,
-                          ])
-                wp.launch(kernel=Cloth.add_deltas,
-                          dim=self.numParticles,
-                          inputs=[self.pos, self.deltas])
+    def step(self, dt: float, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True):
+        if integrate:
+            wp.launch(kernel=Cloth.integrate,
+                      dim=self.numParticles,
+                      inputs=[
+                          dt,
+                          self.invMass,
+                          self.prevPos,
+                          self.pos,
+                          self.vel,
+                          sphere.center,
+                          sphere.radius,
+                          sphere.dc,
+                          sphere.dr,
+                          sphere.dq,
+                      ])
 
-            if not solve_constraints:
-                continue
+        if self_collision:
+            self.grid.build(self.pos, 2.0 * particleRadius)
+            self.deltas.zero_()
+            wp.launch(kernel=Cloth.particle_particle_contacts,
+                      dim=self.numParticles,
+                      inputs=[
+                          dt,
+                          self.grid.id,
+                          self.invMass,
+                          self.pos,
+                          self.vel,
+                      ],
+                      outputs=[
+                          self.deltas,
+                      ])
+            wp.launch(kernel=Cloth.add_deltas,
+                      dim=self.numParticles,
+                      inputs=[self.pos, self.deltas])
 
+        if solve_constraints:
             self.distConstraints.lambdas.zero_()
             self.bendConstraints.lambdas.zero_()
-
             for iteration in range(iterations):
                 for offset, count, kernel, indices, rests, lambdas, ke, kd, parallel, scale in self.constraints:
                     if parallel:
@@ -840,20 +849,16 @@ class Cloth(Input):
                                       self.pos,
                                   ])
 
-            wp.launch(kernel=Cloth.update_velocity,
-                      dim=self.numParticles,
-                      inputs=[
-                          dt,
-                          self.pos,
-                          self.prevPos,
-                          sphere.center + sphere.dc,
-                          sphere.radius + sphere.dr,
-                      ],
-                      outputs=[self.vel])
-
-        self.mesh.refit()
-
-        wp.copy(self.hostPos, self.pos)
+        wp.launch(kernel=Cloth.update_velocity,
+                  dim=self.numParticles,
+                  inputs=[
+                      dt,
+                      self.pos,
+                      self.prevPos,
+                      sphere.center + sphere.dc,
+                      sphere.radius + sphere.dr,
+                  ],
+                  outputs=[self.vel])
 
     def update_mesh(self):
         self.normals.zero_()
