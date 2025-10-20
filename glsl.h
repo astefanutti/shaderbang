@@ -26,7 +26,7 @@
 
 #include "common.h"
 
-extern int init(const char *shadertoy, const struct options *options);
+extern int init(const struct options *options);
 extern int run();
 extern int join();
 extern void stop();

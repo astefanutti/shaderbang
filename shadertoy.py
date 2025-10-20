@@ -8,16 +8,146 @@ import signal
 import stat
 import threading
 
+from array import array
 from contextlib import ExitStack
 from ctypes import byref
-from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
-from shaderbang.shadertoy import AsciiKeyboard, ButtonMouse, Touchscreen, TrackMouse
-from shaderbang.shadertoy import CubemapTexture, ImageTexture, VolumeTexture
-from lib import glsl, options
 from libevdev import *
 from pathlib import Path
 from signal import pthread_sigmask, pthread_kill, sigwait
 from threading import main_thread, Thread
+
+from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
+from shaderbang.input import Input
+from shaderbang.shadertoy import AsciiKeyboard, ButtonMouse, Touchscreen, TrackMouse
+from shaderbang.shadertoy import CubemapTexture, ImageTexture, VolumeTexture
+from lib import glsl, options
+
+
+from OpenGL import setPlatform
+setPlatform("egl")
+
+from OpenGL.GL import *
+from OpenGL.GLU import *
+
+
+vs_tpl_100 = """
+#version {version}
+
+attribute vec3 position;
+
+void main()
+{{
+    gl_Position = vec4(position, 1.0);
+}}
+"""
+
+vs_tpl_300 = """
+#version {version}
+
+in vec3 position;
+
+void main()
+{{
+    gl_Position = vec4(position, 1.0);
+}}
+"""
+
+fs_tpl_300 = """
+#version {version}
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+
+out vec4 fragColor;
+
+uniform vec3      iResolution;    // viewport resolution (in pixels)
+uniform float     iTime;          // shader playback time (in seconds)
+uniform int       iFrame;         // current frame number
+uniform vec4      iMouse;         // mouse pixel coords
+uniform vec4      iDate;          // (year, month, day, time in seconds)
+
+// Shader body
+{body}
+
+void main()
+{{
+    mainImage(fragColor, gl_FragCoord.xy);
+}}
+"""
+
+
+class Program(Input):
+
+    vertices = [
+        # First triangle
+         1.0,  1.0,
+        -1.0,  1.0,
+        -1.0, -1.0,
+        # Second triangle
+        -1.0, -1.0,
+         1.0, -1.0,
+         1.0, 1.0,
+    ]
+
+    def __init__(self, file: Path):
+        super().__init__("program")
+        self.file = file
+        self.program = None
+        self.iTime = None
+        self.iFrame = None
+        self.iResolution = None
+        self.vbo = GLuint()
+
+    def init(self, width, height):
+        self.program = glCreateProgram()
+
+        vs = glCreateShader(GL_VERTEX_SHADER)
+        glShaderSource(vs, vs_tpl_300.format(version="330"))
+        glCompileShader(vs)
+        if glGetShaderiv(vs, GL_COMPILE_STATUS) == GL_FALSE:
+            print("Compile error", glGetShaderInfoLog(vs))
+        glAttachShader(self.program, vs)
+
+        fs = glCreateShader(GL_FRAGMENT_SHADER)
+        with open(self.file, "r") as shader:
+            glShaderSource(fs, fs_tpl_300.format(version="330", body=shader.read()))
+            glCompileShader(fs)
+            if glGetShaderiv(fs, GL_COMPILE_STATUS) == GL_FALSE:
+                print("Compile error", glGetShaderInfoLog(fs))
+            glAttachShader(self.program, fs)
+
+        glLinkProgram(self.program)
+        if glGetProgramiv(self.program, GL_LINK_STATUS) == GL_FALSE:
+            print("Link error", glGetProgramInfoLog(self.program))
+
+        glDeleteShader(vs)
+        glDeleteShader(fs)
+
+        glViewport(0, 0, width, height)
+        glUseProgram(self.program)
+
+        self.iTime = glGetUniformLocation(self.program, "iTime")
+        self.iFrame = glGetUniformLocation(self.program, "iFrame")
+        self.iResolution = glGetUniformLocation(self.program, "iResolution")
+        glUniform3f(self.iResolution, width, height, 0)
+
+        glGenBuffers(1, ctypes.pointer(self.vbo))
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        vertices = array("f", self.vertices)
+        glBufferData(GL_ARRAY_BUFFER, vertices.tobytes(), GL_STATIC_DRAW)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, None)
+        glEnableVertexAttribArray(0)
+
+    def render(self, frame, time):
+        glUniform1f(self.iTime, time)
+        # Replace the above to input elapsed time relative to 60 FPS
+        # glUniform1f(iTime, frame / 60.0);
+        glUniform1ui(self.iFrame, frame)
+
+        glDrawArrays(GL_TRIANGLES, 0, 6)
 
 
 class Metadata(argparse.Action):
@@ -96,6 +226,8 @@ parser.add_argument("-m", "--metadata", metavar=("<UNIFORM>.KEY", "VALUE"), type
                     action=Metadata, dest="metadata", default={}, help="set uniform metadata")
 args = parser.parse_args()
 
+Program(args.shader[0])
+
 for (uniform, path) in args.cubemaps:
     CubemapTexture(uniform, path)
 for (uniform, path) in args.textures:
@@ -114,7 +246,7 @@ inotify = INotify()
 inotify.add_watch("/dev/input", IN_CREATE | IN_ATTRIB)
 Thread(target=hot_plug_devices, daemon=True).start()
 
-ret = glsl.init(bytes(args.shader[0].as_posix(), "utf-8"), byref(options(args)))
+ret = glsl.init(byref(options(args)))
 if ret != 0:
     devices.close()
     exit(ret)

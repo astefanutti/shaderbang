@@ -26,8 +26,8 @@
 
 #include "common.h"
 
-static int render_shaderbang(uint64_t start_time, unsigned frame) {
-	float time = ((float) (get_time_ns() - start_time)) / NSEC_PER_SEC;
+static int render_shaderbang(const uint64_t start_time, const unsigned frame) {
+	const float time = (float) (get_time_ns() - start_time) / NSEC_PER_SEC;
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	int ret = callRenderCallbacks(frame, time);

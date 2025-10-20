@@ -77,7 +77,7 @@ static void usage(const char *name) {
 	       name);
 }
 
-int init(const char *shadertoy, const struct options *options) {
+int init(const struct options *options) {
 	int ret;
 	int fd;
 
@@ -145,11 +145,7 @@ int init(const char *shadertoy, const struct options *options) {
 		return -1;
 	}
 
-	if (strlen(shadertoy)) {
-		ret = init_shadertoy(gbm, egl, shadertoy);
-	} else {
-		ret = init_shaderbang(gbm, egl);
-	}
+	ret = init_shaderbang(gbm, egl);
 	if (ret < 0) {
 		return -1;
 	}
@@ -243,7 +239,7 @@ int main(int argc, char *argv[]) {
 	}
 	shadertoy = argv[optind];
 
-	ret = init(shadertoy, &options);
+	ret = init(&options);
 	if (ret < 0) {
 		return -1;
 	}
