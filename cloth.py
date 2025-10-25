@@ -1611,7 +1611,7 @@ inotify = INotify()
 inotify.add_watch("/dev/input", IN_CREATE | IN_ATTRIB)
 Thread(target=hot_plug_devices, args=[devices, inotify], daemon=True).start()
 
-ret = glsl.init(bytes("", "utf-8"), ctypes.byref(options(args)))
+ret = glsl.init(ctypes.byref(options(args)))
 if ret != 0:
     devices.close()
     exit(ret)

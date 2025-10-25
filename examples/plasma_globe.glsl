@@ -1,4 +1,4 @@
-// python shadertoy.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
+#!/usr/bin/env -S ./shadertoy.py -t iChannel0 presets/tex_RGBA_noise_medium.png
 
 // Copied from https://www.shadertoy.com/view/XsjXRm
 // Created by https://www.shadertoy.com/user/nimitz

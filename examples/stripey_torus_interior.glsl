@@ -42,11 +42,11 @@ void mainImage( out vec4 fragColor, in vec2 fragCoord )
 	vec3 planeV = vec3(0.0, iResolution.y / iResolution.x * 1.0, 0.0);
 	vec3 rayDir = normalize(cameraDir + screenPos.x * planeU + screenPos.y * planeV);
 	
-	//cameraPos.yz = rotate2d(cameraPos.yz, mousePos.y);
-	//rayDir.yz = rotate2d(rayDir.yz, mousePos.y);
+	cameraPos.yz = rotate2d(cameraPos.yz, mousePos.y);
+	rayDir.yz = rotate2d(rayDir.yz, mousePos.y);
 	
-	//cameraPos.xz = rotate2d(cameraPos.xz, mousePos.x);
-	//rayDir.xz = rotate2d(rayDir.xz, mousePos.x);
+	cameraPos.xz = rotate2d(cameraPos.xz, mousePos.x);
+	rayDir.xz = rotate2d(rayDir.xz, mousePos.x);
 	
 	vec3 rayPos = castRay(cameraPos, rayDir, 0.01);
 	

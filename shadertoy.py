@@ -96,8 +96,8 @@ class Program(Input):
         super().__init__("program")
         self.file = file
         self.program = None
-        self.iTime = None
         self.iFrame = None
+        self.iTime = None
         self.iResolution = None
         self.vbo = GLuint()
 
@@ -142,10 +142,10 @@ class Program(Input):
         glEnableVertexAttribArray(0)
 
     def render(self, frame, time):
+        glUniform1i(self.iFrame, frame)
         glUniform1f(self.iTime, time)
-        # Replace the above to input elapsed time relative to 60 FPS
-        # glUniform1f(iTime, frame / 60.0);
-        glUniform1ui(self.iFrame, frame)
+        # Or elapsed time relative to 60 FPS
+        # glUniform1f(self.iTime, frame / 60.0);
 
         glDrawArrays(GL_TRIANGLES, 0, 6)
 
