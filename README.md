@@ -10,9 +10,9 @@ Shader files can be made directly executable with [shebangs](#shebangs), and Pyt
 It works with any GPU and display controller hardware, provided a DRM/KMS driver is available, from the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi) and [Jetson Nano](https://ttt.io/glsl-jetson-nano) to NVIDIA RTX desktop GPUs.
 More configurations are listed in the [compatibility](#compatibility) section.
 
-A GPU-accelerated [cloth simulation](examples/cloth.py) using [NVIDIA Warp](https://github.com/NVIDIA/warp):
+A [cloth simulation](examples/cloth.py) using [NVIDIA Warp](https://github.com/NVIDIA/warp) with an NVIDIA RTX 5090 FE GPU and a Magedok 16" 4K OLED touchscreen monitor:
 
-<video src="https://github.com/user-attachments/assets/d135a51c-2a09-44ae-82b2-3372649bb542" autoplay loop muted></video>
+https://github.com/user-attachments/assets/ccf6e96a-de56-46f8-9be3-c94f6b7c6223
 
 A [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) running on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
 
@@ -194,6 +194,7 @@ It's been reported to run successfully on the following configurations:
 
 | Hardware                                    | OS / Kernel                                | Driver                  | Date    |
 |---------------------------------------------|--------------------------------------------|-------------------------|---------|
+| NVIDIA GeForce RTX 5090 FE                  | Ubuntu 24.04, Linux 6.14                   | NVIDIA Driver 575.57.08 | 05/2026 |
 | NVIDIA GeForce RTX 3060                     | Ubuntu 23.10, Linux 6.5                    | NVIDIA Driver 545.29.06 | 03/2024 |
 | Jetson Orin NX                              | Jetson Linux 35.3.1, Linux 5.10            | NVIDIA DRM Driver       | 09/2023 |
 | Jetson Nano (Tegra X1)                      | Jetson Linux 32.7.4, Linux 4.6             | Mesa NVIDIA Tegra       | 06/2023 |
