@@ -1,6 +1,6 @@
 [project]
 name = "shaderbang"
-dynamic = ["version"]
+version = "0.1.0"
 dependencies = [
     "libevdev",
 ]
@@ -23,3 +23,6 @@ requires = ["setuptools>=75.3.2", "build", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
+build = "cp313-manylinux*"
+archs = "x86_64 aarch64 armv7l"
+before-all = "yum install -y libdrm-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel"
