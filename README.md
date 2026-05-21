@@ -16,11 +16,11 @@ A GPU-accelerated [cloth simulation](examples/cloth.py) using [NVIDIA Warp](http
 
 A [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) running on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
 
-![A Shadertoy shader running on the Raspberry Pi 4](./raspberry_pi.jpg)
+![A Shadertoy shader running on the Raspberry Pi 4](docs/images/raspberry_pi.jpg)
 
 [Another shader](https://www.shadertoy.com/view/fstyD4) running on the Jetson Nano in full HD resolution:
 
-![A Shadertoy shader running on the Jetson Nano](./jetson_nano.jpg)
+![A Shadertoy shader running on the Jetson Nano](docs/images/jetson_nano.jpg)
 
 ## Installation
 
