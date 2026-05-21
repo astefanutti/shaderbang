@@ -25,4 +25,4 @@ build-backend = "setuptools.build_meta"
 [tool.cibuildwheel]
 build = "cp313-manylinux*"
 archs = "x86_64 aarch64 armv7l"
-before-all = "yum install -y libdrm-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel"
+before-all = """if command -v yum > /dev/null; then yum install -y libdrm-devel mesa-libgbm-devel mesa-libEGL-devel mesa-libGLES-devel; elif command -v apt-get > /dev/null; then apt-get update && apt-get install -y libdrm-dev libgbm-dev libegl-dev libgles2-mesa-dev; fi"""
