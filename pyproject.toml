@@ -9,6 +9,7 @@ authors = [
     { name = "Antonin Stefanutti" },
 ]
 description = "A Python toolkit for OpenGL rendering with EGL/DRM/KMS"
+readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 
