@@ -10,7 +10,11 @@ Shader files can be made directly executable with [shebangs](#shebangs), and Pyt
 It works with any GPU and display controller hardware, provided a DRM/KMS driver is available, from the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi) and [Jetson Nano](https://ttt.io/glsl-jetson-nano) to NVIDIA RTX desktop GPUs.
 More configurations are listed in the [compatibility](#compatibility) section.
 
-In the following picture, a [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
+A GPU-accelerated [cloth simulation](examples/cloth.py) using [NVIDIA Warp](https://github.com/NVIDIA/warp):
+
+<video src="https://github.com/user-attachments/assets/d135a51c-2a09-44ae-82b2-3372649bb542" autoplay loop muted></video>
+
+A [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) running on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
 
 ![A Shadertoy shader running on the Raspberry Pi 4](./raspberry_pi.jpg)
 
