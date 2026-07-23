@@ -426,6 +426,87 @@ class Cloth(Input):
         return wp.max(dr, dc) <= 2
 
     @staticmethod
+    @wp.func
+    def swept_sphere_ccd(pos: wp.vec3,
+                         vel: wp.vec3,
+                         center: wp.vec3,
+                         radius: float,
+                         dc: wp.vec3,
+                         dr: float,
+                         dt: float):
+        # Analytic continuous collision of a particle segment against a moving /
+        # growing sphere: solve for the time-of-impact and return the contact point
+        # on the swept surface. Exact for a convex analytic collider, so a fast
+        # sphere drag cannot tunnel through the cloth regardless of speed.
+        s = center - pos
+        vc = dc / dt
+        vr = dr / dt
+        v = vc - vel
+
+        c = wp.dot(s, s) - radius * radius
+        if c < 0.0:
+            # The particle is inside the sphere
+            return False, wp.vec3()
+        a = wp.dot(v, v) - vr * vr
+        if wp.abs(a) < epsilon:
+            # The particle is not moving relative to the sphere
+            return False, wp.vec3()
+        b = wp.dot(v, s) - radius * vr
+        if b > 0.0:
+            # The particle is not moving towards the sphere
+            return False, wp.vec3()
+        d = b * b - a * c
+        if d < 0.0:
+            # The particle segment does not intersect the sphere
+            return False, wp.vec3()
+        t = (-b - wp.sqrt(d)) / a
+        if t >= dt:
+            # The particle segment does not intersect the sphere
+            return False, wp.vec3()
+
+        p = pos + t * vel
+        o = center + t * vc
+        r = p - o
+        lc = wp.length(dc)
+        if lc < epsilon:
+            n = wp.normalize(r)
+            if dr >= 0.0:
+                return True, o + (radius + dr) * n
+            return True, p
+
+        nz = dc / lc
+        z = wp.dot(r, nz)
+        if z <= 0.0:
+            n = wp.normalize(r)
+            if dr >= 0.0:
+                return True, o + (radius + dr) * n
+            return True, p
+
+        nx = wp.cross(r, nz)
+        lnx = wp.length(nx)
+        if lnx < epsilon:
+            # r is parallel to the motion axis (particle dead ahead of the sphere):
+            # the swept frame is degenerate, so pick an arbitrary perpendicular. The
+            # reconstruction below still pushes the particle clear of the swept tube.
+            up = wp.vec3(0.0, 1.0, 0.0)
+            if wp.abs(nz[1]) > 0.9:
+                up = wp.vec3(1.0, 0.0, 0.0)
+            nx = wp.normalize(wp.cross(nz, up))
+        else:
+            nx = nx / lnx
+        ny = wp.cross(nz, nx)
+
+        dl = (dt - t) * lc / dt
+        radius += dr
+        z *= (radius + dl) / radius
+        if z <= dl:
+            y = radius
+        else:
+            dz = z - dl
+            y = wp.sqrt(wp.max(0.0, radius * radius - dz * dz))
+        return True, o + y * ny + z * nz
+
+    @staticmethod
     @wp.kernel
     def integrate(
             dt: float,
@@ -564,38 +645,55 @@ class Cloth(Input):
             dc: wp.vec3,
             dr: float,
             dq: wp.quat):
-        # Analytic PDT (lambda=1) onto convex colliders: project any penetrating
-        # vertex onto the offset surface. Convexity makes the closest-point tangent
-        # plane a global separating half-space, so this is penetration-free at the
-        # substep-end pose with no swept test.
+        # Swept CCD against the moving / growing sphere: the analytic time-of-impact
+        # catches approaching particles on the swept surface (no tunneling at any
+        # drag speed); a static end-pose contact then resolves already-inside /
+        # resting particles and applies depth-based Coulomb friction. Runs after the
+        # constraint solve so its penetration-free result has the final say.
         i = wp.tid()
         if inv_mass[i] == 0.0:
             return
 
         x = pos[i]
+        vel_eff = (x - prev_pos[i]) / dt  # cloth substep velocity, before collision
 
-        # Moving / rotating / resizing sphere (rotation only affects friction).
+        # Pass 1: swept sphere -> snap approaching particles onto the swept surface.
+        hit, c = Cloth.swept_sphere_ccd(prev_pos[i], vel_eff, center, radius, dc, dr, dt)
+        if hit:
+            n = wp.normalize(c - center - dc)
+            x = c + thickness * n
+
+        # Pass 2: static contact at the end pose. The solved position's penetration
+        # depth is the normal force signal for friction (rest contacts, where the
+        # swept test does not fire because the per-substep travel is sub-margin).
         c_end = center + dc
-        big_r = radius + dr + thickness + particleRadius
+        r_end = radius + dr + thickness
         dv = x - c_end
         d = wp.length(dv)
-        if d > epsilon and d < big_r:
+        if d > epsilon and d < r_end:
             n = dv / d
-            x = c_end + big_r * n
-            rr = big_r * n
+            lambda_n = d - r_end  # < 0 when penetrating
+            arm = r_end * n
             frame_dt = float(numSubsteps) * dt
-            v_surf = (dc + wp.quat_rotate(dq, rr) - rr) / frame_dt
-            vrel = (x - prev_pos[i]) / dt - v_surf
+            v_surf = (dc + wp.quat_rotate(dq, arm) - arm) / frame_dt
+            vrel = vel_eff - v_surf
             vt = vrel - wp.dot(n, vrel) * n
             lvt = wp.length(vt)
+            x = c_end + r_end * n  # non-penetration: project onto the offset surface
             if lvt > epsilon:
-                lam_n = big_r - d  # penetration depth
-                lam_f = wp.max(-0.4 * lam_n, -lvt * dt)
-                x += (vt / lvt) * lam_f
+                lambda_f = wp.max(0.4 * lambda_n, -lvt * dt)
+                x += (vt / lvt) * lambda_f
 
-        # Ground plane at y = thickness.
+        # Ground plane at y = thickness, with friction.
         if x[1] < thickness:
+            n = Ground.NORMAL
+            lambda_n = x[1] - thickness  # < 0 below ground
+            vt = vel_eff - wp.dot(n, vel_eff) * n
+            lvt = wp.length(vt)
             x = wp.vec3(x[0], thickness, x[2])
+            if lvt > epsilon:
+                lambda_f = wp.max(0.65 * lambda_n, -lvt * dt)
+                x += (vt / lvt) * lambda_f
 
         pos[i] = x
 
@@ -993,8 +1091,8 @@ class Cloth(Input):
                       dim=self.numParticles,
                       inputs=[self.invMass, self.prevPos, self.pos, self.truncation_ts, self.push])
 
-        # Analytic convex projection onto sphere + ground runs last so its
-        # penetration-free guarantee has final say over the substep.
+        # Swept-CCD sphere projection + ground contact run last so their
+        # penetration-free result has final say over the substep.
         wp.launch(kernel=Cloth.collider_project,
                   dim=self.numParticles,
                   inputs=[
