@@ -126,6 +126,10 @@ thickness = 0.001
 particleRadius = 0.0045
 maxVelocity = 1e2
 
+# Planar Divide-and-Truncate (PDT) collision parameters
+d_offset = 2.0 * particleRadius  # cloth self-collision separation (matches old 2*particleRadius)
+gamma_r = 0.9                    # conservative truncation safety ratio (Newton uses 0.85-0.95)
+
 numIterations = 2
 numSubsteps = 60
 timeStep = 1.0 / 30.0
@@ -314,7 +318,9 @@ class Cloth(Input):
         self.triIds_gl_buffer = GLuint()
         self.gl_buffers = []
 
-        self.grid = wp.HashGrid(128, 128, 128)
+        self.numCols = num_y + 1  # grid stride, for topological-neighbor exclusion
+        self.truncation_ts = wp.zeros(self.numParticles, dtype=float)  # per-vertex PDT scale (atomic_min)
+        self.push = wp.zeros_like(self.restPos)  # C<0 feasibility-recovery separation (atomic_add)
         self.mesh = None
 
         print(str(self.numParticles) + " particles created")
@@ -356,70 +362,68 @@ class Cloth(Input):
 
     @staticmethod
     @wp.func
-    def swept_sphere_ccd(pos: wp.vec3,
-                         vel: wp.vec3,
-                         center: wp.vec3,
-                         radius: float,
-                         dc: wp.vec3,
-                         dr: float,
-                         dt: float):
-        s = center - pos
-        vc = dc / dt
-        vr = dr / dt
-        v = vc - vel
+    def closest_point_on_triangle(a: wp.vec3, b: wp.vec3, c: wp.vec3, p: wp.vec3) -> wp.vec3:
+        # Ericson, Real-Time Collision Detection: closest point on triangle (a,b,c) to p.
+        ab = b - a
+        ac = c - a
+        ap = p - a
+        d1 = wp.dot(ab, ap)
+        d2 = wp.dot(ac, ap)
+        if d1 <= 0.0 and d2 <= 0.0:
+            return a
+        bp = p - b
+        d3 = wp.dot(ab, bp)
+        d4 = wp.dot(ac, bp)
+        if d3 >= 0.0 and d4 <= d3:
+            return b
+        cp = p - c
+        d5 = wp.dot(ab, cp)
+        d6 = wp.dot(ac, cp)
+        if d6 >= 0.0 and d5 <= d6:
+            return c
+        vc = d1 * d4 - d3 * d2
+        if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+            v = d1 / (d1 - d3)
+            return a + v * ab
+        vb = d5 * d2 - d1 * d6
+        if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+            w = d2 / (d2 - d6)
+            return a + w * ac
+        va = d3 * d6 - d5 * d4
+        if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+            w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+            return b + w * (c - b)
+        denom = 1.0 / (va + vb + vc)
+        v = vb * denom
+        w = vc * denom
+        return a + ab * v + ac * w
 
-        c = wp.dot(s, s) - radius * radius
-        if c < 0.0:
-            # The particle is inside the sphere
-            return False, wp.vec3()
-        a = wp.dot(v, v) - vr * vr
-        if wp.abs(a) < epsilon:
-            # The particle is not moving relative to the sphere
-            return False, wp.vec3()
-        b = wp.dot(v, s) - radius * vr
-        if b > 0.0:
-            # The particle is not moving towards the sphere
-            return False, wp.vec3()
-        d = b * b - a * c
-        if d < 0.0:
-            # The particle segment does not intersect the sphere
-            return False, wp.vec3()
-        t = (-b - wp.sqrt(d)) / a
-        if t >= dt:
-            # The particle segment does not intersect the sphere
-            return False, wp.vec3()
+    @staticmethod
+    @wp.func
+    def planar_truncation_t(x: wp.vec3, dx: wp.vec3, n: wp.vec3, p: wp.vec3) -> float:
+        # Fraction of displacement dx that reaches the plane (n, through p) from x.
+        # Returns 1.0 when moving parallel to or away from the plane (no limit).
+        denom = wp.dot(n, dx)
+        if wp.abs(denom) < epsilon:
+            return 1.0
+        t = wp.dot(n, p - x) / denom
+        if t < 0.0:
+            return 1.0
+        gamma_min = 1.0e-3
+        return wp.clamp(wp.min(t * gamma_r, t - gamma_min), 0.0, 1.0)
 
-        p = pos + t * vel
-        o = center + t * vc
-        r = p - o
-        lc = wp.length(dc)
-        if lc < epsilon:
-            n = wp.normalize(r)
-            if dr >= 0.0:
-                return True, o + (radius + dr) * n
-            return True, p
-
-        nz = dc / lc
-        z = wp.dot(r, nz)
-        if z <= 0.0:
-            n = wp.normalize(r)
-            if dr >= 0.0:
-                return True, o + (radius + dr) * n
-            return True, p
-
-        nx = wp.cross(r, nz)
-        nx = wp.normalize(nx)
-        ny = wp.cross(nz, nx)
-
-        dl = (dt - t) * lc / dt
-        radius += dr
-        z *= (radius + dl) / radius
-        if z <= dl:
-            y = radius
-        else:
-            dz = z - dl
-            y = wp.sqrt(wp.max(0.0, radius * radius - dz * dz))
-        return True, o + y * ny + z * nz
+    @staticmethod
+    @wp.func
+    def within_ring(a: wp.int32, b: wp.int32, num_cols: wp.int32) -> bool:
+        # True when grid vertices a and b are within the 2-ring of each other.
+        # The mesh is a regular grid: index = row * num_cols + col.
+        dr = a // num_cols - b // num_cols
+        dc = a % num_cols - b % num_cols
+        if dr < 0:
+            dr = -dr
+        if dc < 0:
+            dc = -dc
+        return wp.max(dr, dc) <= 2
 
     @staticmethod
     @wp.kernel
@@ -428,110 +432,172 @@ class Cloth(Input):
             inv_mass: wp.array(dtype=float),
             prev_pos: wp.array(dtype=wp.vec3),
             pos: wp.array(dtype=wp.vec3),
-            vel: wp.array(dtype=wp.vec3),
+            vel: wp.array(dtype=wp.vec3)):
+        tid = wp.tid()
+
+        # Freeze the penetration-free reference state X = prev_pos for this substep.
+        # Collisions (sphere, ground, self) are resolved afterwards by PDT truncation
+        # and analytic collider projection, not here.
+        if inv_mass[tid] == 0.0:
+            prev_pos[tid] = pos[tid]
+            return
+
+        prev_pos[tid] = pos[tid]
+        pos[tid] += (vel[tid] + gravity * dt) * dt
+
+    @staticmethod
+    @wp.kernel
+    def self_collision_truncate(
+            mesh: wp.uint64,
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),  # frozen reference state X
+            pos: wp.array(dtype=wp.vec3),       # X + accumulated displacement
+            num_cols: wp.int32,
+            truncation_ts: wp.array(dtype=float),  # pre-filled with 1.0 (atomic_min)
+            push: wp.array(dtype=wp.vec3)):        # pre-zeroed C<0 recovery (atomic_add)
+        v = wp.tid()
+        if inv_mass[v] == 0.0:
+            return
+
+        xv = prev_pos[v]
+        dxv = pos[v] - xv
+
+        # Broadphase: query the LBVH with the swept AABB of this vertex, inflated
+        # by the contact offset (the reference geometry is frozen at prev_pos).
+        r = d_offset + wp.length(dxv)
+        lo = wp.min(xv, pos[v]) - wp.vec3(r, r, r)
+        hi = wp.max(xv, pos[v]) + wp.vec3(r, r, r)
+        query = wp.mesh_query_aabb(mesh, lo, hi)
+        face = wp.int32(0)
+        while wp.mesh_query_aabb_next(query, face):
+            i0 = wp.mesh_get_index(mesh, 3 * face + 0)
+            i1 = wp.mesh_get_index(mesh, 3 * face + 1)
+            i2 = wp.mesh_get_index(mesh, 3 * face + 2)
+            # Skip incident and topological-neighbor triangles (2-ring): their
+            # closest point is naturally within the offset and would freeze bending.
+            if (Cloth.within_ring(v, i0, num_cols)
+                    or Cloth.within_ring(v, i1, num_cols)
+                    or Cloth.within_ring(v, i2, num_cols)):
+                continue
+
+            # Narrowphase + DIVIDE: build one separating plane from the frozen state.
+            p0 = prev_pos[i0]
+            p1 = prev_pos[i1]
+            p2 = prev_pos[i2]
+            cp = Cloth.closest_point_on_triangle(p0, p1, p2, xv)
+            n_hat = xv - cp
+            d = wp.length(n_hat)
+            if d < epsilon:
+                continue
+            n = n_hat / d
+            c = d - d_offset  # signed gap (>= 0 at a feasible start)
+
+            dt0 = pos[i0] - p0
+            dt1 = pos[i1] - p1
+            dt2 = pos[i2] - p2
+
+            if c < 0.0:
+                # Feasibility recovery: the pair starts already inside the offset,
+                # so truncation cannot guarantee separation. Apply a one-sided push
+                # to restore the offset (weighted by each side's approach), and skip
+                # the truncation plane this substep.
+                delta_v_n = wp.max(-wp.dot(n, dxv), 0.0)
+                delta_t_n = wp.max(wp.max(wp.dot(n, dt0), wp.dot(n, dt1)),
+                                   wp.max(wp.dot(n, dt2), 0.0))
+                s = delta_v_n + delta_t_n
+                if s == 0.0:
+                    lmbd = 0.5
+                else:
+                    lmbd = wp.clamp(delta_t_n / s, 0.05, 0.95)
+                depth = -c  # positive penetration
+                wp.atomic_add(push, v, (1.0 - lmbd) * depth * n)
+                tp = lmbd * depth / 3.0
+                if inv_mass[i0] != 0.0:
+                    wp.atomic_add(push, i0, -tp * n)
+                if inv_mass[i1] != 0.0:
+                    wp.atomic_add(push, i1, -tp * n)
+                if inv_mass[i2] != 0.0:
+                    wp.atomic_add(push, i2, -tp * n)
+                continue
+
+            # TRUNCATE: split the gap so the harder-approaching side gives more.
+            delta_v_n = wp.max(-wp.dot(n, dxv), 0.0)
+            delta_t_n = wp.max(wp.max(wp.dot(n, dt0), wp.dot(n, dt1)),
+                               wp.max(wp.dot(n, dt2), 0.0))
+            s = delta_v_n + delta_t_n
+            if s == 0.0:
+                lmbd = 0.5
+            else:
+                lmbd = wp.clamp(delta_t_n / s, 0.05, 0.95)
+            p_plane = cp + (d_offset + lmbd * c) * n
+
+            wp.atomic_min(truncation_ts, v, Cloth.planar_truncation_t(xv, dxv, n, p_plane))
+            if inv_mass[i0] != 0.0:
+                wp.atomic_min(truncation_ts, i0, Cloth.planar_truncation_t(p0, dt0, -n, p_plane))
+            if inv_mass[i1] != 0.0:
+                wp.atomic_min(truncation_ts, i1, Cloth.planar_truncation_t(p1, dt1, -n, p_plane))
+            if inv_mass[i2] != 0.0:
+                wp.atomic_min(truncation_ts, i2, Cloth.planar_truncation_t(p2, dt2, -n, p_plane))
+
+    @staticmethod
+    @wp.kernel
+    def apply_truncation(
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),
+            pos: wp.array(dtype=wp.vec3),
+            truncation_ts: wp.array(dtype=float),
+            push: wp.array(dtype=wp.vec3)):
+        i = wp.tid()
+        if inv_mass[i] == 0.0:
+            return  # leave host-driven anchors untouched
+        pos[i] = prev_pos[i] + (pos[i] - prev_pos[i]) * truncation_ts[i] + push[i]
+
+    @staticmethod
+    @wp.kernel
+    def collider_project(
+            dt: float,
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),
+            pos: wp.array(dtype=wp.vec3),
             center: wp.vec3,
             radius: float,
             dc: wp.vec3,
             dr: float,
             dq: wp.quat):
-        tid = wp.tid()
-
-        if inv_mass[tid] == 0.0:
-            prev_pos[tid] = pos[tid]
+        # Analytic PDT (lambda=1) onto convex colliders: project any penetrating
+        # vertex onto the offset surface. Convexity makes the closest-point tangent
+        # plane a global separating half-space, so this is penetration-free at the
+        # substep-end pose with no swept test.
+        i = wp.tid()
+        if inv_mass[i] == 0.0:
             return
 
-        hit, c = Cloth.swept_sphere_ccd(prev_pos[tid], vel[tid], center, radius, dc, dr, dt)
-        if hit:
-            r = c - center - dc
-            n = wp.normalize(r)
-            c += thickness * n
-            pos[tid] = c
+        x = pos[i]
 
-        prev_pos[tid] = pos[tid]
-        vp = vel[tid] + gravity * dt
-        pos[tid] += vp * dt
-        center += dc
-        radius += dr
+        # Moving / rotating / resizing sphere (rotation only affects friction).
+        c_end = center + dc
+        big_r = radius + dr + thickness + particleRadius
+        dv = x - c_end
+        d = wp.length(dv)
+        if d > epsilon and d < big_r:
+            n = dv / d
+            x = c_end + big_r * n
+            rr = big_r * n
+            frame_dt = float(numSubsteps) * dt
+            v_surf = (dc + wp.quat_rotate(dq, rr) - rr) / frame_dt
+            vrel = (x - prev_pos[i]) / dt - v_surf
+            vt = vrel - wp.dot(n, vrel) * n
+            lvt = wp.length(vt)
+            if lvt > epsilon:
+                lam_n = big_r - d  # penetration depth
+                lam_f = wp.max(-0.4 * lam_n, -lvt * dt)
+                x += (vt / lvt) * lam_f
 
-        hit, c = Cloth.swept_sphere_ccd(prev_pos[tid], vp, center, radius, wp.vec3(), 0.0, dt)
-        if hit:
-            r = c - center
-            n = wp.normalize(r)
-            c += thickness * n
-            r += thickness * n
-            lambda_n = wp.dot(n, pos[tid] - c)
-            delta_n = n * lambda_n
-            vs = (wp.quat_rotate(dq, r) - r) / dt / float(numSubsteps)
-            # v = vp - vs
-            v = (c - prev_pos[tid]) / dt - vs
-            vt = v - wp.dot(n, v) * n
-            mu = 0.4
-            lambda_f = wp.max(mu * lambda_n, -wp.length(vt) * dt)
-            delta_f = wp.normalize(vt) * lambda_f
-            pos[tid] += (delta_f - delta_n) * 1.0
+        # Ground plane at y = thickness.
+        if x[1] < thickness:
+            x = wp.vec3(x[0], thickness, x[2])
 
-        elif pos[tid][1] < thickness:
-            n = Ground.NORMAL
-            lambda_n = pos[tid][1] - thickness
-            delta_n = n * lambda_n
-            vt = vp - wp.dot(n, vp) * n
-            mu = 0.65
-            lambda_f = wp.max(mu * lambda_n, -wp.length(vt) * dt)
-            delta_f = wp.normalize(vt) * lambda_f
-            pos[tid] += (delta_f - delta_n) * 1.0
-
-    @staticmethod
-    @wp.kernel
-    def particle_particle_contacts(
-            dt: float,
-            grid: wp.uint64,
-            inv_mass: wp.array(dtype=float),
-            pos: wp.array(dtype=wp.vec3),
-            vel: wp.array(dtype=wp.vec3),
-            deltas: wp.array(dtype=wp.vec3),
-    ):
-        tid, _ = wp.tid()
-
-        # order threads by cell
-        i = wp.hash_grid_point_id(grid, tid)
-        p = pos[i]
-        v = vel[i]
-        w1 = inv_mass[i]
-
-        if w1 == 0.0:
-            return
-
-        cohesion = particleRadius / 1000.0
-        query = wp.hash_grid_query(grid, p, 2.0 * particleRadius + cohesion)
-        index = wp.int32(0)
-        delta = wp.vec3(0.0)
-
-        while wp.hash_grid_query_next(query, index):
-            if inv_mass[index] == 0.0 or index == i:
-                continue
-
-            n = p - pos[index]
-            d = wp.length(n)
-            c = d - 2.0 * particleRadius
-            w2 = inv_mass[index]
-            w = w1 + w2
-
-            if c > cohesion or w == 0.0 or d < epsilon:
-                continue
-
-            n = n / d
-            lambda_n = c
-            delta_n = n * lambda_n
-            vr = v - vel[index]
-            vn = wp.dot(n, vr)
-            vt = vr - n * vn
-
-            mu = 0.2
-            lambda_f = wp.max(mu * lambda_n, -wp.length(vt) * dt)
-            delta_f = wp.normalize(vt) * lambda_f
-            delta += (delta_f - delta_n) / w
-
-        wp.atomic_add(deltas, i, delta * w1)
+        pos[i] = x
 
     @staticmethod
     @wp.kernel
@@ -709,27 +775,16 @@ class Cloth(Input):
             dt: float,
             pos: wp.array(dtype=wp.vec3),
             prev_pos: wp.array(dtype=wp.vec3),
-            center: wp.vec3,
-            radius: float,
             vel: wp.array(dtype=wp.vec3)):
         tid = wp.tid()
 
+        # pos is already collision-resolved (truncation + collider projection),
+        # so velocity simply reflects the committed displacement.
         v = (pos[tid] - prev_pos[tid]) / dt
         mag = wp.length(v)
         if mag > maxVelocity:
             v *= maxVelocity / mag
         vel[tid] = v
-
-        hit, c = Cloth.swept_sphere_ccd(prev_pos[tid], v, center, radius, wp.vec3(), thickness, dt)
-        if hit:
-            pos[tid] = c
-        elif pos[tid][1] < 0.0:
-            r = radius + thickness
-            rr = r * r
-            if wp.length_sq(pos[tid] - center) <= rr:
-                x = pos[tid][0] - center[0]
-                z = pos[tid][2] - center[2]
-                pos[tid][1] = center[1] - wp.sqrt(wp.max(0.0, rr - x * x - z * z))
 
     @staticmethod
     @wp.kernel
@@ -798,7 +853,7 @@ class Cloth(Input):
                 continue
 
             if not particle.flags & AnchorFlag.ACTIVE:
-                # TODO: use swept_sphere_ccd
+                # host-side sphere push-out for released anchors
                 r = wp.vec3f(pos[particle.id]) - sphere.center
                 d = wp.length(r) - sphere.radius - thickness - particleRadius
                 if d < 0:
@@ -851,6 +906,14 @@ class Cloth(Input):
         wp.copy(self.hostPos, self.pos)
 
     def step(self, dt: float, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True):
+        # Phase 0: refit the LBVH against the start-of-substep geometry. Before
+        # integrate runs, self.pos still holds the previous substep's end position,
+        # which integrate is about to freeze into self.prevPos -> the broadphase
+        # bounds stay consistent with the reference state used to build the
+        # division planes. (refit is warmed up once in init() to avoid a capture
+        # allocation.)
+        self.mesh.refit()
+
         if integrate:
             wp.launch(kernel=Cloth.integrate,
                       dim=self.numParticles,
@@ -860,31 +923,7 @@ class Cloth(Input):
                           self.prevPos,
                           self.pos,
                           self.vel,
-                          sphere.center,
-                          sphere.radius,
-                          sphere.dc,
-                          sphere.dr,
-                          sphere.dq,
                       ])
-
-        if self_collision:
-            self.grid.build(self.pos, 2.0 * particleRadius)
-            self.deltas.zero_()
-            wp.launch(kernel=Cloth.particle_particle_contacts,
-                      dim=self.numParticles,
-                      inputs=[
-                          dt,
-                          self.grid.id,
-                          self.invMass,
-                          self.pos,
-                          self.vel,
-                      ],
-                      outputs=[
-                          self.deltas,
-                      ])
-            wp.launch(kernel=Cloth.add_deltas,
-                      dim=self.numParticles,
-                      inputs=[self.pos, self.deltas])
 
         if solve_constraints:
             self.distConstraints.lambdas.zero_()
@@ -930,14 +969,52 @@ class Cloth(Input):
                                       self.pos,
                                   ])
 
+        # Planar Divide-and-Truncate: clamp the net per-vertex displacement so no
+        # vertex crosses a plane that separated it from a nearby triangle at the
+        # frozen reference state (self-collision), recovering feasibility where a
+        # pair already overlaps.
+        if self_collision:
+            self.truncation_ts.fill_(1.0)
+            self.push.zero_()
+            wp.launch(kernel=Cloth.self_collision_truncate,
+                      dim=self.numParticles,
+                      inputs=[
+                          self.mesh.id,
+                          self.invMass,
+                          self.prevPos,
+                          self.pos,
+                          self.numCols,
+                      ],
+                      outputs=[
+                          self.truncation_ts,
+                          self.push,
+                      ])
+            wp.launch(kernel=Cloth.apply_truncation,
+                      dim=self.numParticles,
+                      inputs=[self.invMass, self.prevPos, self.pos, self.truncation_ts, self.push])
+
+        # Analytic convex projection onto sphere + ground runs last so its
+        # penetration-free guarantee has final say over the substep.
+        wp.launch(kernel=Cloth.collider_project,
+                  dim=self.numParticles,
+                  inputs=[
+                      dt,
+                      self.invMass,
+                      self.prevPos,
+                      self.pos,
+                      sphere.center,
+                      sphere.radius,
+                      sphere.dc,
+                      sphere.dr,
+                      sphere.dq,
+                  ])
+
         wp.launch(kernel=Cloth.update_velocity,
                   dim=self.numParticles,
                   inputs=[
                       dt,
                       self.pos,
                       self.prevPos,
-                      sphere.center + sphere.dc,
-                      sphere.radius + sphere.dr,
                   ],
                   outputs=[self.vel])
 
@@ -988,6 +1065,9 @@ class Cloth(Input):
         self.triIds = buffer.map(dtype=wp.int32, shape=(self.numTris, 3))
 
         self.mesh = wp.Mesh(self.pos, self.triIds.flatten(), self.vel, bvh_constructor="lbvh")
+        # Warm up refit() outside CUDA-graph capture so any scratch allocation
+        # happens now, not during the first captured step().
+        self.mesh.refit()
 
         wp.launch(kernel=Cloth.rest_distances,
                   dim=(self.distConstraints.count,),
