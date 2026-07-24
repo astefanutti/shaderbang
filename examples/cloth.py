@@ -1598,7 +1598,13 @@ class PathTracerView(Input):
 
     def _build(self):
         cloth = self.cloth
-        self.pt = PathTracer(self._width, self._height,
+        # Render at half the framebuffer resolution and let the OptiX temporal
+        # denoiser upscale 2x back to native (1080p -> 4K on the target display),
+        # which both denoises and antialiases the 1-spp trace far cheaper than
+        # rendering natively. Requires the patched otk-pyoptix binding (see
+        # shaderbang/pathtracer/patches/); with the stock binding drop upscale to
+        # get the single-frame HDR denoiser at native resolution.
+        self.pt = PathTracer(self._width // 2, self._height // 2, upscale=2,
                              exposure=PathTracerView.EXPOSURE)
         self.pt.set_geometry(cloth.pos, cloth.triIds)
         self.pt.set_ground(y=0.0, albedo=(0.55, 0.55, 0.6))

@@ -34,23 +34,34 @@ static __forceinline__ __device__ float  clampf(float x, float lo, float hi) { r
 // --------------------------------------------------------------------------- //
 struct Params
 {
-    float4*                accum;     // HDR accumulator, width*height
-    float4*                output;    // per-frame HDR (= accum / (subframe+1)), denoiser input
-    float4*                albedo;    // guide AOV: per-pixel surface albedo
-    float4*                normal;    // guide AOV: per-pixel view-space normal (+z toward camera)
-    OptixTraversableHandle handle;    // cloth GAS
+    // --- 8-byte members first (pointers + handle) --- //
+    float4*                accum;         // HDR accumulator, width*height (input res)
+    float4*                output;        // per-frame HDR (= accum / (subframe+1)), denoiser input
+    float4*                albedo;        // guide AOV: per-pixel surface albedo
+    float4*                normal;        // guide AOV: per-pixel view-space normal (+z toward camera)
+    float3*                prev_vertices; // previous-frame cloth vertex positions (for motion vectors)
+    uint3*                 tri_indices;   // triangle vertex-index triplets (prev-vertex lookup)
+    float2*                flow;          // output motion-vector AOV (input res, curr -> prev in pixels)
+    OptixTraversableHandle handle;        // cloth GAS
 
-    unsigned int           width;
-    unsigned int           height;
-    unsigned int           subframe;  // 0 resets the accumulator
-    float                  exposure;  // unused on device (tonemap is a Warp kernel)
+    // --- 4-byte scalars --- //
+    unsigned int           width;         // input (render) width
+    unsigned int           height;        // input (render) height
+    unsigned int           subframe;      // 0 resets the accumulator
+    float                  exposure;      // unused on device (tonemap is a Warp kernel)
 
+    // --- float3 basis / colors (float3 has 4-byte alignment) --- //
     float3                 cam_eye;
     float3                 cam_u;
     float3                 cam_v;
     float3                 cam_w;
 
-    float3                 light_dir;    // normalized, points toward the light
+    float3                 prev_cam_eye;  // previous-frame camera (for motion-vector reprojection)
+    float3                 prev_cam_u;
+    float3                 prev_cam_v;
+    float3                 prev_cam_w;
+
+    float3                 light_dir;     // normalized, points toward the light
     float3                 light_color;
     float3                 sky_top;
     float3                 sky_bottom;
@@ -59,6 +70,8 @@ struct Params
     float3                 sphere_albedo;
     float                  sphere_radius;
 
+    float3                 sphere_center_prev; // previous-frame sphere center (rigid motion)
+
     float3                 ground_albedo;
     float                  ground_y;
 
@@ -66,17 +79,69 @@ struct Params
     float3                 cloth_albedo_back;
 };
 
+// Firefly clamp on per-sample radiance luminance. Direct-only shading (M3) is
+// already bounded, so this is a no-op today; it becomes load-bearing once GI /
+// NEE add stochastic bounces in M4.
+#define PT_MAX_RADIANCE 64.0f
+
 extern "C" {
 __constant__ Params params;
 }
 
-// Payloads: p0 = hit t (float bits), p1..p3 = geometric normal.
-static __forceinline__ __device__ void setHitPayload(float t, float3 n)
+// Payloads: p0 = hit t (float bits), p1..p3 = geometric normal, p4..p6 =
+// previous-frame world position of the hit (for motion vectors).
+static __forceinline__ __device__ void setHitPayload(float t, float3 n, float3 pPrev)
 {
     optixSetPayload_0(__float_as_uint(t));
     optixSetPayload_1(__float_as_uint(n.x));
     optixSetPayload_2(__float_as_uint(n.y));
     optixSetPayload_3(__float_as_uint(n.z));
+    optixSetPayload_4(__float_as_uint(pPrev.x));
+    optixSetPayload_5(__float_as_uint(pPrev.y));
+    optixSetPayload_6(__float_as_uint(pPrev.z));
+}
+
+// Invert the pin-hole ray generation: solve D = a*cam_u + b*cam_v + c*cam_w for
+// (a, b, c) via Cramer's rule (scalar triple products). The NDC coordinates are
+// (a/c, b/c) -- exactly the (dx, dy) the raygen program maps to a pixel -- and c
+// is the depth along the (non-normalized) forward axis. Returns (a/c, b/c, c).
+static __forceinline__ __device__ float3 solveCameraNDC(float3 D, float3 u, float3 v, float3 w)
+{
+    float denom = dot(u, cross(v, w));
+    float inv = 1.0f / denom;
+    float a = dot(D, cross(v, w)) * inv;
+    float b = dot(u, cross(D, w)) * inv;
+    float c = dot(u, cross(v, D)) * inv;
+    return make_float3(a, b, c);
+}
+
+// Pixel coordinates (buffer convention: x right, y = launch-index y, both at the
+// pixel-center offset the raygen uses) for a world point seen by the given
+// camera. Returns false if the point projects behind the camera.
+static __forceinline__ __device__ bool projectToPixel(
+        float3 P, float3 eye, float3 u, float3 v, float3 w,
+        unsigned int W, unsigned int H, float2& outPix)
+{
+    float3 abc = solveCameraNDC(P - eye, u, v, w);
+    if (abc.z <= 1e-6f)
+        return false;
+    outPix.x = (abc.x / abc.z + 1.0f) * 0.5f * (float)W;
+    outPix.y = (abc.y / abc.z + 1.0f) * 0.5f * (float)H;
+    return true;
+}
+
+// Same, for a pure direction (a point at infinity, e.g. the sky): the eye
+// translation is irrelevant, only the camera basis (rotation) matters.
+static __forceinline__ __device__ bool projectDirToPixel(
+        float3 Dd, float3 u, float3 v, float3 w,
+        unsigned int W, unsigned int H, float2& outPix)
+{
+    float3 abc = solveCameraNDC(Dd, u, v, w);
+    if (abc.z <= 1e-6f)
+        return false;
+    outPix.x = (abc.x / abc.z + 1.0f) * 0.5f * (float)W;
+    outPix.y = (abc.y / abc.z + 1.0f) * 0.5f * (float)H;
+    return true;
 }
 
 // Deterministic per-sample hash for subpixel jitter (PCG-ish).
@@ -156,14 +221,16 @@ extern "C" __global__ void __raygen__rg()
     // Trace the cloth GAS.
     unsigned int p0 = __float_as_uint(1e30f);  // t (1e30 == miss)
     unsigned int p1 = 0u, p2 = 0u, p3 = 0u;    // normal
+    unsigned int p4 = 0u, p5 = 0u, p6 = 0u;    // previous-frame hit position
     optixTrace(
             params.handle, origin, dir,
             0.0f, 1e16f, 0.0f,
             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
             0, 1, 0,
-            p0, p1, p2, p3);
+            p0, p1, p2, p3, p4, p5, p6);
     float t_cloth = __uint_as_float(p0);
     float3 n_cloth = make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3));
+    float3 prev_hit_cloth = make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6));
 
     // Analytic colliders.
     float t_sphere = intersectSphere(origin, dir, params.sphere_center, params.sphere_radius);
@@ -220,6 +287,12 @@ extern "C" __global__ void __raygen__rg()
         aov_normal = make_float3(dot(nf, uh), dot(nf, vh), dot(nf, wh * -1.0f));
     }
 
+    // Firefly clamp: cap the per-sample radiance luminance before it enters the
+    // accumulator so a single bright outlier can't dominate the mean.
+    float lum = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
+    if (lum > PT_MAX_RADIANCE)
+        color = color * (PT_MAX_RADIANCE / lum);
+
     // Progressive accumulation.
     float4 prev = (params.subframe == 0u) ? make_float4(0.0f, 0.0f, 0.0f, 0.0f)
                                           : params.accum[pixel];
@@ -233,6 +306,41 @@ extern "C" __global__ void __raygen__rg()
     // a denoiser guide). No accumulation needed.
     params.albedo[pixel] = make_float4(aov_albedo.x, aov_albedo.y, aov_albedo.z, 1.0f);
     params.normal[pixel] = make_float4(aov_normal.x, aov_normal.y, aov_normal.z, 0.0f);
+
+    // Motion-vector (flow) AOV: the OptiX temporal denoiser wants, at the current
+    // pixel, the vector (current - previous) in input-resolution pixels, so it can
+    // recover the source pixel as (current - flow). We find where the surface seen
+    // here *was* one frame ago (prev_pix), in the same pixel convention the raygen
+    // uses (x right, y up from the bottom row -- self-consistent with the beauty /
+    // previousOutput buffers, so the denoiser's reprojection lands correctly).
+    // The host zeroes history on the first frame (temporalModeUsePreviousLayers =
+    // 0), so a bogus flow then is harmless; we still emit a sane value.
+    float2 curr_pix = make_float2((float)idx.x + 0.5f, (float)idx.y + 0.5f);
+    float2 prev_pix = curr_pix;  // default: zero flow (static / reprojection failed)
+    float2 pp;
+    if (which == 0)
+    {
+        // Sky: reproject the ray direction through the previous camera basis.
+        if (projectDirToPixel(dir, params.prev_cam_u, params.prev_cam_v,
+                              params.prev_cam_w, params.width, params.height, pp))
+            prev_pix = pp;
+    }
+    else
+    {
+        float3 P_curr = origin + dir * best;
+        float3 P_prev;
+        if (which == 1)
+            P_prev = prev_hit_cloth;                       // barycentric on prev verts
+        else if (which == 2)
+            P_prev = P_curr + (params.sphere_center_prev - params.sphere_center);  // rigid
+        else
+            P_prev = P_curr;                               // static ground
+        if (projectToPixel(P_prev, params.prev_cam_eye, params.prev_cam_u,
+                           params.prev_cam_v, params.prev_cam_w,
+                           params.width, params.height, pp))
+            prev_pix = pp;
+    }
+    params.flow[pixel] = make_float2(curr_pix.x - prev_pix.x, curr_pix.y - prev_pix.y);
 }
 
 extern "C" __global__ void __miss__ms()
@@ -250,5 +358,17 @@ extern "C" __global__ void __closesthit__ch()
     float3 v[3];
     optixGetTriangleVertexData(params.handle, prim, sbtIdx, 0.0f, v);
     float3 n = normalize(cross(v[1] - v[0], v[2] - v[0]));
-    setHitPayload(optixGetRayTmax(), n);
+
+    // Previous-frame world position of this exact surface point: reuse the hit's
+    // barycentrics against the *previous* frame's vertex positions (same topology,
+    // same triangle index -- only the vertices moved). This is the cloth's true
+    // per-vertex motion, the term a rigid/camera reprojection cannot capture.
+    float2 bc = optixGetTriangleBarycentrics();
+    uint3 tri = params.tri_indices[prim];
+    float3 p0 = params.prev_vertices[tri.x];
+    float3 p1 = params.prev_vertices[tri.y];
+    float3 p2 = params.prev_vertices[tri.z];
+    float3 pPrev = p0 * (1.0f - bc.x - bc.y) + p1 * bc.x + p2 * bc.y;
+
+    setHitPayload(optixGetRayTmax(), n, pPrev);
 }

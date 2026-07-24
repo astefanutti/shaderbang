@@ -12,8 +12,9 @@ the hot path:
   * one primary ray per pixel is traced against that GAS, with the sphere and
     ground intersected analytically in the raygen program (see ``programs.cu``);
   * radiance is accumulated in an HDR buffer, run through the OptiX AI denoiser
-    (single-frame HDR in M1; temporal + upscale come in M3), then tone-mapped
-    (ACES) by a Warp kernel straight into an OpenGL PBO for display.
+    (single-frame HDR by default; a temporal 2x-upscale model with motion vectors
+    when constructed with ``upscale=2``), then tone-mapped (ACES) by a Warp kernel
+    straight into an OpenGL PBO for display.
 
 Everything -- OptiX, Warp, CuPy -- shares the CUDA *primary* context (OptiX is
 created with ``cu_ctx = 0``) so device memory and the stream are shared. The
@@ -36,26 +37,32 @@ import warp as wp
 
 # --------------------------------------------------------------------------- #
 # Launch parameters -- MUST match the Params struct in programs.cu field-for-
-# field. align=True reproduces C struct padding: the five 8-byte members come
-# first (offsets 0/8/16/24/32), then the 4-byte scalars, then the tightly packed
-# float3s (each an ('f4', (3,)) subarray == float3). itemsize rounds up to a
-# multiple of 8.
+# field. align=True reproduces C struct padding: the eight 8-byte members come
+# first (offsets 0/8/.../56), then the 4-byte scalars, then the tightly packed
+# float3s (each an ('f4', (3,)) subarray == float3; float2 == ('f4', (2,))).
+# itemsize rounds up to a multiple of 8.
 # --------------------------------------------------------------------------- #
 _PARAMS_NAMES = [
-    "accum", "output", "albedo", "normal", "handle",
+    "accum", "output", "albedo", "normal",
+    "prev_vertices", "tri_indices", "flow", "handle",
     "width", "height", "subframe", "exposure",
     "cam_eye", "cam_u", "cam_v", "cam_w",
+    "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
     "light_dir", "light_color", "sky_top", "sky_bottom",
     "sphere_center", "sphere_albedo", "sphere_radius",
+    "sphere_center_prev",
     "ground_albedo", "ground_y",
     "cloth_albedo_front", "cloth_albedo_back",
 ]
 _PARAMS_FORMATS = [
-    "u8", "u8", "u8", "u8", "u8",
+    "u8", "u8", "u8", "u8",
+    "u8", "u8", "u8", "u8",
     "u4", "u4", "u4", "f4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
+    ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), "f4",
+    ("f4", (3,)),
     ("f4", (3,)), "f4",
     ("f4", (3,)), ("f4", (3,)),
 ]
@@ -187,12 +194,20 @@ class PathTracer:
     """
 
     def __init__(self, width, height, device="cuda:0", exposure=1.0,
-                 log_level=0):
+                 upscale=1, log_level=0):
         self.width = int(width)
         self.height = int(height)
+        # Output extent. The temporal-upscale denoiser (M3b) produces a 2x-larger
+        # image than it is fed, so the beauty/guide/flow buffers stay at the
+        # render res (self.width/height) while the denoised result, tone-map
+        # target, present texture and PBO use the output res (self._out_*).
+        self.upscale = int(upscale)
+        self._out_width = self.width * self.upscale
+        self._out_height = self.height * self.upscale
         self.exposure = float(exposure)
         self._device = device
         self._subframe = 0
+        self._has_history = False   # temporal denoiser: no valid prev frame yet
 
         # Lazy GPU-stack imports (kept out of module import so the dev box can
         # import this file for byte-compile / partial use).
@@ -239,10 +254,12 @@ class PathTracer:
         self._d_temp = None
         self._d_temp_size = 0
         self._gas_output_size = 0
+        self._vertices = None
         self._vtx_ptr = 0
         self._num_vertices = 0
         self._idx_ptr = 0
         self._num_triangles = 0
+        self._prev_vertices = None   # previous-frame vertex snapshot (motion vec)
 
         # GL present state (created lazily on the first present, when a GL
         # context is current).
@@ -311,7 +328,7 @@ class PathTracer:
             usesMotionBlur=False,
             traversableGraphFlags=int(
                 optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS),
-            numPayloadValues=4,     # t + geometric normal (xyz)
+            numPayloadValues=7,     # t + geometric normal (xyz) + prev-pos (xyz)
             numAttributeValues=2,   # built-in triangle barycentrics
             exceptionFlags=int(optix.EXCEPTION_FLAG_NONE),
             pipelineLaunchParamsVariableName="params",
@@ -400,31 +417,59 @@ class PathTracer:
         n = self.width * self.height
         self.d_accum = wp.zeros(n, dtype=wp.vec4, device=self._device)
         self.d_output = wp.zeros(n, dtype=wp.vec4, device=self._device)
-        self.d_denoised = wp.zeros(n, dtype=wp.vec4, device=self._device)
+        # Denoised result is at the output extent (2x under temporal upscale).
+        self.d_denoised = wp.zeros(self._out_width * self._out_height,
+                                   dtype=wp.vec4, device=self._device)
+        # The buffer the tone-map reads. Under the temporal-upscale model the
+        # output double-buffers and this is re-pointed at the live one each frame.
+        self._d_denoised_cur = self.d_denoised
         # Denoiser guide AOVs (written by the raygen program every frame).
         self.d_albedo = wp.zeros(n, dtype=wp.vec4, device=self._device)
         self.d_normal = wp.zeros(n, dtype=wp.vec4, device=self._device)
-        # Offscreen LDR target (present() writes into a mapped PBO instead).
-        self.d_ldr = wp.zeros(n * 4, dtype=wp.uint8, device=self._device)
+        # Motion-vector (flow) AOV: input-res 2D vector, current -> previous
+        # frame, in pixels; written by the raygen program every frame and fed to
+        # the temporal denoiser as guideLayer.flow.
+        self.d_flow = wp.zeros(n, dtype=wp.vec2, device=self._device)
+        # Offscreen LDR target (present() writes into a mapped PBO instead). Sized
+        # for the *output* extent, which is 2x the render res under the upscaling
+        # temporal model (see _out_width/_out_height).
+        self.d_ldr = wp.zeros(self._out_width * self._out_height * 4,
+                              dtype=wp.uint8, device=self._device)
 
-    def _image2d(self, wp_arr):
-        oi = self._optix.Image2D()
-        oi.data = int(wp_arr.ptr)
-        oi.width = self.width
-        oi.height = self.height
-        oi.rowStrideInBytes = self.width * 16   # FLOAT4
-        oi.pixelStrideInBytes = 16
-        oi.format = self._optix.PIXEL_FORMAT_FLOAT4
+    def _image2d(self, wp_arr, width=None, height=None, fmt=None,
+                 pixel_stride=16):
+        """Wrap a device buffer as an OptixImage2D. Defaults to a render-res
+        FLOAT4 image (beauty/albedo/normal); pass width/height/fmt/pixel_stride
+        for the output-res denoised image (2x) or the FLOAT2 flow AOV (8B)."""
+        optix = self._optix
+        oi = optix.Image2D()
+        oi.data = _device_ptr(wp_arr)   # wp.array or cupy (internal guide layers)
+        oi.width = self.width if width is None else width
+        oi.height = self.height if height is None else height
+        oi.rowStrideInBytes = oi.width * pixel_stride
+        oi.pixelStrideInBytes = pixel_stride
+        oi.format = optix.PIXEL_FORMAT_FLOAT4 if fmt is None else fmt
         return oi
 
     def _create_denoiser(self):
         optix = self._optix
-        cp = self._cp
         dn_options = optix.DenoiserOptions()
         # Albedo + normal guides sharpen edges the beauty alone smears; the
         # raygen program fills d_albedo/d_normal every frame (see programs.cu).
         dn_options.guideAlbedo = 1
         dn_options.guideNormal = 1
+        if self.upscale > 1:
+            self._create_denoiser_temporal(dn_options)
+        else:
+            self._create_denoiser_hdr(dn_options)
+
+    def _create_denoiser_hdr(self, dn_options):
+        """Single-frame HDR denoiser (M1/M3a): no motion vectors, no upscale, so
+        the output extent equals the render extent. Works against the stock
+        otk-pyoptix binding (selected when ``upscale == 1``)."""
+        optix = self._optix
+        cp = self._cp
+        self._temporal = False
         self._denoiser = self._ctx.denoiserCreate(
             optix.DENOISER_MODEL_KIND_HDR, dn_options)
 
@@ -444,16 +489,96 @@ class PathTracer:
         self._dn_layer.input = self._dn_input
         self._dn_layer.output = self._dn_output
         # Guide layer: albedo + view-space normal AOVs (both FLOAT4, same extent
-        # as the beauty). The binding exposes exactly .albedo/.normal/.flow.
+        # as the beauty).
         self._dn_albedo_img = self._image2d(self.d_albedo)
         self._dn_normal_img = self._image2d(self.d_normal)
         self._dn_guide = optix.DenoiserGuideLayer()
         self._dn_guide.albedo = self._dn_albedo_img
         self._dn_guide.normal = self._dn_normal_img
         self._dn_params = optix.DenoiserParams()
-        self._dn_params.denoiseAlpha = 0
-        self._dn_params.hdrIntensity = self._d_intensity
+        # denoiseAlpha moved from DenoiserParams to DenoiserOptions in OptiX 8.0;
+        # the patched binding gates it out of Params for >= 8.0, so only touch it
+        # where it still exists (the field defaults to 0 either way).
+        if hasattr(self._dn_params, "denoiseAlpha"):
+            self._dn_params.denoiseAlpha = 0
+        self._dn_params.hdrIntensity = int(self._d_intensity.data.ptr)
         self._dn_params.hdrAverageColor = 0
+        self._dn_params.blendFactor = 0.0
+        self._d_denoised_cur = self.d_denoised
+
+    def _create_denoiser_temporal(self, dn_options):
+        """Temporal + 2x-upscale denoiser (M3b): renders at self.width x
+        self.height and produces a 2x image. Recurrent state is carried across
+        frames through the double-buffered internal guide layers and the previous
+        denoised output, reprojected with the flow AOV. Requires the patched
+        otk-pyoptix binding (see pathtracer/patches/); selected by ``upscale=2``.
+        """
+        optix = self._optix
+        cp = self._cp
+        self._temporal = True
+        self._dn_has_history = False   # no valid previous output/guide on frame 0
+        self._out_flip = 0
+        self._denoiser = self._ctx.denoiserCreate(
+            optix.DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X, dn_options)
+
+        # computeMemoryResources / setup take the INPUT (render) extent; the model
+        # knows its output is 2x. Full-frame (no tiling) -> withoutOverlap scratch.
+        mem = self._denoiser.computeMemoryResources(self.width, self.height)
+        self._d_state = cp.empty((mem.stateSizeInBytes,), dtype=cp.uint8)
+        self._d_scratch = cp.empty(
+            (mem.withoutOverlapScratchSizeInBytes,), dtype=cp.uint8)
+        # The upscale family normalizes with the average colour (a 3-float device
+        # buffer filled by computeAverageColor), not the scalar hdrIntensity.
+        self._d_avg_color = cp.zeros((3,), dtype=cp.float32)
+        self._denoiser.setup(
+            self._stream_ptr, self.width, self.height,
+            self._d_state.data.ptr, self._d_state.nbytes,
+            self._d_scratch.data.ptr, self._d_scratch.nbytes)
+
+        # Double-buffered denoised output (2x): d_denoised is buffer A (from
+        # _alloc_image_buffers); allocate buffer B here.
+        self.d_denoised2 = wp.zeros(self._out_width * self._out_height,
+                                    dtype=wp.vec4, device=self._device)
+        self._out_bufs = (self.d_denoised, self.d_denoised2)
+        self._d_denoised_cur = self.d_denoised
+
+        # Double-buffered internal guide layers (the model's recurrent hidden
+        # state), at the OUTPUT extent, opaque pixels of the model's size. Zeroed
+        # so the previous-guide read on frame 0 is well-defined.
+        self._ig_pixel = int(mem.internalGuideLayerPixelSizeInBytes)
+        ig_bytes = self._out_width * self._out_height * self._ig_pixel
+        self._d_ig = (cp.zeros((ig_bytes,), dtype=cp.uint8),
+                      cp.zeros((ig_bytes,), dtype=cp.uint8))
+
+        # Persistent OptiX image/layer/guide objects. The 1x inputs are fixed; the
+        # 2x output + internal-guide pointers are rebound per frame as the double
+        # buffers swap (see _denoise_temporal).
+        self._dn_input = self._image2d(self.d_output)             # beauty (1x)
+        self._dn_albedo_img = self._image2d(self.d_albedo)        # 1x
+        self._dn_normal_img = self._image2d(self.d_normal)        # 1x
+        self._dn_flow_img = self._image2d(                        # 1x, FLOAT2
+            self.d_flow, fmt=optix.PIXEL_FORMAT_FLOAT2, pixel_stride=8)
+        self._dn_out_img = (
+            self._image2d(self.d_denoised, self._out_width, self._out_height),
+            self._image2d(self.d_denoised2, self._out_width, self._out_height),
+        )
+        self._dn_ig_img = (
+            self._image2d(self._d_ig[0], self._out_width, self._out_height,
+                          optix.PIXEL_FORMAT_INTERNAL_GUIDE_LAYER, self._ig_pixel),
+            self._image2d(self._d_ig[1], self._out_width, self._out_height,
+                          optix.PIXEL_FORMAT_INTERNAL_GUIDE_LAYER, self._ig_pixel),
+        )
+        self._dn_layer = optix.DenoiserLayer()
+        self._dn_layer.input = self._dn_input
+        self._dn_guide = optix.DenoiserGuideLayer()
+        self._dn_guide.albedo = self._dn_albedo_img
+        self._dn_guide.normal = self._dn_normal_img
+        self._dn_guide.flow = self._dn_flow_img
+        self._dn_params = optix.DenoiserParams()
+        if hasattr(self._dn_params, "denoiseAlpha"):   # OptiX < 8 only (see above)
+            self._dn_params.denoiseAlpha = 0
+        self._dn_params.hdrIntensity = 0
+        self._dn_params.hdrAverageColor = int(self._d_avg_color.data.ptr)
         self._dn_params.blendFactor = 0.0
 
     def _init_params(self):
@@ -464,6 +589,10 @@ class PathTracer:
         p["output"] = int(self.d_output.ptr)
         p["albedo"] = int(self.d_albedo.ptr)
         p["normal"] = int(self.d_normal.ptr)
+        p["flow"] = int(self.d_flow.ptr)
+        # prev_vertices / tri_indices are wired by set_geometry (0 until then).
+        p["prev_vertices"] = 0
+        p["tri_indices"] = 0
         p["width"] = self.width
         p["height"] = self.height
         p["exposure"] = self.exposure
@@ -472,6 +601,11 @@ class PathTracer:
         p["cam_u"] = (1.0, 0.0, 0.0)
         p["cam_v"] = (0.0, 1.0, 0.0)
         p["cam_w"] = (0.0, 0.0, -1.0)
+        # Previous-frame camera starts equal to the current one (zero motion).
+        p["prev_cam_eye"] = tuple(p["cam_eye"])
+        p["prev_cam_u"] = tuple(p["cam_u"])
+        p["prev_cam_v"] = tuple(p["cam_v"])
+        p["prev_cam_w"] = tuple(p["cam_w"])
         p["light_dir"] = _norm3((0.4, 1.0, 0.3))
         p["light_color"] = (1.0, 1.0, 1.0)
         p["sky_top"] = (0.35, 0.55, 0.9)
@@ -479,6 +613,7 @@ class PathTracer:
         p["sphere_center"] = (0.0, 1.5, 0.0)
         p["sphere_albedo"] = (0.75, 0.2, 0.2)
         p["sphere_radius"] = 0.5
+        p["sphere_center_prev"] = tuple(p["sphere_center"])
         p["ground_albedo"] = (0.6, 0.6, 0.6)
         p["ground_y"] = 0.0
         p["cloth_albedo_front"] = (0.2, 0.45, 0.85)
@@ -550,6 +685,7 @@ class PathTracer:
         length-``3*num_tris`` array). Both stay owned by the caller (the physics
         keeps writing ``vertices`` in place); we only keep their pointers.
         """
+        self._vertices = vertices          # kept for the per-frame prev snapshot
         self._vtx_ptr = _device_ptr(vertices)
         self._num_vertices = int(len(vertices))
         self._idx_ptr = _device_ptr(indices)
@@ -558,6 +694,17 @@ class PathTracer:
             self._num_triangles = int(shape[0])
         else:
             self._num_triangles = int(len(indices)) // 3
+
+        # Previous-frame vertex snapshot for motion vectors. The closesthit
+        # program reads params.prev_vertices[tri.xyz]; the index buffer itself
+        # doubles as uint3* (int32 triplets are bit-identical to uint3), so
+        # tri_indices just aliases the caller's index buffer.
+        self._prev_vertices = wp.zeros(self._num_vertices, dtype=wp.vec3,
+                                       device=self._device)
+        wp.copy(self._prev_vertices, self._vertices)   # frame 0: prev == current
+        self._h_params[0]["prev_vertices"] = int(self._prev_vertices.ptr)
+        self._h_params[0]["tri_indices"] = int(self._idx_ptr)
+
         self._build_gas(update=False)
 
     def _triangle_input(self):
@@ -638,8 +785,35 @@ class PathTracer:
 
         self._denoise()
         self._subframe += 1
+        self._snapshot_prev()
+
+    def _snapshot_prev(self):
+        """Freeze this frame's camera, sphere and cloth vertices as the
+        ``previous`` state the next frame's motion vectors reproject against.
+
+        Runs after the launch has consumed the *current* prev_* fields. The
+        vertex copy is issued on the render stream (the Warp default stream,
+        shared with the physics), so it is ordered strictly after this frame's
+        trace and strictly before next frame's physics overwrites the vertices
+        in place -- no extra sync, no race on the shared buffer.
+        """
+        p = self._h_params[0]
+        p["prev_cam_eye"] = tuple(p["cam_eye"])
+        p["prev_cam_u"] = tuple(p["cam_u"])
+        p["prev_cam_v"] = tuple(p["cam_v"])
+        p["prev_cam_w"] = tuple(p["cam_w"])
+        p["sphere_center_prev"] = tuple(p["sphere_center"])
+        if self._prev_vertices is not None and self._vertices is not None:
+            wp.copy(self._prev_vertices, self._vertices)
+        self._has_history = True
 
     def _denoise(self):
+        if self._temporal:
+            self._denoise_temporal()
+        else:
+            self._denoise_hdr()
+
+    def _denoise_hdr(self):
         self._denoiser.computeIntensity(
             self._stream_ptr, self._dn_input, self._d_intensity.data.ptr,
             self._d_scratch.data.ptr, self._d_scratch.nbytes)
@@ -650,18 +824,54 @@ class PathTracer:
             self._d_scratch.data.ptr, self._d_scratch.nbytes,
             0, self.width, self.height)
 
+    def _denoise_temporal(self):
+        # Average colour drives the HDR normalization for the upscale family (it
+        # does not use the scalar intensity computeIntensity produces).
+        self._denoiser.computeAverageColor(
+            self._stream_ptr, self._dn_input, self._d_avg_color.data.ptr,
+            self._d_scratch.data.ptr, self._d_scratch.nbytes)
+
+        cur = self._out_flip
+        prev = 1 - cur
+        # This frame writes buffer `cur`; the previous frame's denoised output and
+        # internal guide (buffer `prev`) feed the temporal reprojection. On frame 0
+        # the `prev` buffers are zeroed and ignored (temporalModeUsePreviousLayers=0).
+        self._dn_layer.output = self._dn_out_img[cur]
+        self._dn_layer.previousOutput = self._dn_out_img[prev]
+        self._dn_guide.outputInternalGuideLayer = self._dn_ig_img[cur]
+        self._dn_guide.previousOutputInternalGuideLayer = self._dn_ig_img[prev]
+        self._dn_params.temporalModeUsePreviousLayers = (
+            1 if self._dn_has_history else 0)
+
+        # Non-tiled full-frame invoke: a single layer (numLayers = 1). The setup /
+        # scratch were sized for the whole frame, so no tiling/overlap is needed.
+        self._denoiser.invoke(
+            self._stream_ptr, self._dn_params,
+            self._d_state.data.ptr, self._d_state.nbytes,
+            self._dn_guide, self._dn_layer, 1,
+            0, 0,
+            self._d_scratch.data.ptr, self._d_scratch.nbytes)
+
+        self._d_denoised_cur = self._out_bufs[cur]
+        self._out_flip = prev
+        self._dn_has_history = True
+
     def _tonemap_into(self, out_u8):
-        wp.launch(_tonemap_kernel, dim=self.width * self.height,
-                  inputs=[self.d_denoised, out_u8, self.exposure],
+        # The denoised buffer is at the output extent (2x under temporal upscale);
+        # _d_denoised_cur tracks the live one of the double buffer. One thread per
+        # output pixel.
+        wp.launch(_tonemap_kernel, dim=self._out_width * self._out_height,
+                  inputs=[self._d_denoised_cur, out_u8, self.exposure],
                   device=self._device, stream=self._wp_stream)
 
     def download_ldr(self):
         """Tone-map into ``d_ldr`` and return an (H, W, 4) uint8 numpy image
-        (row 0 = bottom, matching the ray-gen convention). For offscreen use."""
+        (row 0 = bottom, matching the ray-gen convention) at the *output*
+        extent. For offscreen use."""
         self._tonemap_into(self.d_ldr)
         wp.synchronize_stream(self._wp_stream)
         flat = self.d_ldr.numpy()
-        return flat.reshape(self.height, self.width, 4)
+        return flat.reshape(self._out_height, self._out_width, 4)
 
     # ------------------------------------------------------------------ #
     # OpenGL present (fixed-function; robust across the target's GL version)
@@ -679,7 +889,8 @@ class PathTracer:
         )
         self._tex = int(glGenTextures(1))
         glBindTexture(GL_TEXTURE_2D, self._tex)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, self.width, self.height, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     self._out_width, self._out_height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, None)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -689,7 +900,8 @@ class PathTracer:
 
         self._pbo = int(glGenBuffers(1))
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo)
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, self.width * self.height * 4,
+        glBufferData(GL_PIXEL_UNPACK_BUFFER,
+                     self._out_width * self._out_height * 4,
                      None, GL_STREAM_DRAW)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
 
@@ -709,14 +921,15 @@ class PathTracer:
             glBindBuffer, glBindTexture, glTexSubImage2D,
             GL_TEXTURE_2D, GL_RGBA, GL_UNSIGNED_BYTE, GL_PIXEL_UNPACK_BUFFER,
         )
-        n = self.width * self.height
+        # The presented image is at the output extent (2x under temporal upscale).
+        n = self._out_width * self._out_height
         mapped = self._pbo_reg.map(dtype=wp.uint8, shape=(n * 4,))
         self._tonemap_into(mapped)
         self._pbo_reg.unmap()   # ensures the CUDA write is complete for GL
 
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo)
         glBindTexture(GL_TEXTURE_2D, self._tex)
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self.width, self.height,
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, self._out_width, self._out_height,
                         GL_RGBA, GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
         glBindTexture(GL_TEXTURE_2D, 0)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
@@ -730,7 +943,8 @@ class PathTracer:
             GL_PROJECTION, GL_MODELVIEW, GL_TEXTURE_2D, GL_DEPTH_TEST,
             GL_LIGHTING, GL_QUADS, GL_TRUE,
         )
-        glViewport(0, 0, self.width, self.height)
+        # Fill the full framebuffer (== output extent by construction).
+        glViewport(0, 0, self._out_width, self._out_height)
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
