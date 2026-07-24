@@ -192,11 +192,29 @@ stand up its own EGL context.
 
 ### M1 — First live frame
 `shaderbang/pathtracer/` module: OptiX pipeline (raygen / miss / closest-hit
-`.cu` compiled by NVRTC), GAS from `wp.array` geometry, 1 spp @ 1080p,
-single-bounce Lambert shading + analytic sphere, HDR accumulation, single-frame
-(non-temporal) denoise, PBO → `glTexSubImage2D` → ACES quad. Integrated into
-`cloth.py`, replacing the fixed-function GL cloth/sphere draw; geometry moves to
-plain `wp.array`s.
+`.cu` compiled by NVRTC), indexed GAS from `wp.array` geometry, 1 spp,
+single-bounce Lambert shading + analytic sphere + ground, HDR accumulation,
+single-frame (non-temporal) denoise, PBO → `glTexSubImage2D` → textured quad.
+Integrated into `cloth.py`, replacing the fixed-function GL cloth/sphere draw;
+geometry moves to plain `wp.array`s.
+
+Lands in two commits for reviewability:
+
+- **M1a — reusable renderer.** `programs.cu` (device programs) + `renderer.py`
+  (the `PathTracer` class: pipeline, indexed GAS build + in-place refit,
+  accumulation, HDR denoise, present), plus `offscreen.py`, an on-target
+  self-test (`python -m shaderbang.pathtracer.offscreen`) that renders a curved
+  triangle sheet over the sphere/ground to a PNG with **no GL context** — so the
+  renderer is validated in isolation before touching cloth.py's live loop.
+- **M1b — cloth integration.** Wire the `PathTracer` into `cloth.py`, move the
+  cloth geometry off GL buffers onto plain `wp.array`s, and present the traced
+  frame in place of the fixed-function draws.
+
+Refinement vs. the original sketch: the ACES tone-map runs as a **post-denoise
+Warp kernel** that writes RGBA8 straight into the PBO (rather than a GLSL quad),
+so the present path is one texture upload + one fixed-function quad — robust
+across whatever GL version the native context exposes, and keeping the GL surface
+minimal in the pure-PT design.
 
 ### M2 — On-target benchmark
 Instrumentation to measure rays/s and frame time on the 5090 at 1080p and for
