@@ -245,11 +245,55 @@ figure is the sustained pipelined cost. The native-4K numbers stand in for the
 upper bound until M3 adds the 1080p→4K temporal upscale path.
 
 ### M3 — Temporal quality
-Per-frame GAS refit + periodic rebuild; `mvPrevPos` snapshot + screen-space flow
-AOV; albedo/normal guide AOVs; irradiance demodulation (denoise radiance/albedo,
-re-modulate after); geometric history rejection (normal / plane-depth / ID, not
-color clamping); firefly clamp; the OptiX **TEMPORAL** model with 2× upscale to
-4K.
+Split into two commits: **M3a** (guide AOVs — done) and **M3b** (temporal +
+upscale — see the binding blocker below).
+
+**M3a — albedo/normal guide AOVs (done).** The raygen program now writes two
+extra per-pixel buffers alongside the beauty: `d_albedo` (the hit's surface
+albedo; the background pixel gets the sky colour) and `d_normal` (the front-
+facing shading normal in *view space*, with the forward axis negated so +z points
+back toward the camera). Both are `FLOAT4`, same extent as the beauty, and are
+overwritten every subframe rather than accumulated — they are deterministic per
+pixel and the sub-pixel jitter only perturbs them at silhouette edges, which is
+fine for a denoiser guide. Host side: `DenoiserOptions.guideAlbedo`/`guideNormal`
+are enabled and the two buffers are attached as `DenoiserGuideLayer.albedo` /
+`.normal`. The guides let the HDR denoiser keep albedo and geometric edges the
+beauty alone smears at 1 spp — this is the achievable subset of the original
+"albedo/normal guide AOVs + irradiance demodulation" item (guide-based edge
+preservation subsumes manual demodulation while all albedos stay flat; explicit
+demodulation is revisited in M4 once textures/BSDF give it something to do).
+
+**M3b — temporal denoiser + motion vectors + 2× upscale (blocked on the
+binding).** The plan was: `mvPrevPos` snapshot + screen-space flow AOV;
+`previousOutput` history feedback; geometric history rejection via the flow +
+normal/plane-depth guides (not colour clamping); firefly clamp; the OptiX
+**TEMPORAL** model with 2× upscale (render 1080p → present 4K).
+
+Discovered during M3: the published `otk-pyoptix` binding (`src/main.cpp`, master)
+**cannot express this path** without patching and rebuilding the C++ extension.
+Verified from source:
+
+- `DENOISER_MODEL_KIND_TEMPORAL` and `_TEMPORAL_AOV` are both bound to the *AOV*
+  enum value (`main.cpp:2577-2578` — `.value("DENOISER_MODEL_KIND_TEMPORAL",
+  OPTIX_DENOISER_MODEL_KIND_AOV)`), so selecting "temporal" actually creates a
+  plain AOV denoiser.
+- `DENOISER_MODEL_KIND_UPSCALE2X` / `_TEMPORAL_UPSCALE2X` are **not exposed at
+  all** — no way to select an upscaling model.
+- `PixelFormat` exposes only HALF3/4, FLOAT3/4, UCHAR3/4 (`main.cpp:2562-2567`):
+  no `FLOAT2`/`HALF2` (the flow/motion-vector formats) and no
+  `INTERNAL_GUIDE_LAYER`.
+- `DenoiserGuideLayer` exposes only `albedo`/`normal`/`flow` (`main.cpp:3491-
+  3493`): no `previousOutputInternalGuideLayer` / `outputInternalGuideLayer` /
+  `flowTrustworthiness` — and OptiX 8/9 temporal modes carry recurrent state
+  through those internal guide layers.
+- `DenoiserParams` exposes no `temporalModeUsePreviousLayers` (`main.cpp:3503-
+  3511`), so there is no way to signal first-vs-subsequent frame.
+
+What *is* usable today: the LDR/HDR/AOV models, `DenoiserLayer.previousOutput`,
+`DenoiserGuideLayer.flow` (but with no FLOAT2/HALF2 format enum to tag it), and
+`invokeTiled` with a layer list. M3b is therefore **pending a decision** on how to
+proceed (fork+rebuild the binding to expose the temporal/upscale surface; a
+narrower workaround; or re-scope), tracked separately from the shipped M3a.
 
 ### M4 — Full shading
 Disney BSDF, multiple importance sampling, next-event estimation, and

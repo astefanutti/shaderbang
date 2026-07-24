@@ -36,12 +36,13 @@ import warp as wp
 
 # --------------------------------------------------------------------------- #
 # Launch parameters -- MUST match the Params struct in programs.cu field-for-
-# field. align=True reproduces C struct padding: the three 8-byte members come
-# first (offsets 0/8/16), then the 4-byte scalars, then the tightly packed
-# float3s (each an ('f4', (3,)) subarray == float3). itemsize rounds to 208.
+# field. align=True reproduces C struct padding: the five 8-byte members come
+# first (offsets 0/8/16/24/32), then the 4-byte scalars, then the tightly packed
+# float3s (each an ('f4', (3,)) subarray == float3). itemsize rounds up to a
+# multiple of 8.
 # --------------------------------------------------------------------------- #
 _PARAMS_NAMES = [
-    "accum", "output", "handle",
+    "accum", "output", "albedo", "normal", "handle",
     "width", "height", "subframe", "exposure",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "light_dir", "light_color", "sky_top", "sky_bottom",
@@ -50,7 +51,7 @@ _PARAMS_NAMES = [
     "cloth_albedo_front", "cloth_albedo_back",
 ]
 _PARAMS_FORMATS = [
-    "u8", "u8", "u8",
+    "u8", "u8", "u8", "u8", "u8",
     "u4", "u4", "u4", "f4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
@@ -400,6 +401,9 @@ class PathTracer:
         self.d_accum = wp.zeros(n, dtype=wp.vec4, device=self._device)
         self.d_output = wp.zeros(n, dtype=wp.vec4, device=self._device)
         self.d_denoised = wp.zeros(n, dtype=wp.vec4, device=self._device)
+        # Denoiser guide AOVs (written by the raygen program every frame).
+        self.d_albedo = wp.zeros(n, dtype=wp.vec4, device=self._device)
+        self.d_normal = wp.zeros(n, dtype=wp.vec4, device=self._device)
         # Offscreen LDR target (present() writes into a mapped PBO instead).
         self.d_ldr = wp.zeros(n * 4, dtype=wp.uint8, device=self._device)
 
@@ -417,8 +421,10 @@ class PathTracer:
         optix = self._optix
         cp = self._cp
         dn_options = optix.DenoiserOptions()
-        dn_options.guideAlbedo = 0
-        dn_options.guideNormal = 0
+        # Albedo + normal guides sharpen edges the beauty alone smears; the
+        # raygen program fills d_albedo/d_normal every frame (see programs.cu).
+        dn_options.guideAlbedo = 1
+        dn_options.guideNormal = 1
         self._denoiser = self._ctx.denoiserCreate(
             optix.DENOISER_MODEL_KIND_HDR, dn_options)
 
@@ -437,7 +443,13 @@ class PathTracer:
         self._dn_layer = optix.DenoiserLayer()
         self._dn_layer.input = self._dn_input
         self._dn_layer.output = self._dn_output
+        # Guide layer: albedo + view-space normal AOVs (both FLOAT4, same extent
+        # as the beauty). The binding exposes exactly .albedo/.normal/.flow.
+        self._dn_albedo_img = self._image2d(self.d_albedo)
+        self._dn_normal_img = self._image2d(self.d_normal)
         self._dn_guide = optix.DenoiserGuideLayer()
+        self._dn_guide.albedo = self._dn_albedo_img
+        self._dn_guide.normal = self._dn_normal_img
         self._dn_params = optix.DenoiserParams()
         self._dn_params.denoiseAlpha = 0
         self._dn_params.hdrIntensity = self._d_intensity
@@ -450,6 +462,8 @@ class PathTracer:
         p = self._h_params[0]
         p["accum"] = int(self.d_accum.ptr)
         p["output"] = int(self.d_output.ptr)
+        p["albedo"] = int(self.d_albedo.ptr)
+        p["normal"] = int(self.d_normal.ptr)
         p["width"] = self.width
         p["height"] = self.height
         p["exposure"] = self.exposure

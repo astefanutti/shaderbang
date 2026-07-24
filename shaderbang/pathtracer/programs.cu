@@ -36,6 +36,8 @@ struct Params
 {
     float4*                accum;     // HDR accumulator, width*height
     float4*                output;    // per-frame HDR (= accum / (subframe+1)), denoiser input
+    float4*                albedo;    // guide AOV: per-pixel surface albedo
+    float4*                normal;    // guide AOV: per-pixel view-space normal (+z toward camera)
     OptixTraversableHandle handle;    // cloth GAS
 
     unsigned int           width;
@@ -124,14 +126,12 @@ static __forceinline__ __device__ float3 skyColor(float3 dir)
     return lerp(params.sky_bottom, params.sky_top, t);
 }
 
-// Lambert direct lighting: albedo * (ambient-ish sky fill + N.L * light).
-static __forceinline__ __device__ float3 shade(float3 n, float3 albedo, float3 dir)
+// Lambert direct lighting with a sky-colored ambient fill. ``nf`` must already
+// face the viewer (see the raygen program). Returns the un-clamped HDR radiance.
+static __forceinline__ __device__ float3 shade(float3 nf, float3 albedo)
 {
-    // Two-sided: face the normal toward the viewer.
-    if (dot(n, dir) > 0.0f)
-        n = n * -1.0f;
-    float ndl = fmaxf(dot(n, params.light_dir), 0.0f);
-    float3 ambient = skyColor(n) * 0.25f;
+    float ndl = fmaxf(dot(nf, params.light_dir), 0.0f);
+    float3 ambient = skyColor(nf) * 0.25f;
     float3 direct = params.light_color * ndl;
     return albedo * (ambient + direct);
 }
@@ -178,9 +178,13 @@ extern "C" __global__ void __raygen__rg()
     if (t_ground > 0.0f && t_ground < best) { best = t_ground; which = 3; }
 
     float3 color;
+    float3 aov_albedo;              // denoiser albedo guide (background := sky)
+    float3 aov_normal;             // denoiser normal guide, view space, +z -> camera
     if (which == 0)
     {
         color = skyColor(dir);
+        aov_albedo = color;
+        aov_normal = make_float3(0.0f, 0.0f, 0.0f);
     }
     else
     {
@@ -204,7 +208,16 @@ extern "C" __global__ void __raygen__rg()
             n = make_float3(0.0f, 1.0f, 0.0f);
             albedo = params.ground_albedo;
         }
-        color = shade(n, albedo, dir);
+        // Face the normal toward the viewer, then shade + emit guides with it.
+        float3 nf = (dot(n, dir) > 0.0f) ? (n * -1.0f) : n;
+        color = shade(nf, albedo);
+        aov_albedo = albedo;
+        // View-space normal: project onto the (normalized) camera basis, with the
+        // forward axis negated so +z points back toward the camera.
+        float3 uh = normalize(params.cam_u);
+        float3 vh = normalize(params.cam_v);
+        float3 wh = normalize(params.cam_w);
+        aov_normal = make_float3(dot(nf, uh), dot(nf, vh), dot(nf, wh * -1.0f));
     }
 
     // Progressive accumulation.
@@ -214,6 +227,12 @@ extern "C" __global__ void __raygen__rg()
     params.accum[pixel] = acc;
     float inv = 1.0f / (float)(params.subframe + 1u);
     params.output[pixel] = make_float4(acc.x * inv, acc.y * inv, acc.z * inv, 1.0f);
+
+    // Guide AOVs are deterministic per pixel; overwrite each subframe (the small
+    // sub-pixel jitter only perturbs them at silhouette edges, which is fine for
+    // a denoiser guide). No accumulation needed.
+    params.albedo[pixel] = make_float4(aov_albedo.x, aov_albedo.y, aov_albedo.z, 1.0f);
+    params.normal[pixel] = make_float4(aov_normal.x, aov_normal.y, aov_normal.z, 0.0f);
 }
 
 extern "C" __global__ void __miss__ms()
