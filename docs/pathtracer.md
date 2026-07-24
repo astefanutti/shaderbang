@@ -231,9 +231,18 @@ across whatever GL version the native context exposes, and keeping the GL surfac
 minimal in the pure-PT design.
 
 ### M2 — On-target benchmark
-Instrumentation to measure rays/s and frame time on the 5090 at 1080p and for
-the 1080p→4K upscale path. This sets the real spp/bounce budget — the numbers
-that were only hypotheses at design time.
+Instrumentation to measure rays/s and frame time on the 5090 at 1080p and 4K.
+This sets the real spp/bounce budget — the numbers that were only hypotheses at
+design time. Implemented as `shaderbang/pathtracer/benchmark.py` (`python -m
+shaderbang.pathtracer.benchmark`): headless (no GL context, so it runs over SSH),
+it traces a deforming sheet sized to match cloth.py's default 320k-triangle mesh
+against the analytic sphere/ground and times each pipeline phase — GAS refit,
+trace, HDR denoise, ACES tone-map — reporting per-frame ms, fps and primary
+rays/s at 1080p and 4K. `trace` is derived as `render − denoise` (the fused
+launch+denoise `render()` call minus a denoise-only loop); timing is wall-clock
+around an explicit stream sync, one sync per `iters`-long phase loop so the
+figure is the sustained pipelined cost. The native-4K numbers stand in for the
+upper bound until M3 adds the 1080p→4K temporal upscale path.
 
 ### M3 — Temporal quality
 Per-frame GAS refit + periodic rebuild; `mvPrevPos` snapshot + screen-space flow
