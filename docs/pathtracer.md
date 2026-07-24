@@ -412,8 +412,29 @@ construction. **Native 4K** needs no special path: it is simply `upscale=1` at a
 4K extent (`PathTracer(3840, 2160, upscale=1)`), which selects the single-frame
 HDR denoiser at full resolution instead of the 1080p→4K temporal upscaler.
 
-**M5b — OIDN fallback (planned).** Intel OIDN non-temporal fallback backend
-behind the same denoiser interface for still frames / portability.
+**M5b — OIDN fallback (done).** A second denoiser backend, selected with
+`PathTracer(..., denoiser="oidn")`, runs Intel Open Image Denoise instead of the
+OptiX AI denoiser. It shares the whole rest of the pipeline — the OptiX trace and
+the same beauty + albedo + normal AOVs still feed it, and the result still flows
+through the device ACES tone-map — so from the caller's side it is the same
+`render()` / `present()` loop; only the denoise step swaps. OIDN is non-temporal,
+so it is valid only at `upscale=1` (the constructor rejects `denoiser="oidn"`
+with `upscale=2`).
+
+It is a deliberate **still-frame / portability fallback**, not a replacement for
+the live path: it is the one place that takes a CPU roundtrip (download the FLOAT4
+beauty/albedo/normal AOVs to host, run OIDN's `"RT"` filter with the guides in HDR
+mode, upload the denoised RGB back for the tone-map). That does not breach the
+"no CPU-GPU transfer on the hot path" rule — the hot path is the OptiX temporal
+backend; OIDN is opt-in for portability (e.g. where the patched temporal binding
+isn't available) or for high-quality progressive stills. The `oidn` package is a
+**soft dependency**: it is imported lazily and only when this backend is chosen,
+and a clear `RuntimeError` (with an install hint) is raised if it is missing. The
+binding targeted is the ctypes `oidn` wrapper whose functions mirror the C API
+(`NewDevice` / `NewFilter` / `SetSharedFilterImage` / `ExecuteFilter`) with numpy
+arrays as shared buffers; the exact binding surface and the HDR-flag setter name
+(which differs between OIDN 1.x and 2.x, so both spellings are probed) are marked
+`VERIFY-ON-TARGET`.
 
 ## References
 

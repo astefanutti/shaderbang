@@ -207,7 +207,7 @@ class PathTracer:
     """
 
     def __init__(self, width, height, device="cuda:0", exposure=1.0,
-                 upscale=1, log_level=0):
+                 upscale=1, log_level=0, denoiser="optix"):
         width = int(width)
         height = int(height)
         upscale = int(upscale)
@@ -225,6 +225,18 @@ class PathTracer:
                 f"2x-upscale denoiser), got {upscale}")
         if not (exposure > 0.0):
             raise ValueError(f"exposure must be > 0, got {exposure}")
+        # Denoiser backend: "optix" (the on-GPU OptiX AI denoiser, default) or
+        # "oidn" (Intel Open Image Denoise, a non-temporal CPU-roundtrip fallback
+        # for still frames / portability -- see _create_denoiser_oidn). OIDN
+        # cannot upscale, so it is only valid at upscale=1.
+        if denoiser not in ("optix", "oidn"):
+            raise ValueError(
+                f"denoiser must be 'optix' or 'oidn', got {denoiser!r}")
+        if denoiser == "oidn" and upscale != 1:
+            raise ValueError(
+                "the OIDN backend is non-temporal and cannot upscale; use "
+                "upscale=1 (or denoiser='optix' for the 2x temporal upscaler)")
+        self._backend = denoiser
         self.width = width
         self.height = height
         # Output extent. The temporal-upscale denoiser (M3b) produces a 2x-larger
@@ -518,6 +530,9 @@ class PathTracer:
         return oi
 
     def _create_denoiser(self):
+        if self._backend == "oidn":
+            self._create_denoiser_oidn()
+            return
         optix = self._optix
         dn_options = optix.DenoiserOptions()
         # Albedo + normal guides sharpen edges the beauty alone smears; the
@@ -1046,7 +1061,9 @@ class PathTracer:
         self._has_history = True
 
     def _denoise(self):
-        if self._temporal:
+        if self._backend == "oidn":
+            self._denoise_oidn()
+        elif self._temporal:
             self._denoise_temporal()
         else:
             self._denoise_hdr()
@@ -1093,6 +1110,110 @@ class PathTracer:
         self._d_denoised_cur = self._out_bufs[cur]
         self._out_flip = prev
         self._dn_has_history = True
+
+    # ------------------------------------------------------------------ #
+    # OIDN backend (M5b) -- non-temporal fallback for still frames /
+    # portability. This is the ONE place the pipeline takes a CPU roundtrip; it
+    # is deliberately off the live hot path (selected only with
+    # ``denoiser="oidn"``, which forbids upscale). Intel OIDN denoises the beauty
+    # with the albedo + normal guide AOVs on the host, then the result is
+    # uploaded back for the usual device tone-map. The whole backend is soft: the
+    # ``oidn`` package is imported lazily and only when this backend is chosen.
+    # The binding targeted is the ctypes ``oidn`` wrapper whose functions mirror
+    # the C API with the ``oidn``/``OIDN_`` prefixes stripped and numpy arrays as
+    # shared buffers (oidn.NewDevice / SetSharedFilterImage / ExecuteFilter).
+    # VERIFY-ON-TARGET: exact binding surface + performance.
+    # ------------------------------------------------------------------ #
+    def _create_denoiser_oidn(self):
+        try:
+            import oidn
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "denoiser='oidn' needs the Intel Open Image Denoise Python "
+                "binding; install it (e.g. `pip install oidn`) or use "
+                "denoiser='optix'") from e
+        self._oidn = oidn
+        self._temporal = False
+        h, w, n = self.height, self.width, self.width * self.height
+
+        # Persistent host staging bound once as OIDN "shared" images: OIDN reads
+        # /writes these numpy buffers in place every ExecuteFilter, so they must
+        # outlive the filter and be refilled (not reallocated) per frame. RGB
+        # only (the AOVs are FLOAT4 on device; we drop the padding alpha).
+        self._oidn_color = np.zeros((h, w, 3), dtype=np.float32)   # HDR beauty
+        self._oidn_albedo = np.zeros((h, w, 3), dtype=np.float32)  # [0,1]
+        self._oidn_normal = np.zeros((h, w, 3), dtype=np.float32)  # view-space
+        self._oidn_out = np.zeros((h, w, 3), dtype=np.float32)     # denoised
+        # Reused (n, 4) host buffer for the upload (alpha pinned to 1).
+        self._oidn_rgba = np.ones((n, 4), dtype=np.float32)
+
+        self._oidn_device = oidn.NewDevice()
+        oidn.CommitDevice(self._oidn_device)
+        f = oidn.NewFilter(self._oidn_device, "RT")
+        fmt = oidn.FORMAT_FLOAT3
+        oidn.SetSharedFilterImage(f, "color", self._oidn_color, fmt, w, h)
+        oidn.SetSharedFilterImage(f, "albedo", self._oidn_albedo, fmt, w, h)
+        oidn.SetSharedFilterImage(f, "normal", self._oidn_normal, fmt, w, h)
+        oidn.SetSharedFilterImage(f, "output", self._oidn_out, fmt, w, h)
+        # The beauty is linear HDR (tone-mapped later on device), so the filter
+        # must run in HDR mode. The bool-setter name differs across binding
+        # versions (OIDN 2.x SetFilterBool vs 1.x SetFilter1b), so probe both.
+        self._oidn_set_bool(f, "hdr", True)
+        oidn.CommitFilter(f)
+        self._oidn_filter = f
+        self._d_denoised_cur = self.d_denoised   # valid target before frame 0
+
+    def _oidn_set_bool(self, filt, name, value):
+        for fn in ("SetFilterBool", "SetFilter1b", "SetFilter1i"):
+            setter = getattr(self._oidn, fn, None)
+            if setter is None:
+                continue
+            try:
+                setter(filt, name, bool(value) if fn != "SetFilter1i"
+                       else int(value))
+                return True
+            except Exception:  # noqa: BLE001 -- try the next spelling
+                continue
+        return False
+
+    def _denoise_oidn(self):
+        # Make sure the OptiX launch's writes to the beauty/guide AOVs are
+        # visible on the host before the download (this backend is synchronous by
+        # design -- it is the still-frame fallback, not the live hot path).
+        wp.synchronize_stream(self._wp_stream)
+        h, w, n = self.height, self.width, self.width * self.height
+        # Download device FLOAT4 AOVs -> refill the bound FLOAT3 host buffers in
+        # place (drop the padding alpha). ``[:] =`` copies into the pre-bound
+        # arrays OIDN holds pointers to.
+        self._oidn_color[:] = self.d_output.numpy().reshape(h, w, 4)[:, :, :3]
+        self._oidn_albedo[:] = self.d_albedo.numpy().reshape(h, w, 4)[:, :, :3]
+        self._oidn_normal[:] = self.d_normal.numpy().reshape(h, w, 4)[:, :, :3]
+
+        self._oidn.ExecuteFilter(self._oidn_filter)
+
+        # Upload the denoised RGB back to a device FLOAT4 buffer for the tone-map.
+        self._oidn_rgba[:, :3] = self._oidn_out.reshape(n, 3)
+        self._d_denoised_cur = wp.array(self._oidn_rgba, dtype=wp.vec4,
+                                        device=self._device)
+
+    def _release_oidn(self):
+        oidn = getattr(self, "_oidn", None)
+        if oidn is None:
+            return
+        f = getattr(self, "_oidn_filter", None)
+        if f is not None:
+            try:
+                oidn.ReleaseFilter(f)
+            except Exception:  # noqa: BLE001
+                pass
+            self._oidn_filter = None
+        dev = getattr(self, "_oidn_device", None)
+        if dev is not None:
+            try:
+                oidn.ReleaseDevice(dev)
+            except Exception:  # noqa: BLE001
+                pass
+            self._oidn_device = None
 
     def _tonemap_into(self, out_u8):
         # The denoised buffer is at the output extent (2x under temporal upscale);
@@ -1226,6 +1347,10 @@ class PathTracer:
         so the texture/PBO deletes land on the right context. Also usable as a
         context manager (``with PathTracer(...) as pt: ...``).
         """
+        # OIDN backend (M5b), if it was the selected denoiser.
+        if getattr(self, "_backend", None) == "oidn":
+            self._release_oidn()
+
         # OptiX objects, children before the context that owns them. otk-pyoptix
         # exposes a .destroy() method on each handle.        # VERIFY-ON-TARGET
         for attr in ("_pipeline", "_rg_group", "_ms_group", "_ms_shadow_group",
@@ -1244,6 +1369,8 @@ class PathTracer:
             "_dn_input", "_dn_output", "_dn_layer", "_dn_guide", "_dn_params",
             "_dn_albedo_img", "_dn_normal_img", "_dn_flow_img",
             "_dn_out_img", "_dn_ig_img", "_out_bufs", "_d_ig",
+            "_oidn_color", "_oidn_albedo", "_oidn_normal", "_oidn_out",
+            "_oidn_rgba",
             "d_accum", "d_output", "d_denoised", "d_denoised2", "d_albedo",
             "d_normal", "d_flow", "d_ldr", "_d_denoised_cur",
             "_env_data", "_env_cdf", "_prev_vertices",
