@@ -323,6 +323,17 @@ class Cloth(Input):
         self.push = wp.zeros_like(self.restPos)  # C<0 feasibility-recovery separation (atomic_add)
         self.mesh = None
 
+        # Unique mesh edges (sorted vertex pairs) for edge-edge self-collision.
+        edge_set = set()
+        for tri in self.hostTriIds:
+            a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+            for u, w in ((a, b), (b, c), (c, a)):
+                edge_set.add((u, w) if u < w else (w, u))
+        edge_arr = np.array(sorted(edge_set), dtype=np.int32)
+        self.numEdges = len(edge_arr)
+        self.edgeIds = wp.array(edge_arr, dtype=wp.int32)  # [numEdges, 2], va < vb
+        print(str(self.numEdges) + " edges created")
+
         print(str(self.numParticles) + " particles created")
         print(str(self.numTris) + " triangles created")
         print(str(self.distConstraints.count) + " distance constraints created")
@@ -424,6 +435,50 @@ class Cloth(Input):
         if dc < 0:
             dc = -dc
         return wp.max(dr, dc) <= 2
+
+    @staticmethod
+    @wp.func
+    def closest_point_segment_segment(p1: wp.vec3, q1: wp.vec3,
+                                      p2: wp.vec3, q2: wp.vec3):
+        # Ericson, Real-Time Collision Detection: closest points between segments
+        # [p1,q1] and [p2,q2]. Returns (c1, c2, s, t) with c1 = p1 + s*(q1-p1) and
+        # c2 = p2 + t*(q2-p2); s, t are the barycentric parameters along each edge.
+        d1 = q1 - p1
+        d2 = q2 - p2
+        r = p1 - p2
+        a = wp.dot(d1, d1)
+        e = wp.dot(d2, d2)
+        f = wp.dot(d2, r)
+        s = float(0.0)
+        t = float(0.0)
+        if a <= epsilon and e <= epsilon:
+            s = 0.0
+            t = 0.0
+        elif a <= epsilon:
+            s = 0.0
+            t = wp.clamp(f / e, 0.0, 1.0)
+        else:
+            cc = wp.dot(d1, r)
+            if e <= epsilon:
+                t = 0.0
+                s = wp.clamp(-cc / a, 0.0, 1.0)
+            else:
+                b = wp.dot(d1, d2)
+                denom = a * e - b * b
+                if wp.abs(denom) > epsilon:
+                    s = wp.clamp((b * f - cc * e) / denom, 0.0, 1.0)
+                else:
+                    s = 0.0
+                t = (b * s + f) / e
+                if t < 0.0:
+                    t = 0.0
+                    s = wp.clamp(-cc / a, 0.0, 1.0)
+                elif t > 1.0:
+                    t = 1.0
+                    s = wp.clamp((b - cc) / a, 0.0, 1.0)
+        c1 = p1 + d1 * s
+        c2 = p2 + d2 * t
+        return c1, c2, s, t
 
     @staticmethod
     @wp.func
@@ -619,6 +674,125 @@ class Cloth(Input):
                 wp.atomic_min(truncation_ts, i1, Cloth.planar_truncation_t(p1, dt1, -n, p_plane))
             if inv_mass[i2] != 0.0:
                 wp.atomic_min(truncation_ts, i2, Cloth.planar_truncation_t(p2, dt2, -n, p_plane))
+
+    @staticmethod
+    @wp.kernel
+    def self_collision_truncate_edges(
+            mesh: wp.uint64,
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),  # frozen reference state X
+            pos: wp.array(dtype=wp.vec3),       # X + accumulated displacement
+            num_cols: wp.int32,
+            edge_ids: wp.array2d(dtype=wp.int32),  # [numEdges, 2], va < vb
+            truncation_ts: wp.array(dtype=float),  # pre-filled with 1.0 (atomic_min)
+            push: wp.array(dtype=wp.vec3)):        # pre-zeroed C<0 recovery (atomic_add)
+        # Edge-edge complement to the vertex-triangle pass: catches folds where two
+        # edges cross with no vertex near either face (the classic "X" configuration).
+        e = wp.tid()
+        va = edge_ids[e, 0]
+        vb = edge_ids[e, 1]
+        wa = inv_mass[va]
+        wb = inv_mass[vb]
+        if wa == 0.0 and wb == 0.0:
+            return  # both endpoints host-driven
+
+        xa = prev_pos[va]
+        xb = prev_pos[vb]
+
+        # Broadphase: swept AABB of the edge over the frozen + current state,
+        # inflated by the contact offset (the LBVH is frozen at prev_pos).
+        off = wp.vec3(d_offset, d_offset, d_offset)
+        lo = wp.min(wp.min(xa, xb), wp.min(pos[va], pos[vb])) - off
+        hi = wp.max(wp.max(xa, xb), wp.max(pos[va], pos[vb])) + off
+        query = wp.mesh_query_aabb(mesh, lo, hi)
+        face = wp.int32(0)
+        while wp.mesh_query_aabb_next(query, face):
+            i0 = wp.mesh_get_index(mesh, 3 * face + 0)
+            i1 = wp.mesh_get_index(mesh, 3 * face + 1)
+            i2 = wp.mesh_get_index(mesh, 3 * face + 2)
+            for k in range(3):
+                vc = i0
+                vd = i1
+                if k == 1:
+                    vc = i1
+                    vd = i2
+                if k == 2:
+                    vc = i2
+                    vd = i0
+                if vc > vd:  # canonical order of the candidate edge
+                    swap = vc
+                    vc = vd
+                    vd = swap
+                # Skip pairs that share a vertex (adjacent edges never separate).
+                if va == vc or va == vd or vb == vc or vb == vd:
+                    continue
+                # No key dedup: each edge processes every pair it discovers so it
+                # strongly constrains ITSELF as the query. The broadphase is asymmetric
+                # (a fast edge's swept AABB finds a slow edge's frozen triangle, but not
+                # the reverse), so keying off a lower-index "owner" is not guaranteed to
+                # see the pair -- and skipping the discovering thread would let a fast
+                # edge tunnel. Both edges get the strong constraint from their own query;
+                # atomic_min makes the redundant weak constraint from the other thread
+                # (and any double-processing via a shared triangle) order-independent.
+                # Skip topological neighbors (2-ring on the grid) to keep bending free.
+                if (Cloth.within_ring(va, vc, num_cols)
+                        or Cloth.within_ring(va, vd, num_cols)
+                        or Cloth.within_ring(vb, vc, num_cols)
+                        or Cloth.within_ring(vb, vd, num_cols)):
+                    continue
+
+                yc = prev_pos[vc]
+                yd = prev_pos[vd]
+                # DIVIDE: separating plane through the frozen-state closest points.
+                ca, cb, se, sf = Cloth.closest_point_segment_segment(xa, xb, yc, yd)
+                n_hat = ca - cb
+                d = wp.length(n_hat)
+                if d < epsilon:
+                    continue
+                n = n_hat / d
+                c = d - d_offset  # signed gap (>= 0 at a feasible start)
+
+                # Displacement of each edge's contact point (barycentric blend).
+                dca = (1.0 - se) * (pos[va] - xa) + se * (pos[vb] - xb)
+                dcf = (1.0 - sf) * (pos[vc] - yc) + sf * (pos[vd] - yd)
+
+                delta_e_n = wp.max(-wp.dot(n, dca), 0.0)
+                delta_f_n = wp.max(wp.dot(n, dcf), 0.0)
+                ssum = delta_e_n + delta_f_n
+                if ssum == 0.0:
+                    lmbd = 0.5
+                else:
+                    lmbd = wp.clamp(delta_f_n / ssum, 0.05, 0.95)
+
+                if c < 0.0:
+                    # Feasibility recovery for an already-overlapping pair. Each edge
+                    # pushes only its OWN endpoints away from the other (weighted along
+                    # the edge by the reference barycentric coordinate). The candidate
+                    # edge separates itself in its own thread -- an overlap means the
+                    # pair is within d_offset, so both edges discover each other -- and
+                    # the two threads' (1 - lmbd) weights are complementary, so the pair
+                    # still separates by ~depth without an atomic_add cross-push
+                    # double-count between the query and candidate sides.
+                    depth = -c
+                    if wa != 0.0:
+                        wp.atomic_add(push, va, (1.0 - lmbd) * depth * (1.0 - se) * n)
+                    if wb != 0.0:
+                        wp.atomic_add(push, vb, (1.0 - lmbd) * depth * se * n)
+                    continue
+
+                # TRUNCATE: scaling both endpoints of an edge by t scales its contact
+                # point's displacement by t (linearity), so the plane is respected.
+                p_plane = cb + (d_offset + lmbd * c) * n
+                t_e = Cloth.planar_truncation_t(ca, dca, n, p_plane)
+                if wa != 0.0:
+                    wp.atomic_min(truncation_ts, va, t_e)
+                if wb != 0.0:
+                    wp.atomic_min(truncation_ts, vb, t_e)
+                t_f = Cloth.planar_truncation_t(cb, dcf, -n, p_plane)
+                if inv_mass[vc] != 0.0:
+                    wp.atomic_min(truncation_ts, vc, t_f)
+                if inv_mass[vd] != 0.0:
+                    wp.atomic_min(truncation_ts, vd, t_f)
 
     @staticmethod
     @wp.kernel
@@ -1068,9 +1242,10 @@ class Cloth(Input):
                                   ])
 
         # Planar Divide-and-Truncate: clamp the net per-vertex displacement so no
-        # vertex crosses a plane that separated it from a nearby triangle at the
-        # frozen reference state (self-collision), recovering feasibility where a
-        # pair already overlaps.
+        # vertex crosses a plane that separated it from a nearby triangle (vertex-
+        # triangle) or a nearby edge (edge-edge) at the frozen reference state,
+        # recovering feasibility where a pair already overlaps. Both passes write
+        # the same truncation_ts (atomic_min) and push (atomic_add) buffers.
         if self_collision:
             self.truncation_ts.fill_(1.0)
             self.push.zero_()
@@ -1082,6 +1257,20 @@ class Cloth(Input):
                           self.prevPos,
                           self.pos,
                           self.numCols,
+                      ],
+                      outputs=[
+                          self.truncation_ts,
+                          self.push,
+                      ])
+            wp.launch(kernel=Cloth.self_collision_truncate_edges,
+                      dim=self.numEdges,
+                      inputs=[
+                          self.mesh.id,
+                          self.invMass,
+                          self.prevPos,
+                          self.pos,
+                          self.numCols,
+                          self.edgeIds,
                       ],
                       outputs=[
                           self.truncation_ts,
