@@ -1,0 +1,77 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -2559,12 +2559,19 @@
+         .export_values();
+ 
+     py::enum_<OptixPixelFormat>(m, "PixelFormat", py::arithmetic())
++        .value( "PIXEL_FORMAT_HALF2", OPTIX_PIXEL_FORMAT_HALF2 )
+         .value( "PIXEL_FORMAT_HALF3", OPTIX_PIXEL_FORMAT_HALF3 )
+         .value( "PIXEL_FORMAT_HALF4", OPTIX_PIXEL_FORMAT_HALF4 )
++        .value( "PIXEL_FORMAT_FLOAT2", OPTIX_PIXEL_FORMAT_FLOAT2 )
+         .value( "PIXEL_FORMAT_FLOAT3", OPTIX_PIXEL_FORMAT_FLOAT3 )
+         .value( "PIXEL_FORMAT_FLOAT4", OPTIX_PIXEL_FORMAT_FLOAT4 )
+         .value( "PIXEL_FORMAT_UCHAR3", OPTIX_PIXEL_FORMAT_UCHAR3 )
+         .value( "PIXEL_FORMAT_UCHAR4", OPTIX_PIXEL_FORMAT_UCHAR4 )
++#if OPTIX_VERSION >= 70500
++        .value( "PIXEL_FORMAT_INTERNAL_GUIDE_LAYER", OPTIX_PIXEL_FORMAT_INTERNAL_GUIDE_LAYER )
++#endif
++        IF_OPTIX77( .value( "PIXEL_FORMAT_HALF1", OPTIX_PIXEL_FORMAT_HALF1 ) )
++        IF_OPTIX77( .value( "PIXEL_FORMAT_FLOAT1", OPTIX_PIXEL_FORMAT_FLOAT1 ) )
+         .export_values();
+ 
+     py::enum_<OptixDenoiserModelKind>(m, "DenoiserModelKind", py::arithmetic())
+@@ -2574,8 +2581,12 @@
+         .value( "DENOISER_MODEL_KIND_LDR", OPTIX_DENOISER_MODEL_KIND_LDR )
+         .value( "DENOISER_MODEL_KIND_HDR", OPTIX_DENOISER_MODEL_KIND_HDR )
+         .value( "DENOISER_MODEL_KIND_AOV", OPTIX_DENOISER_MODEL_KIND_AOV )
+-        IF_OPTIX73( .value( "DENOISER_MODEL_KIND_TEMPORAL", OPTIX_DENOISER_MODEL_KIND_AOV ) )
+-        IF_OPTIX74( .value( "DENOISER_MODEL_KIND_TEMPORAL_AOV", OPTIX_DENOISER_MODEL_KIND_AOV ) )
++        IF_OPTIX73( .value( "DENOISER_MODEL_KIND_TEMPORAL", OPTIX_DENOISER_MODEL_KIND_TEMPORAL ) )
++        IF_OPTIX74( .value( "DENOISER_MODEL_KIND_TEMPORAL_AOV", OPTIX_DENOISER_MODEL_KIND_TEMPORAL_AOV ) )
++#if OPTIX_VERSION >= 70500
++        .value( "DENOISER_MODEL_KIND_UPSCALE2X", OPTIX_DENOISER_MODEL_KIND_UPSCALE2X )
++        .value( "DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X", OPTIX_DENOISER_MODEL_KIND_TEMPORAL_UPSCALE2X )
++#endif
+         .export_values();
+ 
+     py::enum_<OptixRayFlags>(m, "RayFlags", py::arithmetic())
+@@ -3484,6 +3495,7 @@
+         .def_readwrite( "input",          &OptixDenoiserLayer::input)
+         .def_readwrite( "previousOutput", &OptixDenoiserLayer::previousOutput)
+         .def_readwrite( "output",         &OptixDenoiserLayer::output)
++        IF_OPTIX77( .def_readwrite( "type", &OptixDenoiserLayer::type) )
+         ;
+     
+     py::class_<OptixDenoiserGuideLayer>( m, "DenoiserGuideLayer" )
+@@ -3491,6 +3503,11 @@
+         .def_readwrite( "albedo", &OptixDenoiserGuideLayer::albedo )
+         .def_readwrite( "normal", &OptixDenoiserGuideLayer::normal )
+         .def_readwrite( "flow",   &OptixDenoiserGuideLayer::flow )
++#if OPTIX_VERSION >= 70500
++        .def_readwrite( "previousOutputInternalGuideLayer", &OptixDenoiserGuideLayer::previousOutputInternalGuideLayer )
++        .def_readwrite( "outputInternalGuideLayer",         &OptixDenoiserGuideLayer::outputInternalGuideLayer )
++#endif
++        IF_OPTIX77( .def_readwrite( "flowTrustworthiness", &OptixDenoiserGuideLayer::flowTrustworthiness ) )
+         ;
+ 
+ #elif OPTIX_VERSION <= 70200
+@@ -3510,6 +3527,9 @@
+         IF_OPTIX72(
+         .def_readwrite( "hdrAverageColor", &OptixDenoiserParams::hdrAverageColor )
+         )
++#if OPTIX_VERSION >= 70500
++        .def_readwrite( "temporalModeUsePreviousLayers", &OptixDenoiserParams::temporalModeUsePreviousLayers )
++#endif
+         ;
+ 
+     py::class_<OptixDenoiserSizes>(m, "DenoiserSizes")
+@@ -3523,6 +3543,9 @@
+         .def_readwrite( "recommendedScratchSizeInBytes", &OptixDenoiserSizes::recommendedScratchSizeInBytes )
+ #endif
+         .def_readwrite( "overlapWindowSizeInPixels", &OptixDenoiserSizes::overlapWindowSizeInPixels )
++#if OPTIX_VERSION >= 70500
++        .def_readwrite( "internalGuideLayerPixelSizeInBytes", &OptixDenoiserSizes::internalGuideLayerPixelSizeInBytes )
++#endif
+         ;
+ 
+ 
