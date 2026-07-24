@@ -44,8 +44,8 @@ import warp as wp
 # --------------------------------------------------------------------------- #
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
-    "prev_vertices", "tri_indices", "flow", "handle",
-    "width", "height", "subframe", "exposure",
+    "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
+    "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
     "light_dir", "light_color", "sky_top", "sky_bottom",
@@ -53,11 +53,14 @@ _PARAMS_NAMES = [
     "sphere_center_prev",
     "ground_albedo", "ground_y",
     "cloth_albedo_front", "cloth_albedo_back",
+    "cloth_roughness", "cloth_metallic",
+    "sphere_roughness", "sphere_metallic",
+    "ground_roughness", "ground_metallic",
 ]
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
-    "u8", "u8", "u8", "u8",
-    "u4", "u4", "u4", "f4",
+    "u8", "u8", "u8", "u8", "u8",
+    "u4", "u4", "u4", "u4", "u4", "f4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
@@ -65,10 +68,14 @@ _PARAMS_FORMATS = [
     ("f4", (3,)),
     ("f4", (3,)), "f4",
     ("f4", (3,)), ("f4", (3,)),
+    "f4", "f4",
+    "f4", "f4",
+    "f4", "f4",
 ]
 # Build with align=True, then pin itemsize up to the 8-byte struct alignment so
-# it equals the CUDA sizeof(Params) exactly (numpy stops at the last field, 204;
-# C rounds the struct to a multiple of alignof == 8, i.e. 208).
+# it equals the CUDA sizeof(Params) exactly (numpy stops at the last field; C
+# rounds the struct up to a multiple of alignof == 8). A -D PARAMS_EXPECTED_SIZE
+# static_assert in programs.cu catches any host/device layout drift at compile.
 _PARAMS_BASE = np.dtype({"names": _PARAMS_NAMES, "formats": _PARAMS_FORMATS,
                          "align": True})
 _PARAMS_ITEMSIZE = (_PARAMS_BASE.itemsize + 7) & ~7
@@ -259,6 +266,7 @@ class PathTracer:
         self._num_vertices = 0
         self._idx_ptr = 0
         self._num_triangles = 0
+        self._normals = None         # per-vertex smooth normals (optional)
         self._prev_vertices = None   # previous-frame vertex snapshot (motion vec)
 
         # GL present state (created lazily on the first present, when a GL
@@ -310,6 +318,10 @@ class PathTracer:
             b"-default-device",
             b"-std=c++11",
             b"-rdc", b"true",
+            # ABI guard: fail the compile if the device struct Params lays out to
+            # a different size than the host PARAMS_DTYPE (see the static_assert
+            # in programs.cu). Silent drift here is memory corruption at launch.
+            f"-DPARAMS_EXPECTED_SIZE={PARAMS_DTYPE.itemsize}".encode(),
             f"-I{optix_inc}".encode(),
             f"-I{cuda_inc}".encode(),
         ]
@@ -328,7 +340,7 @@ class PathTracer:
             usesMotionBlur=False,
             traversableGraphFlags=int(
                 optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS),
-            numPayloadValues=7,     # t + geometric normal (xyz) + prev-pos (xyz)
+            numPayloadValues=10,    # t + Ng(xyz) + Ns(xyz) + prev-pos(xyz)
             numAttributeValues=2,   # built-in triangle barycentrics
             exceptionFlags=int(optix.EXCEPTION_FLAG_NONE),
             pipelineLaunchParamsVariableName="params",
@@ -590,11 +602,16 @@ class PathTracer:
         p["albedo"] = int(self.d_albedo.ptr)
         p["normal"] = int(self.d_normal.ptr)
         p["flow"] = int(self.d_flow.ptr)
-        # prev_vertices / tri_indices are wired by set_geometry (0 until then).
+        # prev_vertices / tri_indices / cloth_normals are wired by set_geometry
+        # (0 until then; a 0 cloth_normals makes the device fall back to the
+        # geometric normal for shading).
         p["prev_vertices"] = 0
         p["tri_indices"] = 0
+        p["cloth_normals"] = 0
         p["width"] = self.width
         p["height"] = self.height
+        p["max_depth"] = 4          # bounces (set_path_depth to override)
+        p["rr_depth"] = 2           # Russian roulette starts here
         p["exposure"] = self.exposure
         # Sensible scene defaults; callers override via the setters below.
         p["cam_eye"] = (0.0, 1.0, 5.0)
@@ -618,6 +635,13 @@ class PathTracer:
         p["ground_y"] = 0.0
         p["cloth_albedo_front"] = (0.2, 0.45, 0.85)
         p["cloth_albedo_back"] = (0.85, 0.6, 0.2)
+        # Per-object material scalars (roughness is used directly as GGX alpha).
+        p["cloth_roughness"] = 0.6
+        p["cloth_metallic"] = 0.0
+        p["sphere_roughness"] = 0.1
+        p["sphere_metallic"] = 0.0
+        p["ground_roughness"] = 0.9
+        p["ground_metallic"] = 0.0
 
     # ------------------------------------------------------------------ #
     # Scene setters
@@ -674,16 +698,45 @@ class PathTracer:
         p["cloth_albedo_front"] = _vec3(front)
         p["cloth_albedo_back"] = _vec3(back if back is not None else front)
 
+    def set_cloth_material(self, roughness, metallic=0.0):
+        """Cloth Disney material. ``roughness`` is used directly as GGX alpha."""
+        p = self._h_params[0]
+        p["cloth_roughness"] = float(roughness)
+        p["cloth_metallic"] = float(metallic)
+
+    def set_sphere_material(self, roughness, metallic=0.0):
+        p = self._h_params[0]
+        p["sphere_roughness"] = float(roughness)
+        p["sphere_metallic"] = float(metallic)
+
+    def set_ground_material(self, roughness, metallic=0.0):
+        p = self._h_params[0]
+        p["ground_roughness"] = float(roughness)
+        p["ground_metallic"] = float(metallic)
+
+    def set_path_depth(self, max_depth, rr_depth=None):
+        """Set the maximum number of bounces and where Russian roulette begins.
+
+        ``max_depth`` counts bounces after the primary ray (max_depth=0 is a
+        direct-lighting-only image). ``rr_depth`` defaults to min(max_depth, 2)."""
+        p = self._h_params[0]
+        md = max(0, int(max_depth))
+        p["max_depth"] = md
+        p["rr_depth"] = min(md, 2) if rr_depth is None else max(0, int(rr_depth))
+
     # ------------------------------------------------------------------ #
     # Geometry / acceleration structure
     # ------------------------------------------------------------------ #
-    def set_geometry(self, vertices, indices):
+    def set_geometry(self, vertices, indices, normals=None):
         """Register triangle geometry and build the GAS.
 
         ``vertices`` is a ``wp.array(dtype=wp.vec3)``; ``indices`` a
         ``wp.array(dtype=wp.int32)`` of shape ``(num_tris, 3)`` (or a flat
-        length-``3*num_tris`` array). Both stay owned by the caller (the physics
-        keeps writing ``vertices`` in place); we only keep their pointers.
+        length-``3*num_tris`` array). ``normals``, if given, is a
+        ``wp.array(dtype=wp.vec3)`` of per-vertex smooth normals (one per vertex)
+        used for shading; when omitted the geometric (flat) normal is used. All
+        stay owned by the caller (the physics keeps writing ``vertices`` and
+        ``normals`` in place); we only keep their pointers.
         """
         self._vertices = vertices          # kept for the per-frame prev snapshot
         self._vtx_ptr = _device_ptr(vertices)
@@ -694,6 +747,13 @@ class PathTracer:
             self._num_triangles = int(shape[0])
         else:
             self._num_triangles = int(len(indices)) // 3
+
+        # Smooth shading normals (optional). The pointer is wired once and read
+        # by the closesthit program every frame; the caller updates the contents
+        # in place. 0 => device falls back to the geometric normal.
+        self._normals = normals
+        self._h_params[0]["cloth_normals"] = (
+            int(_device_ptr(normals)) if normals is not None else 0)
 
         # Previous-frame vertex snapshot for motion vectors. The closesthit
         # program reads params.prev_vertices[tri.xyz]; the index buffer itself

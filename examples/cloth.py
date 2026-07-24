@@ -1606,12 +1606,20 @@ class PathTracerView(Input):
         # get the single-frame HDR denoiser at native resolution.
         self.pt = PathTracer(self._width // 2, self._height // 2, upscale=2,
                              exposure=PathTracerView.EXPOSURE)
-        self.pt.set_geometry(cloth.pos, cloth.triIds)
+        # Pass the cloth's per-vertex smooth normals (updated in place by
+        # Cloth.update_mesh each frame) so the Disney BSDF shades a smooth
+        # surface instead of faceted triangles.
+        self.pt.set_geometry(cloth.pos, cloth.triIds, normals=cloth.normals)
         self.pt.set_ground(y=0.0, albedo=(0.55, 0.55, 0.6))
         self.pt.set_light(direction=(0.5, 1.0, 0.4), color=(1.1, 1.05, 0.95))
         self.pt.set_cloth_albedo(front=(0.2, 0.45, 0.85), back=(0.85, 0.6, 0.2))
         self.pt.set_sphere(center=self.sphere.center, radius=self.sphere.radius,
                            albedo=(0.8, 0.8, 0.8))
+        # Disney materials: matte fabric, a semi-glossy sphere, a diffuse floor.
+        self.pt.set_cloth_material(roughness=0.6)
+        self.pt.set_sphere_material(roughness=0.3)
+        self.pt.set_ground_material(roughness=0.9)
+        self.pt.set_path_depth(max_depth=4)
         self.pt.init_gl()
 
     def render(self, **kwargs):

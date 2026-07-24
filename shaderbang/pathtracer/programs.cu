@@ -1,33 +1,96 @@
 // Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
 // SPDX-License-Identifier: MIT
 //
-// OptiX device programs for the shaderbang path tracer (milestone M1).
+// Portions of the Disney BSDF below are ported from GLSL-PathTracer
+// (https://github.com/knightcrawler25/GLSL-PathTracer), MIT License,
+// Copyright (c) 2019 Asif Ali. See docs/pathtracer.md.
 //
-// M1 is the "first live frame": one primary ray per pixel against the cloth GAS
-// plus analytic sphere and ground-plane intersection, single-bounce Lambert
-// direct lighting from one directional light (no shadows yet), a gradient sky on
-// miss, and progressive HDR accumulation. Shadows / Disney BSDF / MIS / NEE /
-// env sampling arrive in later milestones (see docs/pathtracer.md).
+// OptiX device programs for the shaderbang path tracer (milestone M4a).
+//
+// M4a is "full shading, no shadows yet": the single-hit Lambert of M1/M3 is
+// replaced by an iterative multi-bounce path tracer in the raygen program. Each
+// bounce intersects the cloth GAS plus the analytic sphere/ground, evaluates a
+// ported Disney principled BSDF (smooth per-vertex cloth normals, two-sided
+// cloth), importance-samples a new direction, applies Russian roulette, and
+// accumulates global illumination. A stand-in *unshadowed* directional sun keeps
+// the frame lit until next-event estimation + MIS land in M4b; the sky is the
+// environment on a miss (M4c adds an HDR lat-long env). The albedo/normal/flow
+// guide AOVs and motion-vector reprojection are preserved byte-compatibly for
+// the temporal denoiser -- they are driven by the *first* (primary) hit exactly
+// as before, only now the normal guide uses the smooth shading normal.
 //
 // The Params struct below MUST match PARAMS_DTYPE in renderer.py field for
-// field. Self-contained: only <optix.h>, with minimal inline float3 math (no
-// vec_math.h) so NVRTC needs just the OptiX + CUDA include dirs.
+// field (a -D PARAMS_EXPECTED_SIZE static_assert guards the ABI). Self-contained:
+// only <optix.h>, with hand-rolled float3 math (no vec_math.h) so NVRTC needs
+// just the OptiX + CUDA include dirs.
 
 #include <optix.h>
 
 // --------------------------------------------------------------------------- //
-// Minimal float3 math
+// float3 math (hand-rolled -- no vec_math.h)
 // --------------------------------------------------------------------------- //
 static __forceinline__ __device__ float3 operator+(float3 a, float3 b) { return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
 static __forceinline__ __device__ float3 operator-(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
 static __forceinline__ __device__ float3 operator*(float3 a, float3 b) { return make_float3(a.x * b.x, a.y * b.y, a.z * b.z); }
 static __forceinline__ __device__ float3 operator*(float3 a, float s)  { return make_float3(a.x * s, a.y * s, a.z * s); }
 static __forceinline__ __device__ float3 operator*(float s, float3 a)  { return make_float3(a.x * s, a.y * s, a.z * s); }
+static __forceinline__ __device__ float3 operator-(float3 a)           { return make_float3(-a.x, -a.y, -a.z); }
+static __forceinline__ __device__ float3 operator/(float3 a, float s)  { float inv = 1.0f / s; return make_float3(a.x * inv, a.y * inv, a.z * inv); }
+static __forceinline__ __device__ void   operator+=(float3& a, float3 b) { a.x += b.x; a.y += b.y; a.z += b.z; }
+static __forceinline__ __device__ void   operator*=(float3& a, float3 b) { a.x *= b.x; a.y *= b.y; a.z *= b.z; }
+static __forceinline__ __device__ void   operator*=(float3& a, float s)  { a.x *= s; a.y *= s; a.z *= s; }
 static __forceinline__ __device__ float  dot(float3 a, float3 b)       { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static __forceinline__ __device__ float3 cross(float3 a, float3 b)     { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 static __forceinline__ __device__ float3 normalize(float3 v)          { float inv = rsqrtf(dot(v, v)); return v * inv; }
+// Zero-safe normalize: a degenerate (near-zero-length) input would give
+// rsqrtf(0)=+Inf and 0*Inf=NaN, so fall back to a supplied unit vector instead.
+static __forceinline__ __device__ float3 safeNormalize(float3 v, float3 fallback)
+{
+    float l2 = dot(v, v);
+    return (l2 > 1e-20f) ? v * rsqrtf(l2) : fallback;
+}
+static __forceinline__ __device__ bool finite3(float3 v)
+{
+    return isfinite(v.x) && isfinite(v.y) && isfinite(v.z);
+}
 static __forceinline__ __device__ float3 lerp(float3 a, float3 b, float t) { return a + (b - a) * t; }
 static __forceinline__ __device__ float  clampf(float x, float lo, float hi) { return fminf(fmaxf(x, lo), hi); }
+static __forceinline__ __device__ float  mixf(float a, float b, float t) { return a + t * (b - a); }
+static __forceinline__ __device__ float3 splat(float s)               { return make_float3(s, s, s); }
+static __forceinline__ __device__ float3 powf3(float3 a, float e)     { return make_float3(powf(a.x, e), powf(a.y, e), powf(a.z, e)); }
+static __forceinline__ __device__ float  luminance(float3 c)          { return 0.212671f * c.x + 0.715160f * c.y + 0.072169f * c.z; }
+static __forceinline__ __device__ float3 reflectf(float3 i, float3 n) { return i - n * (2.0f * dot(n, i)); }
+// GLSL refract semantics, including the k<0 total-internal-reflection case that
+// returns the zero vector (disneySample normalizes the result, so this matters).
+static __forceinline__ __device__ float3 refractf(float3 i, float3 n, float eta)
+{
+    float ni = dot(n, i);
+    float k = 1.0f - eta * eta * (1.0f - ni * ni);
+    if (k < 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+    return i * eta - n * (eta * ni + sqrtf(k));
+}
+
+#define PT_PI      3.14159265358979323f
+#define PT_INV_PI  0.31830988618379067f
+#define PT_TWO_PI  6.28318530717958648f
+
+// Orthonormal basis around a unit normal (X=T, Y=B, Z=N), matching GLSL Onb.
+static __forceinline__ __device__ void onb(float3 n, float3& t, float3& b)
+{
+    float3 up = fabsf(n.z) < 0.9999999f ? make_float3(0.0f, 0.0f, 1.0f)
+                                        : make_float3(1.0f, 0.0f, 0.0f);
+    t = normalize(cross(up, n));
+    b = cross(n, t);
+}
+static __forceinline__ __device__ float3 toLocal(float3 x, float3 y, float3 z, float3 v)
+{
+    return make_float3(dot(v, x), dot(v, y), dot(v, z));
+}
+static __forceinline__ __device__ float3 toWorld(float3 x, float3 y, float3 z, float3 v)
+{
+    return x * v.x + y * v.y + z * v.z;
+}
 
 // --------------------------------------------------------------------------- //
 // Launch parameters (mirror renderer.PARAMS_DTYPE exactly)
@@ -40,14 +103,17 @@ struct Params
     float4*                albedo;        // guide AOV: per-pixel surface albedo
     float4*                normal;        // guide AOV: per-pixel view-space normal (+z toward camera)
     float3*                prev_vertices; // previous-frame cloth vertex positions (for motion vectors)
-    uint3*                 tri_indices;   // triangle vertex-index triplets (prev-vertex lookup)
+    uint3*                 tri_indices;   // triangle vertex-index triplets (prev-vertex / normal lookup)
     float2*                flow;          // output motion-vector AOV (input res, curr -> prev in pixels)
     OptixTraversableHandle handle;        // cloth GAS
+    float3*                cloth_normals; // per-vertex smooth normals (0 => fall back to geometric normal)
 
     // --- 4-byte scalars --- //
     unsigned int           width;         // input (render) width
     unsigned int           height;        // input (render) height
     unsigned int           subframe;      // 0 resets the accumulator
+    unsigned int           max_depth;     // maximum number of bounces
+    unsigned int           rr_depth;      // Russian roulette starts at this bounce
     float                  exposure;      // unused on device (tonemap is a Warp kernel)
 
     // --- float3 basis / colors (float3 has 4-byte alignment) --- //
@@ -77,30 +143,64 @@ struct Params
 
     float3                 cloth_albedo_front;
     float3                 cloth_albedo_back;
+
+    // --- per-object material scalars (M4a) --- //
+    float                  cloth_roughness;
+    float                  cloth_metallic;
+    float                  sphere_roughness;
+    float                  sphere_metallic;
+    float                  ground_roughness;
+    float                  ground_metallic;
 };
 
-// Firefly clamp on per-sample radiance luminance. Direct-only shading (M3) is
-// already bounded, so this is a no-op today; it becomes load-bearing once GI /
-// NEE add stochastic bounces in M4.
+#ifdef PARAMS_EXPECTED_SIZE
+// ABI guard: the host builds PARAMS_DTYPE and passes its itemsize as a -D define.
+// A mismatch here is silent memory corruption at launch, so fail the NVRTC
+// compile instead. Keep struct Params and _PARAMS_NAMES/_PARAMS_FORMATS in sync.
+static_assert(sizeof(Params) == PARAMS_EXPECTED_SIZE,
+              "Params size != PARAMS_DTYPE.itemsize (renderer.py ABI drift)");
+#endif
+
+// Firefly clamp on whole-path radiance luminance (applied once, after the bounce
+// loop, so it does not bias per-bounce GI): caps a single bright outlier before
+// it enters the accumulator.
 #define PT_MAX_RADIANCE 64.0f
 
 extern "C" {
 __constant__ Params params;
 }
 
-// Payloads: p0 = hit t (float bits), p1..p3 = geometric normal, p4..p6 =
-// previous-frame world position of the hit (for motion vectors).
-static __forceinline__ __device__ void setHitPayload(float t, float3 n, float3 pPrev)
+// --------------------------------------------------------------------------- //
+// RNG: per-pixel PCG stream, one draw per random. Seeded from (pixel, subframe)
+// only, so every subframe is a deterministic, decorrelated sample -> the
+// progressive mean is an unbiased estimator and the temporal denoiser sees a
+// stable jitter distribution.
+// --------------------------------------------------------------------------- //
+static __forceinline__ __device__ unsigned int pcg(unsigned int v)
 {
-    optixSetPayload_0(__float_as_uint(t));
-    optixSetPayload_1(__float_as_uint(n.x));
-    optixSetPayload_2(__float_as_uint(n.y));
-    optixSetPayload_3(__float_as_uint(n.z));
-    optixSetPayload_4(__float_as_uint(pPrev.x));
-    optixSetPayload_5(__float_as_uint(pPrev.y));
-    optixSetPayload_6(__float_as_uint(pPrev.z));
+    unsigned int state = v * 747796405u + 2891336453u;
+    unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
 }
 
+static __forceinline__ __device__ float uintToUnitFloat(unsigned int x)
+{
+    return (x >> 8) * (1.0f / 16777216.0f);  // [0, 1)
+}
+
+struct RNG { unsigned int state; };
+
+static __forceinline__ __device__ float rng_next(RNG& r)
+{
+    r.state = r.state * 747796405u + 2891336453u;
+    unsigned int w = ((r.state >> ((r.state >> 28u) + 4u)) ^ r.state) * 277803737u;
+    w = (w >> 22u) ^ w;
+    return uintToUnitFloat(w);
+}
+
+// --------------------------------------------------------------------------- //
+// Camera reprojection helpers (for the motion-vector AOV) -- unchanged from M3.
+// --------------------------------------------------------------------------- //
 // Invert the pin-hole ray generation: solve D = a*cam_u + b*cam_v + c*cam_w for
 // (a, b, c) via Cramer's rule (scalar triple products). The NDC coordinates are
 // (a/c, b/c) -- exactly the (dx, dy) the raygen program maps to a pixel -- and c
@@ -144,19 +244,9 @@ static __forceinline__ __device__ bool projectDirToPixel(
     return true;
 }
 
-// Deterministic per-sample hash for subpixel jitter (PCG-ish).
-static __forceinline__ __device__ unsigned int pcg(unsigned int v)
-{
-    unsigned int state = v * 747796405u + 2891336453u;
-    unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-
-static __forceinline__ __device__ float uintToUnitFloat(unsigned int x)
-{
-    return (x >> 8) * (1.0f / 16777216.0f);  // [0, 1)
-}
-
+// --------------------------------------------------------------------------- //
+// Analytic intersections + sky
+// --------------------------------------------------------------------------- //
 // Nearest positive ray-sphere hit distance, or -1.
 static __forceinline__ __device__ float intersectSphere(float3 o, float3 d, float3 c, float r)
 {
@@ -191,14 +281,456 @@ static __forceinline__ __device__ float3 skyColor(float3 dir)
     return lerp(params.sky_bottom, params.sky_top, t);
 }
 
-// Lambert direct lighting with a sky-colored ambient fill. ``nf`` must already
-// face the viewer (see the raygen program). Returns the un-clamped HDR radiance.
-static __forceinline__ __device__ float3 shade(float3 nf, float3 albedo)
+// --------------------------------------------------------------------------- //
+// Disney principled BSDF -- ported from GLSL-PathTracer (MIT (c) 2019 Asif Ali).
+// The lobe helpers operate in the local shading frame (Z = normal), so cosines
+// are the .z components and anisotropic tangent projections are .x/.y.
+// --------------------------------------------------------------------------- //
+static __forceinline__ __device__ float schlickW(float u)
 {
-    float ndl = fmaxf(dot(nf, params.light_dir), 0.0f);
-    float3 ambient = skyColor(nf) * 0.25f;
-    float3 direct = params.light_color * ndl;
-    return albedo * (ambient + direct);
+    float m = clampf(1.0f - u, 0.0f, 1.0f);
+    float m2 = m * m;
+    return m2 * m2 * m;
+}
+
+static __forceinline__ __device__ float dielectricFresnel(float cosThetaI, float eta)
+{
+    float s = eta * eta * (1.0f - cosThetaI * cosThetaI);
+    if (s > 1.0f)
+        return 1.0f;                               // total internal reflection
+    float cosThetaT = sqrtf(fmaxf(1.0f - s, 0.0f));
+    float rs = (eta * cosThetaT - cosThetaI) / (eta * cosThetaT + cosThetaI);
+    float rp = (eta * cosThetaI - cosThetaT) / (eta * cosThetaI + cosThetaT);
+    return 0.5f * (rs * rs + rp * rp);
+}
+
+static __forceinline__ __device__ float gtr1(float NDotH, float a)
+{
+    if (a >= 1.0f)
+        return PT_INV_PI;
+    float a2 = a * a;
+    float t = 1.0f + (a2 - 1.0f) * NDotH * NDotH;
+    return (a2 - 1.0f) / (PT_PI * logf(a2) * t);
+}
+
+static __forceinline__ __device__ float3 sampleGTR1(float rgh, float r1, float r2)
+{
+    float a = fmaxf(0.001f, rgh);
+    float a2 = a * a;
+    float phi = r1 * PT_TWO_PI;
+    float cosT = sqrtf((1.0f - powf(a2, 1.0f - r2)) / (1.0f - a2));
+    float sinT = clampf(sqrtf(1.0f - cosT * cosT), 0.0f, 1.0f);
+    return make_float3(sinT * cosf(phi), sinT * sinf(phi), cosT);
+}
+
+static __forceinline__ __device__ float3 sampleGGXVNDF(float3 V, float ax, float ay, float r1, float r2)
+{
+    float3 Vh = normalize(make_float3(ax * V.x, ay * V.y, V.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    float3 T1 = lensq > 0.0f ? make_float3(-Vh.y, Vh.x, 0.0f) * rsqrtf(lensq)
+                             : make_float3(1.0f, 0.0f, 0.0f);
+    float3 T2 = cross(Vh, T1);
+    float r = sqrtf(r1);
+    float phi = PT_TWO_PI * r2;
+    float t1 = r * cosf(phi);
+    float t2 = r * sinf(phi);
+    float s = 0.5f * (1.0f + Vh.z);
+    t2 = (1.0f - s) * sqrtf(1.0f - t1 * t1) + s * t2;
+    float3 Nh = T1 * t1 + T2 * t2 + Vh * sqrtf(fmaxf(0.0f, 1.0f - t1 * t1 - t2 * t2));
+    return normalize(make_float3(ax * Nh.x, ay * Nh.y, fmaxf(0.0f, Nh.z)));
+}
+
+static __forceinline__ __device__ float gtr2Aniso(float NDotH, float HDotX, float HDotY, float ax, float ay)
+{
+    float a = HDotX / ax;
+    float b = HDotY / ay;
+    float c = a * a + b * b + NDotH * NDotH;
+    return 1.0f / (PT_PI * ax * ay * c * c);
+}
+
+static __forceinline__ __device__ float smithG(float NDotV, float alphaG)
+{
+    float a = alphaG * alphaG;
+    float b = NDotV * NDotV;
+    return (2.0f * NDotV) / (NDotV + sqrtf(a + b - a * b));
+}
+
+static __forceinline__ __device__ float smithGAniso(float NDotV, float VDotX, float VDotY, float ax, float ay)
+{
+    float a = VDotX * ax;
+    float b = VDotY * ay;
+    float c = NDotV;
+    return (2.0f * NDotV) / (NDotV + sqrtf(a * a + b * b + c * c));
+}
+
+static __forceinline__ __device__ float3 cosineSampleHemisphere(float r1, float r2)
+{
+    float r = sqrtf(r1);
+    float phi = PT_TWO_PI * r2;
+    float x = r * cosf(phi);
+    float y = r * sinf(phi);
+    return make_float3(x, y, sqrtf(fmaxf(0.0f, 1.0f - x * x - y * y)));
+}
+
+struct Material
+{
+    float3 baseColor;
+    float  metallic, roughness, subsurface;
+    float  specularTint, sheen, sheenTint;
+    float  clearcoat, clearcoatRoughness, specTrans, ior, anisotropic;
+    float  ax, ay;
+};
+
+static __forceinline__ __device__ void tintColors(const Material& m, float eta,
+        float& F0, float3& Csheen, float3& Cspec0)
+{
+    float lum = luminance(m.baseColor);
+    float3 ctint = lum > 0.0f ? m.baseColor / lum : splat(1.0f);
+    F0 = (1.0f - eta) / (1.0f + eta);
+    F0 *= F0;
+    Cspec0 = lerp(splat(1.0f), ctint, m.specularTint) * F0;
+    Csheen = lerp(splat(1.0f), ctint, m.sheenTint);
+}
+
+static __forceinline__ __device__ float3 evalDiffuse(const Material& mat, float3 Csheen,
+        float3 V, float3 L, float3 H, float& pdf)
+{
+    pdf = 0.0f;
+    if (L.z <= 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+    float LDotH = dot(L, H);
+    float Rr = 2.0f * mat.roughness * LDotH * LDotH;
+
+    float FL = schlickW(L.z);
+    float FV = schlickW(V.z);
+    float Fretro = Rr * (FL + FV + FL * FV * (Rr - 1.0f));
+    float Fd = (1.0f - 0.5f * FL) * (1.0f - 0.5f * FV);
+
+    float Fss90 = 0.5f * Rr;
+    float Fss = mixf(1.0f, Fss90, FL) * mixf(1.0f, Fss90, FV);
+    float ss = 1.25f * (Fss * (1.0f / (L.z + V.z) - 0.5f) + 0.5f);
+
+    float FH = schlickW(LDotH);
+    float3 Fsheen = Csheen * (FH * mat.sheen);
+
+    pdf = L.z * PT_INV_PI;
+    return mat.baseColor * (PT_INV_PI * mixf(Fd + Fretro, ss, mat.subsurface)) + Fsheen;
+}
+
+static __forceinline__ __device__ float3 evalMicroReflect(const Material& mat,
+        float3 V, float3 L, float3 H, float3 F, float& pdf)
+{
+    pdf = 0.0f;
+    if (L.z <= 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+    float D = gtr2Aniso(H.z, H.x, H.y, mat.ax, mat.ay);
+    float G1 = smithGAniso(fabsf(V.z), V.x, V.y, mat.ax, mat.ay);
+    float G2 = G1 * smithGAniso(fabsf(L.z), L.x, L.y, mat.ax, mat.ay);
+    pdf = G1 * D / (4.0f * V.z);
+    return F * (D * G2 / (4.0f * L.z * V.z));
+}
+
+static __forceinline__ __device__ float3 evalMicroRefract(const Material& mat, float eta,
+        float3 V, float3 L, float3 H, float3 F, float& pdf)
+{
+    pdf = 0.0f;
+    if (L.z >= 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+    float LDotH = dot(L, H);
+    float VDotH = dot(V, H);
+    float D = gtr2Aniso(H.z, H.x, H.y, mat.ax, mat.ay);
+    float G1 = smithGAniso(fabsf(V.z), V.x, V.y, mat.ax, mat.ay);
+    float G2 = G1 * smithGAniso(fabsf(L.z), L.x, L.y, mat.ax, mat.ay);
+    float denom = LDotH + VDotH * eta;
+    denom *= denom;
+    float eta2 = eta * eta;
+    float jacobian = fabsf(LDotH) / denom;
+    pdf = G1 * fmaxf(0.0f, VDotH) * D * jacobian / V.z;
+    float3 oneMinusF = make_float3(1.0f - F.x, 1.0f - F.y, 1.0f - F.z);
+    return powf3(mat.baseColor, 0.5f) * oneMinusF
+           * (D * G2 * fabsf(VDotH) * jacobian * eta2 / fabsf(L.z * V.z));
+}
+
+static __forceinline__ __device__ float3 evalClearcoat(const Material& mat,
+        float3 V, float3 L, float3 H, float& pdf)
+{
+    pdf = 0.0f;
+    if (L.z <= 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+    float VDotH = dot(V, H);
+    float F = mixf(0.04f, 1.0f, schlickW(VDotH));
+    float D = gtr1(H.z, mat.clearcoatRoughness);
+    float G = smithG(L.z, 0.25f) * smithG(V.z, 0.25f);
+    float jacobian = 1.0f / (4.0f * VDotH);
+    pdf = D * H.z * jacobian;
+    float fdg = F * D * G;
+    return make_float3(fdg, fdg, fdg);
+}
+
+// Evaluate the BSDF value f (cosine folded in) and its solid-angle pdf for a
+// world-space (V, N, L) triple pointing away from the surface.
+static __device__ float3 disneyEval(const Material& mat, float eta,
+        float3 V, float3 N, float3 L, float& pdf)
+{
+    pdf = 0.0f;
+    float3 f = make_float3(0.0f, 0.0f, 0.0f);
+
+    float3 T, B;
+    onb(N, T, B);
+    V = toLocal(T, B, N, V);
+    L = toLocal(T, B, N, L);
+
+    float3 H = (L.z > 0.0f) ? normalize(L + V) : normalize(L + V * eta);
+    if (H.z < 0.0f)
+        H = -H;
+
+    float F0;
+    float3 Csheen, Cspec0;
+    tintColors(mat, eta, F0, Csheen, Cspec0);
+
+    float dielectricWt = (1.0f - mat.metallic) * (1.0f - mat.specTrans);
+    float metalWt = mat.metallic;
+    float glassWt = (1.0f - mat.metallic) * mat.specTrans;
+
+    float schlickWt = schlickW(V.z);
+    float diffPr = dielectricWt * luminance(mat.baseColor);
+    float dielectricPr = dielectricWt * luminance(lerp(Cspec0, splat(1.0f), schlickWt));
+    float metalPr = metalWt * luminance(lerp(mat.baseColor, splat(1.0f), schlickWt));
+    float glassPr = glassWt;
+    float clearCtPr = 0.25f * mat.clearcoat;
+
+    float inv = 1.0f / (diffPr + dielectricPr + metalPr + glassPr + clearCtPr);
+    diffPr *= inv; dielectricPr *= inv; metalPr *= inv; glassPr *= inv; clearCtPr *= inv;
+
+    bool isReflect = L.z * V.z > 0.0f;
+    float tmp;
+    float VDotH = fabsf(dot(V, H));
+
+    if (diffPr > 0.0f && isReflect)
+    {
+        f += evalDiffuse(mat, Csheen, V, L, H, tmp) * dielectricWt;
+        pdf += tmp * diffPr;
+    }
+    if (dielectricPr > 0.0f && isReflect)
+    {
+        float Fr = (dielectricFresnel(VDotH, 1.0f / mat.ior) - F0) / (1.0f - F0);
+        f += evalMicroReflect(mat, V, L, H, lerp(Cspec0, splat(1.0f), Fr), tmp) * dielectricWt;
+        pdf += tmp * dielectricPr;
+    }
+    if (metalPr > 0.0f && isReflect)
+    {
+        float3 Fr = lerp(mat.baseColor, splat(1.0f), schlickW(VDotH));
+        f += evalMicroReflect(mat, V, L, H, Fr, tmp) * metalWt;
+        pdf += tmp * metalPr;
+    }
+    if (glassPr > 0.0f)
+    {
+        float Fr = dielectricFresnel(VDotH, eta);
+        if (isReflect)
+        {
+            f += evalMicroReflect(mat, V, L, H, splat(Fr), tmp) * glassWt;
+            pdf += tmp * glassPr * Fr;
+        }
+        else
+        {
+            f += evalMicroRefract(mat, eta, V, L, H, splat(Fr), tmp) * glassWt;
+            pdf += tmp * glassPr * (1.0f - Fr);
+        }
+    }
+    if (clearCtPr > 0.0f && isReflect)
+    {
+        f += evalClearcoat(mat, V, L, H, tmp) * (0.25f * mat.clearcoat);
+        pdf += tmp * clearCtPr;
+    }
+
+    return f * fabsf(L.z);
+}
+
+// Importance-sample a new direction L (world space) and return f + pdf via a
+// final disneyEval. Draws three uniforms from the per-pixel RNG stream.
+static __device__ float3 disneySample(const Material& mat, float eta,
+        float3 V, float3 N, float3& L, float& pdf, RNG& rng)
+{
+    pdf = 0.0f;
+    float r1 = rng_next(rng);
+    float r2 = rng_next(rng);
+
+    float3 T, B;
+    onb(N, T, B);
+    float3 Vl = toLocal(T, B, N, V);
+
+    float F0;
+    float3 Csheen, Cspec0;
+    tintColors(mat, eta, F0, Csheen, Cspec0);
+
+    float dielectricWt = (1.0f - mat.metallic) * (1.0f - mat.specTrans);
+    float metalWt = mat.metallic;
+    float glassWt = (1.0f - mat.metallic) * mat.specTrans;
+
+    float schlickWt = schlickW(Vl.z);
+    float diffPr = dielectricWt * luminance(mat.baseColor);
+    float dielectricPr = dielectricWt * luminance(lerp(Cspec0, splat(1.0f), schlickWt));
+    float metalPr = metalWt * luminance(lerp(mat.baseColor, splat(1.0f), schlickWt));
+    float glassPr = glassWt;
+    float clearCtPr = 0.25f * mat.clearcoat;
+
+    float inv = 1.0f / (diffPr + dielectricPr + metalPr + glassPr + clearCtPr);
+    diffPr *= inv; dielectricPr *= inv; metalPr *= inv; glassPr *= inv; clearCtPr *= inv;
+
+    float cdf0 = diffPr;
+    float cdf1 = cdf0 + dielectricPr;
+    float cdf2 = cdf1 + metalPr;
+    float cdf3 = cdf2 + glassPr;
+
+    float r3 = rng_next(rng);
+    float3 Ll;
+    if (r3 < cdf0)
+    {
+        Ll = cosineSampleHemisphere(r1, r2);
+    }
+    else if (r3 < cdf2)
+    {
+        float3 H = sampleGGXVNDF(Vl, mat.ax, mat.ay, r1, r2);
+        if (H.z < 0.0f)
+            H = -H;
+        Ll = normalize(reflectf(-Vl, H));
+    }
+    else if (r3 < cdf3)
+    {
+        float3 H = sampleGGXVNDF(Vl, mat.ax, mat.ay, r1, r2);
+        float Fr = dielectricFresnel(fabsf(dot(Vl, H)), eta);
+        if (H.z < 0.0f)
+            H = -H;
+        r3 = (r3 - cdf2) / (cdf3 - cdf2);
+        Ll = (r3 < Fr) ? normalize(reflectf(-Vl, H))
+                       : normalize(refractf(-Vl, H, eta));
+    }
+    else
+    {
+        float3 H = sampleGTR1(mat.clearcoatRoughness, r1, r2);
+        if (H.z < 0.0f)
+            H = -H;
+        Ll = normalize(reflectf(-Vl, H));
+    }
+
+    L = toWorld(T, B, N, Ll);
+    return disneyEval(mat, eta, V, N, L, pdf);
+}
+
+// Build the material for an intersected object. ``roughness`` is used directly
+// as the GGX alpha (Disney "linear roughness == alpha"), NOT alpha=roughness^2.
+static __forceinline__ __device__ Material makeMaterial(int which, bool front)
+{
+    Material m;
+    m.subsurface = 0.0f;
+    m.specularTint = 0.0f;
+    m.sheen = 0.0f;
+    m.sheenTint = 0.5f;
+    m.clearcoat = 0.0f;
+    m.clearcoatRoughness = 0.03f;
+    m.specTrans = 0.0f;
+    m.ior = 1.5f;
+    m.anisotropic = 0.0f;
+    if (which == 1)
+    {
+        m.baseColor = front ? params.cloth_albedo_front : params.cloth_albedo_back;
+        m.metallic = params.cloth_metallic;
+        m.roughness = params.cloth_roughness;
+    }
+    else if (which == 2)
+    {
+        m.baseColor = params.sphere_albedo;
+        m.metallic = params.sphere_metallic;
+        m.roughness = params.sphere_roughness;
+    }
+    else
+    {
+        m.baseColor = params.ground_albedo;
+        m.metallic = params.ground_metallic;
+        m.roughness = params.ground_roughness;
+    }
+    float aspect = sqrtf(1.0f - m.anisotropic * 0.9f);
+    m.ax = fmaxf(1e-3f, m.roughness / aspect);
+    m.ay = fmaxf(1e-3f, m.roughness * aspect);
+    return m;
+}
+
+// --------------------------------------------------------------------------- //
+// Hit payloads: p0 = t (float bits, 1e30 = miss); p1..p3 = geometric normal Ng;
+// p4..p6 = smooth shading normal Ns; p7..p9 = previous-frame world position.
+// --------------------------------------------------------------------------- //
+static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 ns, float3 pPrev)
+{
+    optixSetPayload_0(__float_as_uint(t));
+    optixSetPayload_1(__float_as_uint(ng.x));
+    optixSetPayload_2(__float_as_uint(ng.y));
+    optixSetPayload_3(__float_as_uint(ng.z));
+    optixSetPayload_4(__float_as_uint(ns.x));
+    optixSetPayload_5(__float_as_uint(ns.y));
+    optixSetPayload_6(__float_as_uint(ns.z));
+    optixSetPayload_7(__float_as_uint(pPrev.x));
+    optixSetPayload_8(__float_as_uint(pPrev.y));
+    optixSetPayload_9(__float_as_uint(pPrev.z));
+}
+
+struct Hit
+{
+    int    which;   // 0 miss, 1 cloth, 2 sphere, 3 ground
+    float  t;
+    float3 p;       // world hit position
+    float3 ng;      // geometric normal (raw orientation)
+    float3 ns;      // shading normal (smooth; == ng for analytic objects)
+    float3 prevP;   // previous-frame world position (motion vectors)
+};
+
+// Trace the cloth GAS and the analytic sphere/ground, return the nearest hit.
+static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
+{
+    unsigned int p0 = __float_as_uint(1e30f);
+    unsigned int p1 = 0u, p2 = 0u, p3 = 0u;
+    unsigned int p4 = 0u, p5 = 0u, p6 = 0u;
+    unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
+    optixTrace(
+            params.handle, o, d,
+            0.0f, 1e16f, 0.0f,
+            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
+            0, 1, 0,
+            p0, p1, p2, p3, p4, p5, p6, p7, p8, p9);
+    float t_cloth = __uint_as_float(p0);
+    float t_s = intersectSphere(o, d, params.sphere_center, params.sphere_radius);
+    float t_g = intersectGround(o, d, params.ground_y);
+
+    Hit h;
+    h.which = 0;
+    float best = 1e29f;
+    if (t_cloth < best) { best = t_cloth; h.which = 1; }
+    if (t_s > 0.0f && t_s < best) { best = t_s; h.which = 2; }
+    if (t_g > 0.0f && t_g < best) { best = t_g; h.which = 3; }
+    if (h.which == 0)
+        return h;
+
+    h.t = best;
+    h.p = o + d * best;
+    if (h.which == 1)
+    {
+        h.ng = normalize(make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3)));
+        h.ns = normalize(make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6)));
+        h.prevP = make_float3(__uint_as_float(p7), __uint_as_float(p8), __uint_as_float(p9));
+    }
+    else if (h.which == 2)
+    {
+        float3 n = normalize(h.p - params.sphere_center);
+        h.ng = n;
+        h.ns = n;
+        h.prevP = h.p + (params.sphere_center_prev - params.sphere_center);  // rigid
+    }
+    else
+    {
+        h.ng = make_float3(0.0f, 1.0f, 0.0f);
+        h.ns = h.ng;
+        h.prevP = h.p;                                                       // static
+    }
+    return h;
 }
 
 extern "C" __global__ void __raygen__rg()
@@ -207,88 +739,90 @@ extern "C" __global__ void __raygen__rg()
     const uint3 dim = optixGetLaunchDimensions();
     const unsigned int pixel = idx.y * params.width + idx.x;
 
-    // Subpixel jitter for progressive antialiasing across accumulated frames.
-    unsigned int seed = pcg(pixel ^ pcg(params.subframe + 1u));
-    float jx = uintToUnitFloat(seed);
-    float jy = uintToUnitFloat(pcg(seed));
+    // Per-pixel RNG stream. The first two draws are the subpixel jitter for
+    // progressive antialiasing; the rest feed the BSDF sampling / RR.
+    RNG rng;
+    rng.state = pcg(pixel ^ pcg(params.subframe + 1u));
+    float jx = rng_next(rng);
+    float jy = rng_next(rng);
 
     float dx = 2.0f * ((float)idx.x + jx) / (float)dim.x - 1.0f;
     float dy = 2.0f * ((float)idx.y + jy) / (float)dim.y - 1.0f;
 
-    float3 origin = params.cam_eye;
-    float3 dir = normalize(params.cam_u * dx + params.cam_v * dy + params.cam_w);
+    float3 o = params.cam_eye;
+    float3 d = normalize(params.cam_u * dx + params.cam_v * dy + params.cam_w);
+    const float3 d0 = d;   // primary direction, kept for the AOV / flow tail
 
-    // Trace the cloth GAS.
-    unsigned int p0 = __float_as_uint(1e30f);  // t (1e30 == miss)
-    unsigned int p1 = 0u, p2 = 0u, p3 = 0u;    // normal
-    unsigned int p4 = 0u, p5 = 0u, p6 = 0u;    // previous-frame hit position
-    optixTrace(
-            params.handle, origin, dir,
-            0.0f, 1e16f, 0.0f,
-            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
-            0, 1, 0,
-            p0, p1, p2, p3, p4, p5, p6);
-    float t_cloth = __uint_as_float(p0);
-    float3 n_cloth = make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3));
-    float3 prev_hit_cloth = make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6));
+    // ---- Iterative multi-bounce path tracing (all traces issue from raygen, so
+    // maxTraceDepth stays 1; nothing traces from closesthit/miss). ----
+    float3 radiance = make_float3(0.0f, 0.0f, 0.0f);
+    float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
+    Hit first;
+    first.which = -1;
 
-    // Analytic colliders.
-    float t_sphere = intersectSphere(origin, dir, params.sphere_center, params.sphere_radius);
-    float t_ground = intersectGround(origin, dir, params.ground_y);
-
-    // Nearest of {cloth, sphere, ground, miss}.
-    const float T_MISS = 1e29f;
-    float best = T_MISS;
-    int which = 0;  // 0 miss, 1 cloth, 2 sphere, 3 ground
-    if (t_cloth < best) { best = t_cloth; which = 1; }
-    if (t_sphere > 0.0f && t_sphere < best) { best = t_sphere; which = 2; }
-    if (t_ground > 0.0f && t_ground < best) { best = t_ground; which = 3; }
-
-    float3 color;
-    float3 aov_albedo;              // denoiser albedo guide (background := sky)
-    float3 aov_normal;             // denoiser normal guide, view space, +z -> camera
-    if (which == 0)
+    for (unsigned int depth = 0u; depth <= params.max_depth; ++depth)
     {
-        color = skyColor(dir);
-        aov_albedo = color;
-        aov_normal = make_float3(0.0f, 0.0f, 0.0f);
-    }
-    else
-    {
-        float3 hit = origin + dir * best;
-        float3 n;
-        float3 albedo;
-        if (which == 1)
+        Hit h = sceneIntersect(o, d);
+        if (depth == 0u)
+            first = h;
+
+        if (h.which == 0)
         {
-            n = normalize(n_cloth);
-            // Front faces the camera hemisphere; pick front/back albedo.
-            albedo = (dot(n_cloth, dir) < 0.0f) ? params.cloth_albedo_front
-                                                : params.cloth_albedo_back;
+            // Environment on a miss (M4b/M4c add MIS + HDR env). No NEE yet, so
+            // the miss always takes full weight -- no double counting.
+            radiance += throughput * skyColor(d);
+            break;
         }
-        else if (which == 2)
+
+        // Two-sided shading: face-forward both normals toward the viewer, and
+        // decide front/back from the unambiguous geometric normal.
+        bool front = dot(h.ng, d) < 0.0f;
+        float3 Ng = front ? h.ng : -h.ng;
+        float3 Ns = (dot(h.ns, d) > 0.0f) ? -h.ns : h.ns;
+        Material mat = makeMaterial(h.which, front);
+        float eta = front ? (1.0f / mat.ior) : mat.ior;   // relative IOR (entering -> 1/ior)
+
+        // --- M4a stand-in: unshadowed directional sun so the frame is lit
+        // before NEE exists (deleted in M4b when directLight replaces it). The
+        // BSDF value already folds |NdotL| in, and a delta light needs no /pdf. ---
         {
-            n = normalize(hit - params.sphere_center);
-            albedo = params.sphere_albedo;
+            float pdf;
+            float3 f = disneyEval(mat, eta, -d, Ns, params.light_dir, pdf);
+            radiance += throughput * f * params.light_color;
         }
-        else
+
+        if (depth == params.max_depth)
+            break;
+
+        // Sample the BSDF for the next bounce.
+        float3 L;
+        float pdf;
+        float3 f = disneySample(mat, eta, -d, Ns, L, pdf, rng);
+        if (!(pdf > 0.0f))
+            break;
+        throughput *= f * (1.0f / pdf);
+
+        // Offset along the geometric normal on the outgoing side to avoid
+        // self-intersection, then continue.
+        float3 offN = (dot(L, Ng) < 0.0f) ? -Ng : Ng;
+        o = h.p + offN * 1e-4f;
+        d = L;
+
+        // Russian roulette (unbiased) once past rr_depth.
+        if (depth >= params.rr_depth)
         {
-            n = make_float3(0.0f, 1.0f, 0.0f);
-            albedo = params.ground_albedo;
+            float q = fminf(fmaxf(throughput.x, fmaxf(throughput.y, throughput.z)) + 0.001f, 0.95f);
+            if (rng_next(rng) > q)
+                break;
+            throughput *= (1.0f / q);
         }
-        // Face the normal toward the viewer, then shade + emit guides with it.
-        float3 nf = (dot(n, dir) > 0.0f) ? (n * -1.0f) : n;
-        color = shade(nf, albedo);
-        aov_albedo = albedo;
-        // View-space normal: project onto the (normalized) camera basis, with the
-        // forward axis negated so +z points back toward the camera.
-        float3 uh = normalize(params.cam_u);
-        float3 vh = normalize(params.cam_v);
-        float3 wh = normalize(params.cam_w);
-        aov_normal = make_float3(dot(nf, uh), dot(nf, vh), dot(nf, wh * -1.0f));
     }
 
-    // Firefly clamp: cap the per-sample radiance luminance before it enters the
-    // accumulator so a single bright outlier can't dominate the mean.
+    // NaN sink (the firefly clamp below cannot catch NaN: NaN > x is false) +
+    // whole-path firefly clamp on radiance luminance.
+    if (!(isfinite(radiance.x) && isfinite(radiance.y) && isfinite(radiance.z)))
+        radiance = make_float3(0.0f, 0.0f, 0.0f);
+    float3 color = radiance;
     float lum = 0.2126f * color.x + 0.7152f * color.y + 0.0722f * color.z;
     if (lum > PT_MAX_RADIANCE)
         color = color * (PT_MAX_RADIANCE / lum);
@@ -301,74 +835,94 @@ extern "C" __global__ void __raygen__rg()
     float inv = 1.0f / (float)(params.subframe + 1u);
     params.output[pixel] = make_float4(acc.x * inv, acc.y * inv, acc.z * inv, 1.0f);
 
-    // Guide AOVs are deterministic per pixel; overwrite each subframe (the small
-    // sub-pixel jitter only perturbs them at silhouette edges, which is fine for
-    // a denoiser guide). No accumulation needed.
-    params.albedo[pixel] = make_float4(aov_albedo.x, aov_albedo.y, aov_albedo.z, 1.0f);
-    params.normal[pixel] = make_float4(aov_normal.x, aov_normal.y, aov_normal.z, 0.0f);
-
-    // Motion-vector (flow) AOV: the OptiX temporal denoiser wants, at the current
-    // pixel, the vector (current - previous) in input-resolution pixels, so it can
-    // recover the source pixel as (current - flow). We find where the surface seen
-    // here *was* one frame ago (prev_pix), in the same pixel convention the raygen
-    // uses (x right, y up from the bottom row -- self-consistent with the beauty /
-    // previousOutput buffers, so the denoiser's reprojection lands correctly).
-    // The host zeroes history on the first frame (temporalModeUsePreviousLayers =
-    // 0), so a bogus flow then is harmless; we still emit a sane value.
+    // ---- Guide AOVs + motion-vector (flow) AOV, driven by the primary hit
+    // exactly as in M3 (only the normal guide now uses the smooth shading
+    // normal, a strict improvement for the denoiser). Deterministic per pixel;
+    // overwrite each subframe. ----
+    float3 aov_albedo;
+    float3 aov_normal;
     float2 curr_pix = make_float2((float)idx.x + 0.5f, (float)idx.y + 0.5f);
-    float2 prev_pix = curr_pix;  // default: zero flow (static / reprojection failed)
+    float2 prev_pix = curr_pix;   // default: zero flow (static / reprojection failed)
     float2 pp;
-    if (which == 0)
+    if (first.which <= 0)
     {
-        // Sky: reproject the ray direction through the previous camera basis.
-        if (projectDirToPixel(dir, params.prev_cam_u, params.prev_cam_v,
+        // Sky (miss): reproject the primary direction through the previous camera.
+        aov_albedo = skyColor(d0);
+        aov_normal = make_float3(0.0f, 0.0f, 0.0f);
+        if (projectDirToPixel(d0, params.prev_cam_u, params.prev_cam_v,
                               params.prev_cam_w, params.width, params.height, pp))
             prev_pix = pp;
     }
     else
     {
-        float3 P_curr = origin + dir * best;
-        float3 P_prev;
-        if (which == 1)
-            P_prev = prev_hit_cloth;                       // barycentric on prev verts
-        else if (which == 2)
-            P_prev = P_curr + (params.sphere_center_prev - params.sphere_center);  // rigid
-        else
-            P_prev = P_curr;                               // static ground
-        if (projectToPixel(P_prev, params.prev_cam_eye, params.prev_cam_u,
+        bool front0 = dot(first.ng, d0) < 0.0f;
+        aov_albedo = makeMaterial(first.which, front0).baseColor;
+        // Face the shading normal toward the viewer for the view-space guide.
+        float3 nf = (dot(first.ns, d0) > 0.0f) ? -first.ns : first.ns;
+        float3 uh = normalize(params.cam_u);
+        float3 vh = normalize(params.cam_v);
+        float3 wh = normalize(params.cam_w);
+        aov_normal = make_float3(dot(nf, uh), dot(nf, vh), dot(nf, -wh));
+        if (projectToPixel(first.prevP, params.prev_cam_eye, params.prev_cam_u,
                            params.prev_cam_v, params.prev_cam_w,
                            params.width, params.height, pp))
             prev_pix = pp;
     }
+    // A NaN in a guide AOV is undefined for the denoiser network and can smear
+    // garbage across neighboring pixels, so sanitize both before the writes
+    // (the beauty already has its own isfinite sink above).
+    if (!finite3(aov_albedo))
+        aov_albedo = make_float3(0.0f, 0.0f, 0.0f);
+    if (!finite3(aov_normal))
+        aov_normal = make_float3(0.0f, 0.0f, 0.0f);
+    params.albedo[pixel] = make_float4(aov_albedo.x, aov_albedo.y, aov_albedo.z, 1.0f);
+    params.normal[pixel] = make_float4(aov_normal.x, aov_normal.y, aov_normal.z, 0.0f);
     params.flow[pixel] = make_float2(curr_pix.x - prev_pix.x, curr_pix.y - prev_pix.y);
 }
 
 extern "C" __global__ void __miss__ms()
 {
-    // Leave t = 1e30 (set in raygen) so the miss is resolved there against sky.
+    // Leave t = 1e30 (set in sceneIntersect) so the miss is resolved there.
     optixSetPayload_0(__float_as_uint(1e30f));
 }
 
 extern "C" __global__ void __closesthit__ch()
 {
     // Geometric normal from the triangle vertices (needs the GAS built with
-    // ALLOW_RANDOM_VERTEX_ACCESS). Smooth shading normals arrive in M4.
+    // ALLOW_RANDOM_VERTEX_ACCESS).
     const unsigned int prim = optixGetPrimitiveIndex();
     const unsigned int sbtIdx = optixGetSbtGASIndex();
     float3 v[3];
     optixGetTriangleVertexData(params.handle, prim, sbtIdx, 0.0f, v);
-    float3 n = normalize(cross(v[1] - v[0], v[2] - v[0]));
+    // Zero-safe: a collapsed triangle (cross == 0) would otherwise normalize to
+    // NaN and poison the denoiser normal guide (see safeNormalize).
+    float3 ng = safeNormalize(cross(v[1] - v[0], v[2] - v[0]),
+                              make_float3(0.0f, 1.0f, 0.0f));
+
+    float2 bc = optixGetTriangleBarycentrics();
+    float w0 = 1.0f - bc.x - bc.y;
+    uint3 tri = params.tri_indices[prim];
+
+    // Smooth shading normal from the cloth's per-vertex normals (barycentric
+    // interpolation); fall back to the geometric normal when unavailable or when
+    // the interpolated normal cancels to ~0 (opposing normals across a sharp
+    // self-collision fold -- Warp's normalize_normals emits exactly (0,0,0)
+    // there, which would make an unguarded normalize NaN).
+    float3 ns = ng;
+    if (params.cloth_normals != 0)
+    {
+        float3 s = params.cloth_normals[tri.x] * w0
+                 + params.cloth_normals[tri.y] * bc.x
+                 + params.cloth_normals[tri.z] * bc.y;
+        ns = safeNormalize(s, ng);
+    }
 
     // Previous-frame world position of this exact surface point: reuse the hit's
-    // barycentrics against the *previous* frame's vertex positions (same topology,
-    // same triangle index -- only the vertices moved). This is the cloth's true
-    // per-vertex motion, the term a rigid/camera reprojection cannot capture.
-    float2 bc = optixGetTriangleBarycentrics();
-    uint3 tri = params.tri_indices[prim];
-    float3 p0 = params.prev_vertices[tri.x];
-    float3 p1 = params.prev_vertices[tri.y];
-    float3 p2 = params.prev_vertices[tri.z];
-    float3 pPrev = p0 * (1.0f - bc.x - bc.y) + p1 * bc.x + p2 * bc.y;
+    // barycentrics against the *previous* frame's vertex positions (same
+    // topology, same triangle index -- only the vertices moved).
+    float3 pPrev = params.prev_vertices[tri.x] * w0
+                 + params.prev_vertices[tri.y] * bc.x
+                 + params.prev_vertices[tri.z] * bc.y;
 
-    setHitPayload(optixGetRayTmax(), n, pPrev);
+    setHitPayload(optixGetRayTmax(), ng, ns, pPrev);
 }

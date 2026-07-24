@@ -311,7 +311,37 @@ render so the next frame's flow is correct.
 Disney BSDF, multiple importance sampling, next-event estimation, and
 environment-map importance sampling ported from GLSL-PathTracer into OptiX device
 code; smooth shading normals from the cloth's per-vertex normals; two-sided cloth
-via the hit's front/back-face flag.
+via the hit's front/back-face flag. Split into **M4a** (BSDF + multi-bounce GI),
+**M4b** (NEE + MIS) and **M4c** (env-map importance sampling).
+
+**M4a — Disney BSDF + multi-bounce GI + smooth normals + two-sided cloth (done).**
+The single-hit Lambert of M1 is replaced by an iterative multi-bounce path tracer
+in `__raygen__rg`: every bounce runs a unified `sceneIntersect` (cloth GAS +
+analytic sphere/ground), evaluates the ported Disney principled BSDF, importance-
+samples the next direction (`disneySample`), and applies Russian roulette past
+`rr_depth`. All `optixTrace` calls still issue from the raygen program, so the
+pipeline's `maxTraceDepth` stays 1. Shading uses the cloth's per-vertex smooth
+normals (barycentric-interpolated in the closesthit program, wired via
+`set_geometry(..., normals=)`), and cloth is two-sided (front/back albedo chosen
+from the geometric face). Per-object roughness/metallic are exposed through
+`set_cloth_material` / `set_sphere_material` / `set_ground_material`, and the bounce
+budget through `set_path_depth`; `roughness` is used directly as the GGX α (Disney
+linear roughness). A stand-in *unshadowed* directional sun keeps the frame lit
+until NEE lands in M4b, and the analytic sky is the environment on a miss. The
+albedo/normal/flow guide AOVs + motion vectors are preserved (the normal guide now
+uses the smooth shading normal); a whole-path NaN sink + firefly clamp protect the
+accumulator, and all normalizes/guide writes are zero/NaN-safe. The host `Params`
+struct is guarded against host/device ABI drift by a compile-time
+`static_assert(sizeof(Params) == PARAMS_EXPECTED_SIZE)` fed from `PARAMS_DTYPE`.
+
+**M4b — next-event estimation + MIS (planned).** Add shadow rays against the
+delta sun (a second miss program + `sceneOcclude`), replace the M4a stand-in with
+a proper `directLight`, and combine BSDF- and light-sampling with the power
+heuristic (carrying the scalar BSDF pdf across bounces).
+
+**M4c — environment-map importance sampling (planned).** Optional HDR lat-long
+environment with a host-built CDF and device importance sampling; the analytic sky
+gradient stays the default.
 
 ### M5 — Hardening + fallback
 Native-4K rendering option; robustness pass; Intel OIDN non-temporal fallback
