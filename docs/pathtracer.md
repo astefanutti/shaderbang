@@ -393,8 +393,27 @@ Design choices (deviations from the GLSL-PathTracer reference, all deliberate):
   deterministic per launch regardless of branch.
 
 ### M5 — Hardening + fallback
-Native-4K rendering option; robustness pass; Intel OIDN non-temporal fallback
-backend behind the same `Denoiser` interface for still frames / portability.
+
+**M5a — Robustness pass + native-4K (done).** Every public setter now validates
+its inputs up front and raises a clear `ValueError` instead of silently
+producing a corrupt launch or an out-of-bounds device read: the constructor
+checks `width`/`height >= 1`, `upscale ∈ {1, 2}` and `exposure > 0`;
+`set_camera_lookat` rejects a coincident eye/target, an up vector parallel to the
+view direction, and a non-positive aspect or out-of-range FOV; and `set_geometry`
+rejects fewer than three vertices, a non-`(N, 3)` / non-multiple-of-3 index
+buffer, and a smooth-normal count that does not match the vertex count. The
+live per-frame setters (`set_sphere`) are deliberately left permissive so an
+extreme interactive value can never crash a running session. A `close()` method
+(also a context manager)
+tears the instance down deterministically — `destroy()` on the pipeline, program
+groups, module, denoiser and device context, then the GL texture/PBO, then the
+device buffers — and is idempotent and safe after a partially-failed
+construction. **Native 4K** needs no special path: it is simply `upscale=1` at a
+4K extent (`PathTracer(3840, 2160, upscale=1)`), which selects the single-frame
+HDR denoiser at full resolution instead of the 1080p→4K temporal upscaler.
+
+**M5b — OIDN fallback (planned).** Intel OIDN non-temporal fallback backend
+behind the same denoiser interface for still frames / portability.
 
 ## References
 

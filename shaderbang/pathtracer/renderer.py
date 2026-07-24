@@ -208,16 +208,33 @@ class PathTracer:
 
     def __init__(self, width, height, device="cuda:0", exposure=1.0,
                  upscale=1, log_level=0):
-        self.width = int(width)
-        self.height = int(height)
+        width = int(width)
+        height = int(height)
+        upscale = int(upscale)
+        exposure = float(exposure)
+        # Validate up front: bad extents/upscale corrupt buffer sizing, and the
+        # denoiser only ships a 1x (HDR) and a 2x (temporal-upscale) model.
+        # Native 4K is just upscale=1 at a 4K extent -- e.g.
+        # ``PathTracer(3840, 2160, upscale=1)`` -- no special path required.
+        if width < 1 or height < 1:
+            raise ValueError(
+                f"width and height must be >= 1, got {width}x{height}")
+        if upscale not in (1, 2):
+            raise ValueError(
+                "upscale must be 1 (single-frame HDR denoiser) or 2 (temporal "
+                f"2x-upscale denoiser), got {upscale}")
+        if not (exposure > 0.0):
+            raise ValueError(f"exposure must be > 0, got {exposure}")
+        self.width = width
+        self.height = height
         # Output extent. The temporal-upscale denoiser (M3b) produces a 2x-larger
         # image than it is fed, so the beauty/guide/flow buffers stay at the
         # render res (self.width/height) while the denoised result, tone-map
         # target, present texture and PBO use the output res (self._out_*).
-        self.upscale = int(upscale)
+        self.upscale = upscale
         self._out_width = self.width * self.upscale
         self._out_height = self.height * self.upscale
-        self.exposure = float(exposure)
+        self.exposure = exposure
         self._device = device
         self._subframe = 0
         self._has_history = False   # temporal denoiser: no valid prev frame yet
@@ -709,15 +726,34 @@ class PathTracer:
         eye = _vec3(eye)
         target = _vec3(target)
         up = _vec3(up)
+        if not (aspect > 0.0):
+            raise ValueError(f"set_camera_lookat: aspect must be > 0, got {aspect}")
+        if not (0.0 < fov_y_deg < 180.0):
+            raise ValueError(
+                f"set_camera_lookat: fov_y_deg must be in (0, 180), got "
+                f"{fov_y_deg}")
         w = _sub3(target, eye)          # not normalized: |W| is the focal length
         wlen = _len3(w)
-        u = _norm3(_cross3(w, up))
+        if not (wlen > 0.0):
+            raise ValueError(
+                "set_camera_lookat: eye and target coincide (zero view "
+                f"direction): eye={eye}, target={target}")
+        u_raw = _cross3(w, up)
+        if not (_len3(u_raw) > 0.0):
+            raise ValueError(
+                "set_camera_lookat: up is parallel to the view direction; pick "
+                f"a different up vector (view={w}, up={up})")
+        u = _norm3(u_raw)
         v = _norm3(_cross3(u, w))
         vlen = wlen * math.tan(0.5 * math.radians(fov_y_deg))
         ulen = vlen * aspect
         self.set_camera(eye, _mul3(u, ulen), _mul3(v, vlen), w)
 
     def set_sphere(self, center, radius, albedo=None):
+        # No radius guard: this is a per-frame live setter (cloth.py pushes the
+        # interactive radius every frame), and the analytic intersector uses the
+        # radius only as r*r, so a stray negative value renders as |r| rather
+        # than corrupting anything -- not worth crashing a running session over.
         p = self._h_params[0]
         p["sphere_center"] = _vec3(center)
         p["sphere_radius"] = float(radius)
@@ -862,17 +898,38 @@ class PathTracer:
         self._vertices = vertices          # kept for the per-frame prev snapshot
         self._vtx_ptr = _device_ptr(vertices)
         self._num_vertices = int(len(vertices))
+        if self._num_vertices < 3:
+            raise ValueError(
+                f"set_geometry needs at least 3 vertices, got "
+                f"{self._num_vertices}")
         self._idx_ptr = _device_ptr(indices)
         shape = getattr(indices, "shape", None)
         if shape is not None and len(shape) == 2:
+            if shape[1] != 3:
+                raise ValueError(
+                    "set_geometry expects a (num_tris, 3) index array, got "
+                    f"shape {tuple(shape)}")
             self._num_triangles = int(shape[0])
         else:
-            self._num_triangles = int(len(indices)) // 3
+            n_idx = int(len(indices))
+            if n_idx % 3 != 0:
+                raise ValueError(
+                    "set_geometry expects a flat index count that is a "
+                    f"multiple of 3, got {n_idx}")
+            self._num_triangles = n_idx // 3
+        if self._num_triangles < 1:
+            raise ValueError("set_geometry needs at least 1 triangle")
 
         # Smooth shading normals (optional). The pointer is wired once and read
         # by the closesthit program every frame; the caller updates the contents
-        # in place. 0 => device falls back to the geometric normal.
+        # in place. 0 => device falls back to the geometric normal. A count
+        # mismatch would make the closesthit read past the buffer (the device
+        # indexes cloth_normals by vertex id), so reject it here.
         self._normals = normals
+        if normals is not None and int(len(normals)) != self._num_vertices:
+            raise ValueError(
+                f"normals length ({int(len(normals))}) must match vertex count "
+                f"({self._num_vertices})")
         self._h_params[0]["cloth_normals"] = (
             int(_device_ptr(normals)) if normals is not None else 0)
 
@@ -1155,6 +1212,90 @@ class PathTracer:
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
         glPopMatrix()
+
+    # ------------------------------------------------------------------ #
+    # Teardown
+    # ------------------------------------------------------------------ #
+    def close(self):
+        """Release the OptiX pipeline, denoiser, device context and every device
+        / GL resource this instance owns.
+
+        Idempotent, and safe to call after a partially-failed construction:
+        every step is guarded, so one bad handle cannot leak the rest. If
+        ``init_gl()`` was used, call ``close()`` with the same GL context current
+        so the texture/PBO deletes land on the right context. Also usable as a
+        context manager (``with PathTracer(...) as pt: ...``).
+        """
+        # OptiX objects, children before the context that owns them. otk-pyoptix
+        # exposes a .destroy() method on each handle.        # VERIFY-ON-TARGET
+        for attr in ("_pipeline", "_rg_group", "_ms_group", "_ms_shadow_group",
+                     "_ch_group", "_module", "_denoiser", "_ctx"):
+            self._destroy_optix(attr)
+
+        # GL present resources (only if init_gl ran; needs a current context).
+        if getattr(self, "_gl_ready", False):
+            self._release_gl()
+
+        # Drop references to device buffers / OptiX host structs so CuPy and Warp
+        # free the backing memory (these are plain allocations with no explicit
+        # destroy; refcount/GC reclaims them once unreferenced).
+        for attr in (
+            "_pbo_reg", "_sbt",
+            "_dn_input", "_dn_output", "_dn_layer", "_dn_guide", "_dn_params",
+            "_dn_albedo_img", "_dn_normal_img", "_dn_flow_img",
+            "_dn_out_img", "_dn_ig_img", "_out_bufs", "_d_ig",
+            "d_accum", "d_output", "d_denoised", "d_denoised2", "d_albedo",
+            "d_normal", "d_flow", "d_ldr", "_d_denoised_cur",
+            "_env_data", "_env_cdf", "_prev_vertices",
+            "_d_params", "_d_rg", "_d_ms", "_d_ch",
+            "_d_state", "_d_scratch", "_d_intensity", "_d_avg_color",
+            "_d_gas", "_d_temp",
+        ):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self._gas_handle = 0
+
+    def _destroy_optix(self, attr):
+        obj = getattr(self, attr, None)
+        if obj is None:
+            return
+        try:
+            destroy = getattr(obj, "destroy", None)
+            if callable(destroy):
+                destroy()
+        except Exception:  # noqa: BLE001 -- best-effort teardown
+            pass
+        setattr(self, attr, None)
+
+    def _release_gl(self):
+        try:
+            from OpenGL.GL import glDeleteTextures, glDeleteBuffers
+        except Exception:  # noqa: BLE001
+            self._gl_ready = False
+            return
+        # Drop the Warp<->GL registration before the PBO is deleted so the CUDA
+        # graphics resource is unregistered first.               # VERIFY-ON-TARGET
+        self._pbo_reg = None
+        if self._tex:
+            try:
+                glDeleteTextures(1, [int(self._tex)])
+            except Exception:  # noqa: BLE001
+                pass
+        if self._pbo:
+            try:
+                glDeleteBuffers(1, [int(self._pbo)])
+            except Exception:  # noqa: BLE001
+                pass
+        self._tex = None
+        self._pbo = None
+        self._gl_ready = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
 
 
 # --------------------------------------------------------------------------- #
