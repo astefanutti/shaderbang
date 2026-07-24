@@ -94,6 +94,7 @@ import shaderbang.input
 from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
 from shaderbang.input import Input, TouchSlot
 from shaderbang.gesture import homothety_and_rotation
+from shaderbang.pathtracer.renderer import PathTracer
 from shaderbang import lib as sb, options
 
 from OpenGL import setPlatform
@@ -310,13 +311,10 @@ class Cloth(Input):
         self.hostPos = wp.array(pos, dtype=wp.vec3, device="cpu", copy=False, pinned=True)
         self.hostTriDist = wp.zeros(self.numTris, dtype=float, device="cpu", pinned=True)
 
+        # Geometry device arrays (allocated in init()); path traced, not GL-bound.
         self.pos = None
-        self.pos_gl_buffer = GLuint()
         self.normals = None
-        self.normals_gl_buffer = GLuint()
         self.triIds = None
-        self.triIds_gl_buffer = GLuint()
-        self.gl_buffers = []
 
         self.numCols = num_y + 1  # grid stride, for topological-neighbor exclusion
         self.truncation_ts = wp.zeros(self.numParticles, dtype=float)  # per-vertex PDT scale (atomic_min)
@@ -1318,38 +1316,14 @@ class Cloth(Input):
     def init(self, **kwargs):
         self._quad = gluNewQuadric()
 
-        host_pos = self.hostPos.numpy()
-        glGenBuffers(1, ctypes.pointer(self.pos_gl_buffer))
-        glBindBuffer(GL_ARRAY_BUFFER, self.pos_gl_buffer)
-        glBufferData(GL_ARRAY_BUFFER, host_pos.nbytes, host_pos, GL_DYNAMIC_DRAW)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        buffer = wp.RegisteredGLBuffer(int(self.pos_gl_buffer.value),
-                                       flags=wp.RegisteredGLBuffer.NONE,
-                                       fallback_to_copy=False)
-        self.gl_buffers.append(buffer)
-        self.pos = buffer.map(dtype=wp.vec3, shape=(self.numParticles,))
-
-        normals = wp.zeros(self.numParticles, dtype=wp.vec3).numpy()
-        glGenBuffers(1, ctypes.pointer(self.normals_gl_buffer))
-        glBindBuffer(GL_ARRAY_BUFFER, self.normals_gl_buffer)
-        glBufferData(GL_ARRAY_BUFFER, normals.nbytes, normals, GL_DYNAMIC_DRAW)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        buffer = wp.RegisteredGLBuffer(int(self.normals_gl_buffer.value),
-                                       flags=wp.RegisteredGLBuffer.WRITE_DISCARD,
-                                       fallback_to_copy=False)
-        self.gl_buffers.append(buffer)
-        self.normals = buffer.map(dtype=wp.vec3, shape=(self.numParticles,))
-
-        tri_ids = self.hostTriIds
-        glGenBuffers(1, ctypes.pointer(self.triIds_gl_buffer))
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.triIds_gl_buffer)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, tri_ids.nbytes, tri_ids, GL_STATIC_DRAW)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
-        buffer = wp.RegisteredGLBuffer(int(self.triIds_gl_buffer.value),
-                                       flags=wp.RegisteredGLBuffer.READ_ONLY,
-                                       fallback_to_copy=False)
-        self.gl_buffers.append(buffer)
-        self.triIds = buffer.map(dtype=wp.int32, shape=(self.numTris, 3))
+        # Pure path tracing: the geometry lives in plain device arrays, not GL
+        # vertex buffers. The OptiX renderer builds its GAS straight from these
+        # pointers and refits them in place each frame, so the *same* arrays feed
+        # both the Warp physics / LBVH self-collision and the ray tracer -- no GL
+        # interop and no CPU copy on the render hot path.
+        self.pos = wp.clone(self.restPos)
+        self.normals = wp.zeros(self.numParticles, dtype=wp.vec3)
+        self.triIds = wp.array(self.hostTriIds, dtype=wp.int32)
 
         self.mesh = wp.Mesh(self.pos, self.triIds.flatten(), self.vel, bvh_constructor="lbvh")
         # Warm up refit() outside CUDA-graph capture so any scratch allocation
@@ -1372,44 +1346,17 @@ class Cloth(Input):
         self.update_mesh()
 
     def render(self, **kwargs):
-        # Make sure all the CUDA operations have completed before calling OpenGL
+        # The cloth mesh is path traced (see PathTracerView), which presents a
+        # full-screen frame over the whole viewport. The only fixed-function
+        # overlay left is the anchor gizmos, drawn *after* that frame -- see
+        # draw_anchors(), which PathTracerView calls once the traced image is up.
+        pass
+
+    def draw_anchors(self):
+        # Kinematic particles / anchors, drawn as small spheres on top of the
+        # traced frame. Positions come from the host mirror the physics keeps in
+        # sync; make sure any in-flight copy has landed before reading it.
         wp.synchronize_stream()
-
-        glColor3f(1.0, 0.0, 0.0)
-        glNormal3f(0.0, 0.0, -1.0)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE if State.WIREFRAME in state else GL_FILL)
-        glLineWidth(1.0)
-
-        glEnableClientState(GL_VERTEX_ARRAY)
-        glEnableClientState(GL_NORMAL_ARRAY)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self.pos_gl_buffer)
-        glVertexPointer(3, GL_FLOAT, 0, ctypes.c_void_p(0))
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-
-        glBindBuffer(GL_ARRAY_BUFFER, self.normals_gl_buffer)
-        glNormalPointer(GL_FLOAT, 0, ctypes.c_void_p(0))
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.triIds_gl_buffer)
-        if State.CULL_FACE in state:
-            glCullFace(GL_FRONT)
-            glColor3f(1.0, 0.0, 0.0)
-            glDrawElements(GL_TRIANGLES, 3 * self.numTris, GL_UNSIGNED_INT, None)
-            glCullFace(GL_BACK)
-            glColor3f(1.0, 1.0, 0.0)
-            glDrawElements(GL_TRIANGLES, 3 * self.numTris, GL_UNSIGNED_INT, None)
-        else:
-            glDisable(GL_CULL_FACE)
-            glColor3f(1.0, 0.0, 0.0)
-            glDrawElements(GL_TRIANGLES, 3 * self.numTris, GL_UNSIGNED_INT, None)
-            glEnable(GL_CULL_FACE)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0)
-
-        glDisableClientState(GL_VERTEX_ARRAY)
-        glDisableClientState(GL_NORMAL_ARRAY)
-
-        # kinematic particles / anchors
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         host_pos = self.hostPos.numpy()
         for anchor in filter(lambda a: a.flags & (AnchorFlag.ACTIVE | AnchorFlag.LOCKED), self.anchors):
@@ -1468,16 +1415,9 @@ class Ground(Input):
         self.vertices = vertices
 
     def render(self, frame, time):
-        glColor3f(1.0, 1.0, 1.0)
-        glNormal3f(0.0, 1.0, 0.0)
-        glVertexPointer(3, GL_FLOAT, 0, self.vertices)
-        glColorPointer(3, GL_FLOAT, 0, self.colors)
-        glEnableClientState(GL_VERTEX_ARRAY)
-        glEnableClientState(GL_COLOR_ARRAY)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-        glDrawArrays(GL_QUADS, 0, math.floor(len(self.vertices) / 3))
-        glDisableClientState(GL_VERTEX_ARRAY)
-        glDisableClientState(GL_COLOR_ARRAY)
+        # The ground plane is intersected analytically by the path tracer
+        # (PathTracer.set_ground); there is nothing to rasterize here.
+        pass
 
 
 class Sphere(Input):
@@ -1510,10 +1450,10 @@ class Sphere(Input):
         self.dr += dr
 
     def render(self, **kwargs):
-        if (not state & (State.RUN | State.STEP)
-                and (wp.length(self.dc) > 0.0 or self.dr != 0.0)):
-            self.draw(self.center, self.radius, self.quat, fill=False)
-        self.draw(self.center + self.dc, self.radius + self.dr, self.dq * self.quat)
+        # The sphere collider is intersected analytically by the path tracer;
+        # PathTracerView pushes its live centre/radius each frame, so there is
+        # no GL sphere to draw here.
+        pass
 
     def draw(self, pos: wp.vec3, rad: float, quat: wp.quat, fill=True, line=True):
         rot = wp.quat_to_matrix(quat)
@@ -1623,6 +1563,89 @@ class Camera(Input):
         self.pos += track_y
         self.target -= track_x
         self.target += track_y
+
+
+class PathTracerView(Input):
+    """Presents the scene with the OptiX path tracer instead of GL rasterization.
+
+    Constructed last so it renders after every other Input: by the time its
+    render() runs, the cloth physics has stepped and refit its mesh (in
+    Cloth.pre_render), so the GAS can be refit from the very same device arrays --
+    no CPU copy, no GL interop for the geometry. The traced + denoised frame is
+    tone-mapped straight into a PBO and drawn full-screen; the only remaining
+    fixed-function draw is the anchor gizmos, layered on top afterwards.
+    """
+
+    FOV_Y = 40.0        # matches Camera.init's gluPerspective vertical FOV
+    EXPOSURE = 1.2
+
+    def __init__(self, camera, sphere, cloth):
+        super().__init__("pathtracer")
+        self.camera = camera
+        self.sphere = sphere
+        self.cloth = cloth
+        self.pt = None
+        self._width = None
+        self._height = None
+        self._sig = None
+
+    def init(self, width, height):
+        # Defer the (GPU-heavy) tracer construction to the first render, when the
+        # cloth device geometry exists and a GL context is current; just capture
+        # the framebuffer size here.
+        self._width = width
+        self._height = height
+
+    def _build(self):
+        cloth = self.cloth
+        self.pt = PathTracer(self._width, self._height,
+                             exposure=PathTracerView.EXPOSURE)
+        self.pt.set_geometry(cloth.pos, cloth.triIds)
+        self.pt.set_ground(y=0.0, albedo=(0.55, 0.55, 0.6))
+        self.pt.set_light(direction=(0.5, 1.0, 0.4), color=(1.1, 1.05, 0.95))
+        self.pt.set_cloth_albedo(front=(0.2, 0.45, 0.85), back=(0.85, 0.6, 0.2))
+        self.pt.set_sphere(center=self.sphere.center, radius=self.sphere.radius,
+                           albedo=(0.8, 0.8, 0.8))
+        self.pt.init_gl()
+
+    def render(self, **kwargs):
+        if self.pt is None:
+            self._build()
+
+        cam = self.camera
+        eye = (cam.pos[0], cam.pos[1], cam.pos[2])
+        target = (cam.pos[0] + cam.forward[0],
+                  cam.pos[1] + cam.forward[1],
+                  cam.pos[2] + cam.forward[2])
+        up = (cam.up[0], cam.up[1], cam.up[2])
+        self.pt.set_camera_lookat(eye=eye, target=target, up=up,
+                                  fov_y_deg=PathTracerView.FOV_Y,
+                                  aspect=self._width / float(self._height))
+
+        # Apply the interactive centre/radius deltas so the traced sphere matches
+        # what the old GL draw showed (post_render integrates them once a step
+        # runs).
+        centre = self.sphere.center + self.sphere.dc
+        radius = self.sphere.radius + self.sphere.dr
+        self.pt.set_sphere(center=(centre[0], centre[1], centre[2]), radius=radius)
+
+        running = bool(state & (State.RUN | State.STEP))
+        if running:
+            # The cloth deformed this frame; track it with an in-place GAS refit.
+            self.pt.refit()
+
+        # Restart accumulation whenever anything moves; otherwise keep refining
+        # the denoised image while the scene is paused and still.
+        sig = (running, eye, target, up,
+               (centre[0], centre[1], centre[2]), radius)
+        reset = running or sig != self._sig
+        self._sig = sig
+
+        self.pt.render(reset=reset)
+        self.pt.present()
+
+        # Anchor gizmos, layered on top of the traced frame.
+        self.cloth.draw_anchors()
 
 
 class Mouse(shaderbang.input.Mouse):
@@ -2044,6 +2067,10 @@ camera = Camera()
 ground = Ground()
 sphere = Sphere(center=wp.vec3(0.0, 1.5, 0.0), radius=0.5)
 cloth = Cloth(y_offset=2.2, num_x=400, num_y=400, spacing=0.015)
+# Constructed last so it renders after the physics has stepped and the scene
+# Inputs have updated (camera basis, sphere transform): the path-traced frame is
+# presented over the whole viewport in place of the fixed-function draws.
+pathtracer = PathTracerView(camera=camera, sphere=sphere, cloth=cloth)
 
 keyboard = Keyboard()
 mouse = Mouse()

@@ -208,7 +208,21 @@ Lands in two commits for reviewability:
   renderer is validated in isolation before touching cloth.py's live loop.
 - **M1b — cloth integration.** Wire the `PathTracer` into `cloth.py`, move the
   cloth geometry off GL buffers onto plain `wp.array`s, and present the traced
-  frame in place of the fixed-function draws.
+  frame in place of the fixed-function draws. As implemented: `Cloth.init`
+  allocates `pos` / `normals` / `triIds` as plain device arrays (the same arrays
+  still back the `wp.Mesh` LBVH used for self-collision), and a new
+  `PathTracerView` Input — constructed *last*, so it renders after the physics
+  step and the camera/sphere updates — refits the GAS from `cloth.pos`, pushes
+  the live camera basis (from `gluPerspective`/`gluLookAt`'s 40° vertical FOV)
+  and sphere transform, traces, denoises, and presents. `Cloth`/`Ground`/`Sphere`
+  `render()` become no-ops; the cloth mesh, sphere and ground are now the traced
+  geometry (cloth GAS) and the two analytic colliders. Accumulation restarts
+  whenever the scene moves (simulation running, or camera/sphere changed) and
+  otherwise refines progressively while paused and still; the GAS is refit only
+  on frames where the cloth actually deformed. The anchor gizmos are the one
+  remaining fixed-function draw, layered on top of the traced frame
+  (`Cloth.draw_anchors`, called by `PathTracerView` after `present()`). Renders
+  at the native framebuffer resolution for M1 — the 1080p→4K upscale is M3.
 
 Refinement vs. the original sketch: the ACES tone-map runs as a **post-denoise
 Warp kernel** that writes RGBA8 straight into the PBO (rather than a GLSL quad),
