@@ -45,7 +45,9 @@ import warp as wp
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
     "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
+    "env_data", "env_cdf",
     "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
+    "env_width", "env_height", "env_enabled",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
     "light_dir", "light_color", "sky_top", "sky_bottom",
@@ -56,11 +58,14 @@ _PARAMS_NAMES = [
     "cloth_roughness", "cloth_metallic",
     "sphere_roughness", "sphere_metallic",
     "ground_roughness", "ground_metallic",
+    "env_total_sum", "env_intensity", "env_rotation",
 ]
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
     "u8", "u8", "u8", "u8", "u8",
+    "u8", "u8",
     "u4", "u4", "u4", "u4", "u4", "f4",
+    "u4", "u4", "u4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
@@ -71,6 +76,7 @@ _PARAMS_FORMATS = [
     "f4", "f4",
     "f4", "f4",
     "f4", "f4",
+    "f4", "f4", "f4",
 ]
 # Build with align=True, then pin itemsize up to the 8-byte struct alignment so
 # it equals the CUDA sizeof(Params) exactly (numpy stops at the last field; C
@@ -268,6 +274,8 @@ class PathTracer:
         self._num_triangles = 0
         self._normals = None         # per-vertex smooth normals (optional)
         self._prev_vertices = None   # previous-frame vertex snapshot (motion vec)
+        self._env_data = None        # HDR env-map device buffer (optional, M4c)
+        self._env_cdf = None         # env-map sin(theta)-weighted CDF (optional)
 
         # GL present state (created lazily on the first present, when a GL
         # context is current).
@@ -671,6 +679,16 @@ class PathTracer:
         p["sphere_metallic"] = 0.0
         p["ground_roughness"] = 0.9
         p["ground_metallic"] = 0.0
+        # Environment map (optional; wired by set_environment). 0 pointers +
+        # env_enabled=0 => the analytic gradient sky above is used on a miss.
+        p["env_data"] = 0
+        p["env_cdf"] = 0
+        p["env_width"] = 0
+        p["env_height"] = 0
+        p["env_enabled"] = 0
+        p["env_total_sum"] = 0.0
+        p["env_intensity"] = 1.0
+        p["env_rotation"] = 0.0
 
     # ------------------------------------------------------------------ #
     # Scene setters
@@ -721,6 +739,80 @@ class PathTracer:
         p = self._h_params[0]
         p["sky_top"] = _vec3(top)
         p["sky_bottom"] = _vec3(bottom)
+
+    def set_environment(self, image, intensity=1.0, rotation=0.0):
+        """Bind an HDR lat-long (equirectangular) environment map for image-based
+        lighting with importance sampling + MIS (M4c).
+
+        ``image`` is an ``(H, W, 3)`` or ``(H, W, 4)`` float image -- a numpy
+        array, a ``wp.array``, or any object exposing
+        ``__cuda_array_interface__``. It is read once (a host copy drives the CDF
+        build) and uploaded to two device buffers this instance then owns; the
+        render hot path touches only those device buffers. Row 0 is the +Y (top)
+        pole, matching the ``theta = acos(dir.y)`` convention in programs.cu.
+        ``intensity`` scales the env radiance; ``rotation`` offsets the azimuth
+        in uv units (``1.0`` == a full turn). A weightless (all-black) map is
+        rejected -- it falls back to the analytic sky. Call
+        ``clear_environment()`` to unbind and return to the analytic sky.
+        """
+        cp = self._cp
+        # Bring the image to a contiguous host float32 (H, W, C) for the CDF
+        # build (a one-time setup cost, never on the render hot path).
+        if hasattr(image, "numpy"):            # wp.array
+            host = image.numpy()
+        elif isinstance(image, cp.ndarray):    # cupy device array
+            host = cp.asnumpy(image)
+        else:
+            host = np.asarray(image)
+        host = np.ascontiguousarray(host, dtype=np.float32)
+        if host.ndim != 3 or host.shape[2] not in (3, 4):
+            raise ValueError(
+                "set_environment expects an (H, W, 3) or (H, W, 4) image, got "
+                f"shape {tuple(host.shape)}")
+        h, w = int(host.shape[0]), int(host.shape[1])
+        rgb = host[:, :, :3]
+
+        # Per-texel weight = Rec.709 luminance * sin(theta) at the row center,
+        # the lat-long solid-angle row weighting the GLSL-PathTracer reference
+        # omits (baking sin(theta) here concentrates samples away from the
+        # oversampled poles). This sin(thetaCenter) is the texel-selection
+        # weight; the device pdf keeps a separate 1/sin(thetaActual) Jacobian
+        # term (they do not cancel -- see envTexelPdf in programs.cu).
+        lum = (0.212671 * rgb[:, :, 0] + 0.715160 * rgb[:, :, 1]
+               + 0.072169 * rgb[:, :, 2]).astype(np.float64)
+        v = (np.arange(h, dtype=np.float64) + 0.5) / h
+        sin_theta = np.sin(v * math.pi)
+        weights = lum * sin_theta[:, None]
+        # Single flat, unnormalized, row-major running-sum CDF over all texels
+        # (index y*W + x), matching envmap.glsl BinarySearch / EnvironmentMap.cpp.
+        cdf = np.cumsum(weights.ravel(order="C"))
+        total = float(cdf[-1]) if cdf.size else 0.0
+        if not (total > 0.0):
+            self.clear_environment()
+            return
+
+        # float4 device buffer (RGB + 1), row-major to match env_cdf and the
+        # device index y*W + x.
+        rgba = np.ones((h * w, 4), dtype=np.float32)
+        rgba[:, :3] = rgb.reshape(h * w, 3)
+        self._env_data = wp.array(rgba, dtype=wp.vec4, device=self._device)
+        self._env_cdf = wp.array(cdf.astype(np.float32), dtype=wp.float32,
+                                 device=self._device)
+
+        p = self._h_params[0]
+        p["env_data"] = int(self._env_data.ptr)
+        p["env_cdf"] = int(self._env_cdf.ptr)
+        p["env_width"] = w
+        p["env_height"] = h
+        p["env_enabled"] = 1
+        p["env_total_sum"] = total
+        p["env_intensity"] = float(intensity)
+        p["env_rotation"] = float(rotation)
+
+    def clear_environment(self):
+        """Unbind the environment map: the analytic gradient sky (``set_sky``) is
+        used on a miss again. The device buffers are kept alive but disabled."""
+        self._h_params[0]["env_enabled"] = 0
 
     def set_cloth_albedo(self, front, back=None):
         p = self._h_params[0]

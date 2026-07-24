@@ -5,7 +5,7 @@
 // (https://github.com/knightcrawler25/GLSL-PathTracer), MIT License,
 // Copyright (c) 2019 Asif Ali. See docs/pathtracer.md.
 //
-// OptiX device programs for the shaderbang path tracer (milestone M4b).
+// OptiX device programs for the shaderbang path tracer (milestone M4c).
 //
 // The single-hit Lambert of M1/M3 is replaced by an iterative multi-bounce path
 // tracer in the raygen program. Each bounce intersects the cloth GAS plus the
@@ -13,16 +13,22 @@
 // per-vertex cloth normals, two-sided cloth), importance-samples a new
 // direction, applies Russian roulette, and accumulates global illumination.
 //
-// M4b adds next-event estimation: a shadow-tested directional sun (a delta
-// light, so NEE-only -- no MIS, no double counting, and a BSDF-sampled ray can
-// never hit it). Shadow rays reuse a second miss program (__miss__shadow) with
-// closesthit disabled and terminate-on-first-hit, plus cheap analytic occluder
-// tests. The sky is the environment on a miss and is BSDF-sampling only (env
-// importance sampling + MIS arrive in M4c with an HDR lat-long env). The
-// albedo/normal/flow guide AOVs and motion-vector reprojection are preserved
-// byte-compatibly for the temporal denoiser -- they are driven by the *first*
-// (primary) hit exactly as before, with the normal guide using the smooth
-// shading normal.
+// M4b added next-event estimation for a shadow-tested directional sun (a delta
+// light, so NEE-only -- no MIS, and a BSDF-sampled ray can never hit it). M4c
+// adds an optional HDR lat-long environment map with importance sampling and
+// multiple importance sampling (MIS, power heuristic) between the env-sampling
+// and BSDF-sampling strategies: directLight() gathers the env-NEE half
+// (PowerHeuristic(envPdf, bsdfPdf)) and the raygen miss handler gathers the
+// BSDF-sampling half (PowerHeuristic(bsdfPdf, envPdf)), with the BSDF pdf of the
+// last bounce carried across as a scalar. When no env map is bound the analytic
+// gradient sky stays the default and is BSDF-sampling only (env pdf = 0), exactly
+// as in M4b. The env CDF is sin(theta)-weighted on the host, so the device pdf
+// carries no 1/sin(theta) pole singularity. Shadow rays reuse a second miss
+// program (__miss__shadow) with closesthit disabled and terminate-on-first-hit,
+// plus cheap analytic occluder tests. The albedo/normal/flow guide AOVs and
+// motion-vector reprojection are preserved byte-compatibly for the temporal
+// denoiser -- they are driven by the *first* (primary) hit exactly as before,
+// with the normal guide using the smooth shading normal.
 //
 // The Params struct below MUST match PARAMS_DTYPE in renderer.py field for
 // field (a -D PARAMS_EXPECTED_SIZE static_assert guards the ABI). Self-contained:
@@ -76,9 +82,10 @@ static __forceinline__ __device__ float3 refractf(float3 i, float3 n, float eta)
     return i * eta - n * (eta * ni + sqrtf(k));
 }
 
-#define PT_PI      3.14159265358979323f
-#define PT_INV_PI  0.31830988618379067f
-#define PT_TWO_PI  6.28318530717958648f
+#define PT_PI          3.14159265358979323f
+#define PT_INV_PI      0.31830988618379067f
+#define PT_TWO_PI      6.28318530717958648f
+#define PT_INV_TWO_PI  0.15915494309189533f
 
 // Orthonormal basis around a unit normal (X=T, Y=B, Z=N), matching GLSL Onb.
 static __forceinline__ __device__ void onb(float3 n, float3& t, float3& b)
@@ -112,6 +119,8 @@ struct Params
     float2*                flow;          // output motion-vector AOV (input res, curr -> prev in pixels)
     OptixTraversableHandle handle;        // cloth GAS
     float3*                cloth_normals; // per-vertex smooth normals (0 => fall back to geometric normal)
+    float4*                env_data;      // HDR lat-long env, row-major (v*W+u); 0/env_enabled=0 => analytic sky
+    float*                 env_cdf;       // flat sin(theta)-weighted running-sum CDF (W*H)
 
     // --- 4-byte scalars --- //
     unsigned int           width;         // input (render) width
@@ -120,6 +129,9 @@ struct Params
     unsigned int           max_depth;     // maximum number of bounces
     unsigned int           rr_depth;      // Russian roulette starts at this bounce
     float                  exposure;      // unused on device (tonemap is a Warp kernel)
+    unsigned int           env_width;     // env-map width in texels (0 when no env)
+    unsigned int           env_height;    // env-map height in texels
+    unsigned int           env_enabled;   // 1 => importance-sample the env map + MIS
 
     // --- float3 basis / colors (float3 has 4-byte alignment) --- //
     float3                 cam_eye;
@@ -156,6 +168,11 @@ struct Params
     float                  sphere_metallic;
     float                  ground_roughness;
     float                  ground_metallic;
+
+    // --- environment map scalars (M4c) --- //
+    float                  env_total_sum; // sum of the sin(theta)-weighted CDF weights
+    float                  env_intensity; // multiplier applied to env radiance
+    float                  env_rotation;  // azimuth offset in uv (u += env_rotation)
 };
 
 #ifdef PARAMS_EXPECTED_SIZE
@@ -768,30 +785,213 @@ static __forceinline__ __device__ bool sceneOcclude(float3 o, float3 d, float tm
     return occluded != 0u;
 }
 
-// Next-event estimation for the directional sun (M4b). The sun is a *delta*
-// light: NEE is its only estimator (a BSDF-sampled ray has zero probability of
-// hitting an infinitesimal light), so there is no MIS and no double counting --
-// the sun is deliberately *not* gathered anywhere else. The BSDF value already
-// folds |N.L| in, and a delta light needs no /pdf. The sky is the environment
-// and is gathered on a miss at full weight (BSDF sampling only), so it is not
-// sampled here; env importance sampling + MIS arrive in M4c.
-static __forceinline__ __device__ float3 directLight(
-        float3 V, float3 N, float3 Ng, const Material& mat, float eta, float3 hitP)
+// --------------------------------------------------------------------------- //
+// Environment map (M4c): optional HDR lat-long image, importance-sampled with a
+// sin(theta)-weighted CDF built on the host (EnvironmentMap.cpp ported), plus
+// MIS against BSDF sampling. Ported from GLSL-PathTracer envmap.glsl, adapted
+// for plain device buffers with manual bilinear filtering (no CUDA texture
+// objects) and the sin(theta) row weighting the reference omits (which improves
+// importance sampling near the poles). The CDF weights bake sin(theta) at the
+// texel-ROW center, so a texel is selected with probability
+// P = L*sin(thetaCenter)/totalSum. The solid-angle pdf then divides by the
+// lat-long Jacobian's sin(theta) at the SAMPLE's actual polar angle:
+//   pdf_w = P * W*H / (2*pi^2 * sin(thetaActual)).
+// The two sin(theta)s do NOT cancel (center vs. actual differ within a cell), so
+// both are kept -- this is exactly pbrt's InfiniteAreaLight pdf and is unbiased
+// (dropping 1/sin(thetaActual) biases the estimate by sin(thetaCenter)/
+// sin(thetaActual), O(1) near the poles). The identical pdf-of-direction formula
+// is evaluated on both the NEE and BSDF-sampling sides so the MIS weights share
+// one measure.
+// --------------------------------------------------------------------------- //
+static __forceinline__ __device__ float powerHeuristic(float a, float b)
 {
-    float3 L = params.light_dir;   // normalized, points toward the sun
-    float pdf;
-    float3 f = disneyEval(mat, eta, V, N, L, pdf);   // |N.L| folded in
-    // Nothing to gather if the BSDF vanishes for this direction (e.g. the sun is
-    // below the surface horizon) -- skip the shadow ray entirely.
-    if (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f)
-        return make_float3(0.0f, 0.0f, 0.0f);
+    // beta=2 power heuristic, one sample per strategy: a^2 / (a^2 + b^2).
+    float t = a * a;
+    return t / (b * b + t);
+}
 
-    // Offset the shadow-ray origin onto the light side of the geometric normal.
-    float3 offN = (dot(L, Ng) < 0.0f) ? -Ng : Ng;
-    float3 so = hitP + offN * 1e-4f;
-    if (sceneOcclude(so, L, 1e16f))
-        return make_float3(0.0f, 0.0f, 0.0f);
-    return f * params.light_color;
+static __forceinline__ __device__ float3 envTexel(int x, int y)
+{
+    float4 c = params.env_data[y * (int)params.env_width + x];
+    return make_float3(c.x, c.y, c.z);
+}
+
+// Direction -> lat-long uv (y-up, right-handed). u is wrapped to [0,1); v is the
+// polar angle in [0,1]. Matches EvalEnvMap's forward map (incl. env_rotation).
+static __forceinline__ __device__ void envDirToUV(float3 dir, float& u, float& v)
+{
+    float theta = acosf(clampf(dir.y, -1.0f, 1.0f));
+    u = (PT_PI + atan2f(dir.z, dir.x)) * PT_INV_TWO_PI + params.env_rotation;
+    u = u - floorf(u);                 // wrap azimuth into [0,1)
+    v = theta * PT_INV_PI;             // [0,1]
+}
+
+// uv -> direction, the exact inverse of envDirToUV (SampleEnvMap's inverse map).
+static __forceinline__ __device__ float3 envUVToDir(float u, float v)
+{
+    float phi = (u - params.env_rotation) * PT_TWO_PI;
+    float theta = v * PT_PI;
+    float st = sinf(theta);
+    return make_float3(-st * cosf(phi), cosf(theta), -st * sinf(phi));
+}
+
+// Bilinear env color at uv (wrap u, clamp v). Filtering is for the *radiance*
+// only; the pdf uses the discrete per-texel luminance (see below).
+static __forceinline__ __device__ float3 envBilinear(float u, float v)
+{
+    int W = (int)params.env_width, H = (int)params.env_height;
+    float fx = u * (float)W - 0.5f;
+    float fy = v * (float)H - 0.5f;
+    float x0f = floorf(fx), y0f = floorf(fy);
+    float tx = fx - x0f, ty = fy - y0f;
+    int x0 = (int)x0f, y0 = (int)y0f;
+    int x0w = ((x0 % W) + W) % W;      // wrap azimuth
+    int x1w = (((x0 + 1) % W) + W) % W;
+    int y0c = min(max(y0, 0), H - 1);  // clamp poles
+    int y1c = min(max(y0 + 1, 0), H - 1);
+    float3 c00 = envTexel(x0w, y0c), c10 = envTexel(x1w, y0c);
+    float3 c01 = envTexel(x0w, y1c), c11 = envTexel(x1w, y1c);
+    return lerp(lerp(c00, c10, tx), lerp(c01, c11, tx), ty);
+}
+
+// Nearest-texel index for a uv (wrap u, clamp v) -- the texel whose cell the
+// sample fell in, matching the discrete CDF the sampler draws from.
+static __forceinline__ __device__ void envTexelIndex(float u, float v, int& x, int& y)
+{
+    int W = (int)params.env_width, H = (int)params.env_height;
+    x = (int)floorf(u * (float)W);
+    x = ((x % W) + W) % W;
+    y = (int)floorf(v * (float)H);
+    y = min(max(y, 0), H - 1);
+}
+
+// Solid-angle pdf of the env importance sampler for a sample that fell in texel
+// (x,y) at actual polar angle theta (sinThetaActual = sin(theta)). Selection
+// probability P = L*sin(thetaCenter)/env_total_sum (the host bakes
+// sin(thetaCenter) into the CDF weights + env_total_sum); the uniform uv jitter
+// within the cell gives pdf_uv = P*W*H; the lat-long Jacobian
+// dw = 2*pi^2*sin(theta)*du*dv converts to solid angle. sin(thetaCenter) (the
+// baked selection weight, per row) and 1/sin(theta) (the Jacobian, at the
+// sample) do NOT cancel, so both are kept -- matching pbrt's InfiniteAreaLight
+// and staying unbiased. Guards env_total_sum and the poles (sinThetaActual==0).
+static __forceinline__ __device__ float envTexelPdf(int x, int y, float sinThetaActual)
+{
+    if (!(params.env_total_sum > 0.0f) || sinThetaActual <= 0.0f)
+        return 0.0f;
+    float thetaCenter = ((float)y + 0.5f) * PT_PI / (float)params.env_height;
+    float L = luminance(envTexel(x, y));
+    float wh = (float)params.env_width * (float)params.env_height;
+    return L * sinf(thetaCenter) * wh
+         / (params.env_total_sum * PT_TWO_PI * PT_PI * sinThetaActual);
+}
+
+// Env radiance + solid-angle pdf for an arbitrary direction (the BSDF-sampling
+// side of the MIS: called from the raygen miss handler).
+static __forceinline__ __device__ float3 envRadiance(float3 dir, float& pdf)
+{
+    float u, v;
+    envDirToUV(dir, u, v);
+    int x, y;
+    envTexelIndex(u, v, x, y);
+    pdf = envTexelPdf(x, y, sinf(v * PT_PI));   // sin(theta) at the query dir
+    return envBilinear(u, v);
+}
+
+// Importance-sample the env map: pick a texel from the CDF, jitter uniformly
+// within its uv cell (a proper continuous sampler, unlike the reference's
+// texel-corner point sample), and return radiance + direction + solid-angle pdf.
+// Draws exactly three uniforms so the RNG stream is deterministic per launch.
+static __forceinline__ __device__ float3 sampleEnv(RNG& rng, float3& dir, float& pdf)
+{
+    int W = (int)params.env_width, H = (int)params.env_height;
+    float value = rng_next(rng) * params.env_total_sum;
+
+    // Hierarchical binary search over the flat sin(theta)-weighted CDF: the last
+    // column is the marginal over rows, the running sum within a row is the
+    // conditional over columns (envmap.glsl BinarySearch).
+    int lower = 0, upper = H - 1;
+    while (lower < upper)
+    {
+        int mid = (lower + upper) >> 1;
+        if (value < params.env_cdf[(W - 1) + mid * W]) upper = mid;
+        else                                           lower = mid + 1;
+    }
+    int y = min(max(lower, 0), H - 1);
+    lower = 0; upper = W - 1;
+    while (lower < upper)
+    {
+        int mid = (lower + upper) >> 1;
+        if (value < params.env_cdf[mid + y * W]) upper = mid;
+        else                                     lower = mid + 1;
+    }
+    int x = min(max(lower, 0), W - 1);
+
+    float ju = rng_next(rng);
+    float jv = rng_next(rng);
+    float u = ((float)x + ju) / (float)W;
+    float v = ((float)y + jv) / (float)H;
+    dir = envUVToDir(u, v);
+    pdf = envTexelPdf(x, y, sinf(v * PT_PI));   // same measure as envRadiance
+    return envBilinear(u, v);
+}
+
+// Next-event estimation (M4b + M4c). Two independent, non-double-counting light
+// contributions are gathered before the BSDF is sampled at this vertex:
+//
+//  * the directional sun -- a *delta* light: NEE is its only estimator (a
+//    BSDF-sampled ray has zero probability of hitting an infinitesimal light),
+//    so there is no MIS, no /pdf, and it is deliberately gathered nowhere else;
+//  * the HDR env map (when bound) -- importance-sampled and MIS-weighted with
+//    PowerHeuristic(envPdf, bsdfPdf); the BSDF-sampling half is gathered on a
+//    miss in raygen. Skipped when no env is bound, leaving the analytic sky
+//    BSDF-sampling only (env pdf = 0), so the sun still works with either.
+//
+// The BSDF value already folds |N.L| in. Draws RNG only for the env sample.
+static __forceinline__ __device__ float3 directLight(
+        float3 V, float3 N, float3 Ng, const Material& mat, float eta,
+        float3 hitP, RNG& rng)
+{
+    float3 Ld = make_float3(0.0f, 0.0f, 0.0f);
+
+    // --- Delta directional sun: NEE-only, full weight, no MIS. ---
+    {
+        float3 L = params.light_dir;   // normalized, points toward the sun
+        float pdf;
+        float3 f = disneyEval(mat, eta, V, N, L, pdf);   // |N.L| folded in
+        // Skip the shadow ray if the BSDF vanishes (e.g. sun below the horizon).
+        if (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)
+        {
+            float3 offN = (dot(L, Ng) < 0.0f) ? -Ng : Ng;
+            float3 so = hitP + offN * 1e-4f;
+            if (!sceneOcclude(so, L, 1e16f))
+                Ld += f * params.light_color;
+        }
+    }
+
+    // --- Environment map NEE (importance sampled + MIS). ---
+    if (params.env_enabled)
+    {
+        float3 Lenv;
+        float envPdf;
+        float3 Li = sampleEnv(rng, Lenv, envPdf);
+        if (envPdf > 0.0f)
+        {
+            float bsdfPdf;
+            float3 f = disneyEval(mat, eta, V, N, Lenv, bsdfPdf);
+            if (bsdfPdf > 0.0f && (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f))
+            {
+                float3 offN = (dot(Lenv, Ng) < 0.0f) ? -Ng : Ng;
+                float3 so = hitP + offN * 1e-4f;
+                if (!sceneOcclude(so, Lenv, 1e16f))
+                {
+                    float mis = powerHeuristic(envPdf, bsdfPdf);
+                    Ld += (f * Li) * (mis * params.env_intensity / envPdf);
+                }
+            }
+        }
+    }
+
+    return Ld;
 }
 
 extern "C" __global__ void __raygen__rg()
@@ -818,6 +1018,7 @@ extern "C" __global__ void __raygen__rg()
     // maxTraceDepth stays 1; nothing traces from closesthit/miss). ----
     float3 radiance = make_float3(0.0f, 0.0f, 0.0f);
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
+    float bsdfPdf = 0.0f;   // solid-angle pdf of the last BSDF sample (MIS carry)
     Hit first;
     first.which = -1;
 
@@ -829,11 +1030,25 @@ extern "C" __global__ void __raygen__rg()
 
         if (h.which == 0)
         {
-            // Environment on a miss. The sky is BSDF-sampling only (no env NEE
-            // yet -- that arrives in M4c with the importance-sampled HDR env), so
-            // the miss takes full weight. The delta sun sampled by NEE below can
-            // never be hit by a scattered ray, so there is no double counting.
-            radiance += throughput * skyColor(d);
+            // Environment on a miss. With an HDR env bound this is the
+            // BSDF-sampling half of the env MIS: weight it against the env-NEE
+            // strategy with PowerHeuristic(bsdfPdf, envPdf), using the BSDF pdf
+            // carried from the bounce that produced this ray. The primary ray
+            // (depth 0) had no NEE competitor, so it takes full weight. With no
+            // env bound the analytic sky takes full weight (BSDF-sampling only,
+            // as in M4b). The delta sun is never gathered here (no double count).
+            if (params.env_enabled)
+            {
+                float envPdf;
+                float3 envCol = envRadiance(d, envPdf);
+                float misWeight = (depth == 0u) ? 1.0f
+                                                : powerHeuristic(bsdfPdf, envPdf);
+                radiance += throughput * envCol * (params.env_intensity * misWeight);
+            }
+            else
+            {
+                radiance += throughput * skyColor(d);
+            }
             break;
         }
 
@@ -845,10 +1060,9 @@ extern "C" __global__ void __raygen__rg()
         Material mat = makeMaterial(h.which, front);
         float eta = front ? (1.0f / mat.ior) : mat.ior;   // relative IOR (entering -> 1/ior)
 
-        // Next-event estimation: shadow-tested directional sun (M4b). Replaces
-        // the M4a unshadowed stand-in. NEE-only, full weight -- the delta sun
-        // cannot be hit by a BSDF-sampled ray, so no MIS and no double counting.
-        radiance += throughput * directLight(-d, Ns, Ng, mat, eta, h.p);
+        // Next-event estimation (M4b sun + M4c env): shadow-tested directional
+        // sun (NEE-only, delta light) plus importance-sampled env with MIS.
+        radiance += throughput * directLight(-d, Ns, Ng, mat, eta, h.p, rng);
 
         if (depth == params.max_depth)
             break;
@@ -860,6 +1074,7 @@ extern "C" __global__ void __raygen__rg()
         if (!(pdf > 0.0f))
             break;
         throughput *= f * (1.0f / pdf);
+        bsdfPdf = pdf;   // carry for the next vertex's env MIS (miss handler)
 
         // Offset along the geometric normal on the outgoing side to avoid
         // self-intersection, then continue.
@@ -906,7 +1121,16 @@ extern "C" __global__ void __raygen__rg()
     if (first.which <= 0)
     {
         // Sky (miss): reproject the primary direction through the previous camera.
-        aov_albedo = skyColor(d0);
+        // The albedo guide uses the env color when bound, else the analytic sky.
+        if (params.env_enabled)
+        {
+            float envPdfUnused;
+            aov_albedo = envRadiance(d0, envPdfUnused);
+        }
+        else
+        {
+            aov_albedo = skyColor(d0);
+        }
         aov_normal = make_float3(0.0f, 0.0f, 0.0f);
         if (projectDirToPixel(d0, params.prev_cam_u, params.prev_cam_v,
                               params.prev_cam_w, params.width, params.height, pp))

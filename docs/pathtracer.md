@@ -351,12 +351,46 @@ the environment is *importance-sampled* (an env direction can be reached by both
 NEE and BSDF sampling), so the power heuristic + carried BSDF pdf land there rather
 than as dead scaffolding here.
 
-**M4c — environment-map importance sampling + MIS (planned).** Optional HDR
-lat-long environment with a host-built CDF and device importance sampling; the
-analytic sky gradient stays the default. This is where multiple importance
-sampling arrives: env-NEE and BSDF-sampling both reach env directions, combined
-with the β=2 power heuristic (carrying the scalar BSDF pdf across bounces, weight 1
-on the primary ray).
+**M4c — environment-map importance sampling + MIS (done).** An optional HDR
+lat-long environment (`renderer.set_environment(image, intensity, rotation)`)
+becomes the light on a miss; the analytic sky gradient (`set_sky`) stays the
+default and `clear_environment()` restores it. This is where multiple importance
+sampling arrives: an env direction can be reached by both env-NEE and BSDF
+sampling, so the two are combined with the β=2 power heuristic
+`PowerHeuristic(a,b) = a²/(a²+b²)`. The env-NEE half lives in `directLight`
+(weighted `PowerHeuristic(envPdf, bsdfPdf)`); the BSDF-sampling half is gathered
+in the raygen miss handler (weighted `PowerHeuristic(bsdfPdf, envPdf)`), carrying
+the scalar BSDF pdf of the ray being traced across bounces — weight 1 on the
+primary ray (depth 0), which has no NEE competitor. The delta sun stays NEE-only
+and is never gathered on a miss, so sun and env never double-count.
+
+Design choices (deviations from the GLSL-PathTracer reference, all deliberate):
+
+- **`sin(θ)` row weighting + pbrt-exact pdf.** The host builds a single flat,
+  row-major, unnormalized running-sum CDF over all `W·H` texels, weighted by
+  Rec.709 luminance × `sin(θ_center)` (the reference omits `sin(θ)`, oversampling
+  the poles). A texel is thus selected with probability `L·sin(θ_center)/Σ`. The
+  device solid-angle pdf keeps the lat-long Jacobian's `1/sin(θ_actual)` term:
+  `pdf_ω = L·sin(θ_center)·W·H / (Σ · 2π² · sin(θ_actual))`. The two `sin(θ)`s do
+  **not** cancel — `θ_center` is the texel row center baked into the CDF, while
+  `θ_actual` is the sampled/queried direction's polar angle — so both are kept.
+  This is exactly pbrt's `InfiniteAreaLight` pdf and is unbiased; dropping
+  `1/sin(θ_actual)` would bias the estimate by `sin(θ_center)/sin(θ_actual)`,
+  O(1) near the poles. The identical pdf-of-direction is evaluated on both MIS
+  sides so the strategies share one measure. Hierarchical binary search over the
+  flat CDF (last column = marginal over rows, running sum within a row =
+  conditional over columns) picks the texel.
+- **Plain device buffers + manual bilinear filtering — no CUDA texture objects.**
+  Consistent with the M0-validated plain-pointer approach (texture objects were
+  never de-risked on target). The caller supplies the env image as a plain array
+  (numpy / `wp.array` / any `__cuda_array_interface__` provider), so there are no
+  new dependencies. Radiance is bilinearly filtered (wrap `u`, clamp `v`); the
+  pdf uses the discrete per-texel luminance to stay consistent with the CDF.
+- **Continuous, jittered sampler.** After the CDF picks a texel, the sample is
+  jittered uniformly within that texel's uv cell (the reference point-samples the
+  texel corner). `sampleEnv` draws exactly three uniforms whenever the env is
+  enabled (one for the CDF value, two for the jitter), so the RNG stream stays
+  deterministic per launch regardless of branch.
 
 ### M5 — Hardening + fallback
 Native-4K rendering option; robustness pass; Intel OIDN non-temporal fallback
