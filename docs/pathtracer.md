@@ -1,0 +1,225 @@
+# Path tracing for shaderbang
+
+A reusable, real-time, denoised path tracer for shaderbang, first consumed by
+[`examples/cloth.py`](../examples/cloth.py). It renders the cloth (and the rest
+of the scene) with a Monte-Carlo path tracer running on the GPU's RT cores via
+NVIDIA OptiX, denoised live with the OptiX AI Denoiser, and presented through
+OpenGL — the substrate shaderbang already uses for its EGL/DRM/KMS scanout.
+
+> **Status.** Design + phased implementation. The renderer is **RTX-on-target
+> only**: it requires an NVIDIA GPU (developed against an RTX 5090 / Blackwell,
+> CUDA 12.8+, driver R590+), CUDA, and OptiX 9.x. It cannot run on the CUDA-less
+> dev box (macOS); only the Warp physics stays CPU-testable. Each milestone is
+> committed separately and verified on-target.
+
+## Goals and constraints
+
+1. **Reuse the simulation geometry with no CPU round-trips.** The cloth's vertex
+   positions, normals and indices live in GPU memory owned by the physics
+   (NVIDIA Warp). The renderer consumes those buffers directly — no host copies
+   on the render hot path.
+2. **Live and denoised.** The target is real-time animated rendering with a
+   temporal denoiser, not merely clean stills when paused.
+3. **Reusable.** Packaged as `shaderbang/pathtracer/`, an `Input` subclass that
+   fits shaderbang's `init` / `pre_render` / `render` / `post_render` model. The
+   module takes CUDA **device arrays** for geometry — agnostic to whether the
+   consumer happens to back them with OpenGL — and owns exactly one GL buffer
+   internally (the present target).
+4. **Borrow proven algorithms.** The shading math (Disney BSDF, MIS, NEE,
+   environment importance sampling) is ported from
+   [GLSL-PathTracer](https://github.com/knightcrawler25/GLSL-PathTracer) (MIT)
+   into OptiX device code. The ACES tonemap GLSL is kept verbatim on the present
+   quad.
+
+## Architecture
+
+```
+Warp (physics / CUDA)                OptiX (rendering / CUDA)               OpenGL (present)
+─────────────────────                ────────────────────────               ────────────────
+cloth.simulate()                                                            
+  writes pos/normals (wp.array) ─┐                                          
+  refit collision LBVH           │  (device pointers, zero copy)            
+    (collision ONLY)             └──►  GAS build / refit (per frame)        
+                                       raygen megakernel:                    
+                                         optixTrace on RT cores              
+                                         iterative bounce loop               
+                                         Disney BSDF / MIS / NEE             
+                                         → HDR radiance + AOVs               
+                                           (albedo, normal, flow, …)         
+                                       OptiX AI Denoiser                     
+                                         TEMPORAL + 2× upscale               
+                                         1080p → 4K                          
+                                         writes into ──(mapped GL PBO)──►  glTexSubImage2D
+                                                                          → RGBA32F texture
+                                                                          → fullscreen ACES quad
+```
+
+Three subsystems share **one CUDA context and stream**:
+
+- **Warp** runs the cloth simulation, owns the geometry as plain `wp.array`s,
+  and keeps the collision LBVH (`wp.Mesh`) — now used for **collision only**
+  (swept CCD + PDT self-collision), which OptiX cannot serve.
+- **OptiX** builds a geometry acceleration structure (**GAS**) from the *same*
+  device pointers each frame, traces primary + secondary rays on the RT cores,
+  writes HDR radiance and denoiser guide buffers (AOVs), then runs the AI
+  Denoiser.
+- **OpenGL** is the **presentation layer only**. There is no CUDA→display path
+  in shaderbang, so the final image must cross into a GL texture to be scanned
+  out. The denoiser writes into a CUDA-mapped GL pixel buffer object (PBO); a
+  `glTexSubImage2D` uploads it into a texture drawn by a fullscreen ACES quad.
+
+End state: **two GPU acceleration structures over one geometry source** — the
+Warp collision LBVH (refit per physics substep) and the OptiX render GAS (refit
+per frame). Both derive from the same `wp.array`s; neither involves a host copy.
+
+### Why this shape
+
+The four design decisions that produced it:
+
+1. **Engine + denoiser: OptiX.** OptiX is NVIDIA's actively-developed ray-tracing
+   + AI-denoising SDK (9.0 Feb 2025 added Blackwell support; 9.1 Dec 2025). Its
+   AI Denoiser is the reference real-time/temporal denoiser and is the only one
+   in this class reachable from a Python + CUDA + raw-OpenGL Linux stack. The
+   alternatives were rejected on **accessibility, not quality**:
+   - **NVIDIA NRD** (ReBLUR/ReLAX/SIGMA) — DX11/12/Vulkan + HLSL compute; no
+     CUDA/GL/Python path.
+   - **DLSS Ray Reconstruction** — Streamline/NGX, a DX12/Vulkan framework with
+     no CUDA entry point and no Python bindings.
+   - **Vulkan Ray Tracing** — reaches the same RT cores but breaks the
+     CUDA/Warp interop that anchors the stack, and has no Python story.
+   - **Intel OIDN** — native CUDA + Python, but still not temporal as of
+     2026-07 (OIDN 3 temporal unreleased). Kept only as a **non-temporal
+     fallback** behind the same interface.
+
+2. **Binding: `otk-pyoptix` (first-party), not `python-optix`.** The
+   "OptiX is unmaintained" concern was a conflation: the *SDK* is maintained;
+   only the third-party `python-optix` binding (mortacious, last commit 2023,
+   pinned to OptiX 7.6) is stale. NVIDIA ships
+   [`otk-pyoptix`](https://github.com/NVIDIA/otk-pyoptix) (part of the OptiX
+   Toolkit), current through 2026, supporting OptiX 9.1 on CUDA 12.x/Blackwell.
+   Fallback is a self-owned thin `ctypes` wrapper over the denoiser host API —
+   dependency-free, but it must reproduce the version-specific
+   `OptixFunctionTable` ABI struct (which is exactly what `otk-pyoptix`
+   absorbs), so it is the *fallback*, not the primary.
+
+3. **Traversal: OptiX GAS (RT cores) from v1.** Software `wp.mesh_query_ray`
+   traversal on the Warp LBVH leaves the RT cores idle. Since we already depend
+   on OptiX for denoising, we let it do traversal too, on the RT cores. A GAS is
+   a *second* acceleration structure, but it is built from the same GL/CUDA
+   vertex buffers (no CPU copy), costs tens of MB, and refits in sub-millisecond
+   time. This relaxes the original "no second BVH" constraint in exchange for
+   the performance needed to be *live*; the "no CPU transfer" constraint is
+   preserved.
+
+4. **Resolution: 1080p + OptiX 2× temporal upscale.** v1 renders and denoises at
+   1080p and upscales to 4K with the denoiser's temporal-upscale model, rather
+   than tracing native 4K. Native 4K is a later option (M5).
+
+## GL/CUDA/OptiX interop
+
+GL↔CUDA interop is a **CUDA driver** feature, not an OptiX or Warp feature.
+OptiX consumes plain `CUdeviceptr`s (`OptixImage2D.data`,
+`OptixBuildInputTriangleArray.vertexBuffers`). A GL buffer becomes such a
+pointer, zero-copy, via `cudaGraphicsGLRegisterBuffer` (register once at init) +
+`cudaGraphicsMapResources` / `cudaGraphicsResourceGetMappedPointer` (map per
+frame) — exactly what `wp.RegisteredGLBuffer` wraps. So the denoiser writes
+directly into the GL PBO's memory.
+
+Only **one** GL-registered buffer is needed: the present PBO. The intermediate
+AOVs (radiance, albedo, normal, flow, …) are plain on-device buffers that never
+touch GL. The cloth geometry is plain `wp.array`s (pure-PT: nothing rasterizes
+them, so they need no GL backing).
+
+Interop rules: the mapped pointer is valid only between map and unmap — remap
+each frame, don't cache it; keep map → OptiX/CUDA work → unmap on one stream so
+the unmap doesn't hand the buffer back to GL before the GPU finishes; GL must not
+touch the buffer while it is mapped. Map/unmap provide implicit GL↔CUDA
+synchronization (no external semaphores, unlike the Vulkan path).
+
+*Later optimization (post-v1):* register the GL **texture** directly
+(`cudaGraphicsGLRegisterImage` + a CUDA surface) so the denoiser writes straight
+into the texture, eliminating the PBO→texture copy. Warp interop is buffer-only,
+so this needs raw CUDA; deferred.
+
+## Integration gotchas
+
+- **Shared CUDA context.** Create the OptiX device context on *Warp's* current
+  `CUcontext` (`optixDeviceContextCreate`) so the GAS, denoiser and physics
+  share one context and stream. Otherwise device pointers do not alias across
+  contexts.
+- **Denoiser outside CUDA-graph capture.** The denoiser allocates state/scratch
+  and computes the HDR intensity on first invoke — it must not be captured into
+  a CUDA graph. Warm it up once in `init` (like the cloth warms up `refit`).
+- **Stream handle.** `wp.get_stream().cuda_stream` is a raw integer; APIs that
+  want a stream object (e.g. CuPy) need `cp.cuda.ExternalStream(int(...))`.
+- **Denoiser image formats.** The noisy input must not be `FLOAT4`; use
+  `HALF4`/`FLOAT3`. Albedo/normal guides are typically 3-channel.
+- **Motion vectors.** The cloth's existing `prevPos` is overwritten at the start
+  of every physics substep, so it holds the second-to-last substep, not the last
+  displayed frame — it is **unusable** for motion vectors. A dedicated
+  `mvPrevPos` is snapshotted (`wp.copy(mvPrevPos, pos)`) in `pre_render`
+  **before** `simulate`, **every rendered frame** (including when paused), and
+  initialized to `pos`. Screen-space flow is computed in the raygen from the
+  cached previous/current view-projection matrices.
+- **Two-sided cloth.** The cloth is a thin sheet; shading normals are flipped on
+  back-face hits (via the hit's front/back-face flag) or half of it renders
+  black.
+- **CPU import.** `shaderbang/__init__.py` loads `_shaderbang.so` at import, and
+  that C extension does not build on macOS. The load is guarded so the pure-Warp
+  physics remains importable/testable on the CUDA-less dev box; `warp-lang` is a
+  declared dependency.
+
+## Milestones
+
+Each milestone is a separate commit, verified on the RTX 5090.
+
+### M0 — De-risk the OptiX/Blackwell toolchain
+The single load-bearing test, before any real rendering code. On the 5090:
+build/import `otk-pyoptix`; `optixInit` + device context on Warp's `CUcontext`
+against the R590 driver; compile a trivial raygen pipeline via NVRTC; build a GAS
+from a `wp.array` pointer and trace one ray, confirming a hit with no CPU copy;
+run `optixDenoiserInvoke` (HDR) on a `wp.array` and write the result into a
+mapped GL PBO → `glTexSubImage2D`. Plus the CPU-side enablers: guard the
+`_shaderbang.so` load, add `warp-lang` to `pyproject.toml`.
+
+### M1 — First live frame
+`shaderbang/pathtracer/` module: OptiX pipeline (raygen / miss / closest-hit
+`.cu` compiled by NVRTC), GAS from `wp.array` geometry, 1 spp @ 1080p,
+single-bounce Lambert shading + analytic sphere, HDR accumulation, single-frame
+(non-temporal) denoise, PBO → `glTexSubImage2D` → ACES quad. Integrated into
+`cloth.py`, replacing the fixed-function GL cloth/sphere draw; geometry moves to
+plain `wp.array`s.
+
+### M2 — On-target benchmark
+Instrumentation to measure rays/s and frame time on the 5090 at 1080p and for
+the 1080p→4K upscale path. This sets the real spp/bounce budget — the numbers
+that were only hypotheses at design time.
+
+### M3 — Temporal quality
+Per-frame GAS refit + periodic rebuild; `mvPrevPos` snapshot + screen-space flow
+AOV; albedo/normal guide AOVs; irradiance demodulation (denoise radiance/albedo,
+re-modulate after); geometric history rejection (normal / plane-depth / ID, not
+color clamping); firefly clamp; the OptiX **TEMPORAL** model with 2× upscale to
+4K.
+
+### M4 — Full shading
+Disney BSDF, multiple importance sampling, next-event estimation, and
+environment-map importance sampling ported from GLSL-PathTracer into OptiX device
+code; smooth shading normals from the cloth's per-vertex normals; two-sided cloth
+via the hit's front/back-face flag.
+
+### M5 — Hardening + fallback
+Native-4K rendering option; robustness pass; Intel OIDN non-temporal fallback
+backend behind the same `Denoiser` interface for still frames / portability.
+
+## References
+
+- [NVIDIA OptiX](https://developer.nvidia.com/rtx/ray-tracing/optix) — SDK,
+  programming guide, denoiser host API.
+- [`otk-pyoptix`](https://github.com/NVIDIA/otk-pyoptix) — first-party Python
+  bindings (OptiX Toolkit).
+- [NVIDIA Warp](https://github.com/NVIDIA/warp) — physics, `wp.Mesh`/LBVH,
+  `wp.RegisteredGLBuffer` interop.
+- [GLSL-PathTracer](https://github.com/knightcrawler25/GLSL-PathTracer) (MIT) —
+  source of the ported Disney BSDF / MIS / NEE / env-sampling and the ACES
+  tonemap.
