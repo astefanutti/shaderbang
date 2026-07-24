@@ -5,19 +5,24 @@
 // (https://github.com/knightcrawler25/GLSL-PathTracer), MIT License,
 // Copyright (c) 2019 Asif Ali. See docs/pathtracer.md.
 //
-// OptiX device programs for the shaderbang path tracer (milestone M4a).
+// OptiX device programs for the shaderbang path tracer (milestone M4b).
 //
-// M4a is "full shading, no shadows yet": the single-hit Lambert of M1/M3 is
-// replaced by an iterative multi-bounce path tracer in the raygen program. Each
-// bounce intersects the cloth GAS plus the analytic sphere/ground, evaluates a
-// ported Disney principled BSDF (smooth per-vertex cloth normals, two-sided
-// cloth), importance-samples a new direction, applies Russian roulette, and
-// accumulates global illumination. A stand-in *unshadowed* directional sun keeps
-// the frame lit until next-event estimation + MIS land in M4b; the sky is the
-// environment on a miss (M4c adds an HDR lat-long env). The albedo/normal/flow
-// guide AOVs and motion-vector reprojection are preserved byte-compatibly for
-// the temporal denoiser -- they are driven by the *first* (primary) hit exactly
-// as before, only now the normal guide uses the smooth shading normal.
+// The single-hit Lambert of M1/M3 is replaced by an iterative multi-bounce path
+// tracer in the raygen program. Each bounce intersects the cloth GAS plus the
+// analytic sphere/ground, evaluates a ported Disney principled BSDF (smooth
+// per-vertex cloth normals, two-sided cloth), importance-samples a new
+// direction, applies Russian roulette, and accumulates global illumination.
+//
+// M4b adds next-event estimation: a shadow-tested directional sun (a delta
+// light, so NEE-only -- no MIS, no double counting, and a BSDF-sampled ray can
+// never hit it). Shadow rays reuse a second miss program (__miss__shadow) with
+// closesthit disabled and terminate-on-first-hit, plus cheap analytic occluder
+// tests. The sky is the environment on a miss and is BSDF-sampling only (env
+// importance sampling + MIS arrive in M4c with an HDR lat-long env). The
+// albedo/normal/flow guide AOVs and motion-vector reprojection are preserved
+// byte-compatibly for the temporal denoiser -- they are driven by the *first*
+// (primary) hit exactly as before, with the normal guide using the smooth
+// shading normal.
 //
 // The Params struct below MUST match PARAMS_DTYPE in renderer.py field for
 // field (a -D PARAMS_EXPECTED_SIZE static_assert guards the ABI). Self-contained:
@@ -733,6 +738,62 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
     return h;
 }
 
+// --------------------------------------------------------------------------- //
+// Shadow / occlusion query (M4b). A binary "is anything between (o) and the
+// light in [eps, tmax]?" test, used by next-event estimation. Analytic occluders
+// are cheap closed-form tests; the cloth GAS is traced with closesthit disabled
+// and terminate-on-first-hit (anyhit is already disabled by the geometry flag),
+// so the shadow trace does no shading work. The payload is pre-seeded "occluded"
+// and only __miss__shadow (miss SBT index 1) clears it -- reached solely when the
+// ray escapes to tmax unobstructed. This trace still issues from raygen (via
+// directLight), so it is not recursive and maxTraceDepth stays 1.
+// --------------------------------------------------------------------------- //
+static __forceinline__ __device__ bool sceneOcclude(float3 o, float3 d, float tmax)
+{
+    float t_s = intersectSphere(o, d, params.sphere_center, params.sphere_radius);
+    if (t_s > 1e-4f && t_s < tmax)
+        return true;
+    float t_g = intersectGround(o, d, params.ground_y);
+    if (t_g > 1e-4f && t_g < tmax)
+        return true;
+
+    unsigned int occluded = 1u;   // assume blocked; __miss__shadow clears to 0
+    optixTrace(
+            params.handle, o, d,
+            1e-4f, tmax, 0.0f,
+            OptixVisibilityMask(255),
+            OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+            0, 1, 1,   // SBToffset=0, SBTstride=1, missSBTIndex=1 (__miss__shadow)
+            occluded);
+    return occluded != 0u;
+}
+
+// Next-event estimation for the directional sun (M4b). The sun is a *delta*
+// light: NEE is its only estimator (a BSDF-sampled ray has zero probability of
+// hitting an infinitesimal light), so there is no MIS and no double counting --
+// the sun is deliberately *not* gathered anywhere else. The BSDF value already
+// folds |N.L| in, and a delta light needs no /pdf. The sky is the environment
+// and is gathered on a miss at full weight (BSDF sampling only), so it is not
+// sampled here; env importance sampling + MIS arrive in M4c.
+static __forceinline__ __device__ float3 directLight(
+        float3 V, float3 N, float3 Ng, const Material& mat, float eta, float3 hitP)
+{
+    float3 L = params.light_dir;   // normalized, points toward the sun
+    float pdf;
+    float3 f = disneyEval(mat, eta, V, N, L, pdf);   // |N.L| folded in
+    // Nothing to gather if the BSDF vanishes for this direction (e.g. the sun is
+    // below the surface horizon) -- skip the shadow ray entirely.
+    if (f.x <= 0.0f && f.y <= 0.0f && f.z <= 0.0f)
+        return make_float3(0.0f, 0.0f, 0.0f);
+
+    // Offset the shadow-ray origin onto the light side of the geometric normal.
+    float3 offN = (dot(L, Ng) < 0.0f) ? -Ng : Ng;
+    float3 so = hitP + offN * 1e-4f;
+    if (sceneOcclude(so, L, 1e16f))
+        return make_float3(0.0f, 0.0f, 0.0f);
+    return f * params.light_color;
+}
+
 extern "C" __global__ void __raygen__rg()
 {
     const uint3 idx = optixGetLaunchIndex();
@@ -768,8 +829,10 @@ extern "C" __global__ void __raygen__rg()
 
         if (h.which == 0)
         {
-            // Environment on a miss (M4b/M4c add MIS + HDR env). No NEE yet, so
-            // the miss always takes full weight -- no double counting.
+            // Environment on a miss. The sky is BSDF-sampling only (no env NEE
+            // yet -- that arrives in M4c with the importance-sampled HDR env), so
+            // the miss takes full weight. The delta sun sampled by NEE below can
+            // never be hit by a scattered ray, so there is no double counting.
             radiance += throughput * skyColor(d);
             break;
         }
@@ -782,14 +845,10 @@ extern "C" __global__ void __raygen__rg()
         Material mat = makeMaterial(h.which, front);
         float eta = front ? (1.0f / mat.ior) : mat.ior;   // relative IOR (entering -> 1/ior)
 
-        // --- M4a stand-in: unshadowed directional sun so the frame is lit
-        // before NEE exists (deleted in M4b when directLight replaces it). The
-        // BSDF value already folds |NdotL| in, and a delta light needs no /pdf. ---
-        {
-            float pdf;
-            float3 f = disneyEval(mat, eta, -d, Ns, params.light_dir, pdf);
-            radiance += throughput * f * params.light_color;
-        }
+        // Next-event estimation: shadow-tested directional sun (M4b). Replaces
+        // the M4a unshadowed stand-in. NEE-only, full weight -- the delta sun
+        // cannot be hit by a BSDF-sampled ray, so no MIS and no double counting.
+        radiance += throughput * directLight(-d, Ns, Ng, mat, eta, h.p);
 
         if (depth == params.max_depth)
             break;
@@ -884,6 +943,13 @@ extern "C" __global__ void __miss__ms()
 {
     // Leave t = 1e30 (set in sceneIntersect) so the miss is resolved there.
     optixSetPayload_0(__float_as_uint(1e30f));
+}
+
+extern "C" __global__ void __miss__shadow()
+{
+    // Reached only when a shadow ray escapes to tmax with no cloth hit: mark the
+    // path to the light as unobstructed (sceneOcclude pre-seeds payload_0 = 1).
+    optixSetPayload_0(0u);
 }
 
 extern "C" __global__ void __closesthit__ch()

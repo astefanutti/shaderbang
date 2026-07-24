@@ -312,7 +312,8 @@ Disney BSDF, multiple importance sampling, next-event estimation, and
 environment-map importance sampling ported from GLSL-PathTracer into OptiX device
 code; smooth shading normals from the cloth's per-vertex normals; two-sided cloth
 via the hit's front/back-face flag. Split into **M4a** (BSDF + multi-bounce GI),
-**M4b** (NEE + MIS) and **M4c** (env-map importance sampling).
+**M4b** (next-event estimation: shadowed delta sun) and **M4c** (env-map
+importance sampling + MIS).
 
 **M4a — Disney BSDF + multi-bounce GI + smooth normals + two-sided cloth (done).**
 The single-hit Lambert of M1 is replaced by an iterative multi-bounce path tracer
@@ -327,21 +328,35 @@ from the geometric face). Per-object roughness/metallic are exposed through
 `set_cloth_material` / `set_sphere_material` / `set_ground_material`, and the bounce
 budget through `set_path_depth`; `roughness` is used directly as the GGX α (Disney
 linear roughness). A stand-in *unshadowed* directional sun keeps the frame lit
-until NEE lands in M4b, and the analytic sky is the environment on a miss. The
+until NEE lands in M4b (below), and the analytic sky is the environment on a miss. The
 albedo/normal/flow guide AOVs + motion vectors are preserved (the normal guide now
 uses the smooth shading normal); a whole-path NaN sink + firefly clamp protect the
 accumulator, and all normalizes/guide writes are zero/NaN-safe. The host `Params`
 struct is guarded against host/device ABI drift by a compile-time
 `static_assert(sizeof(Params) == PARAMS_EXPECTED_SIZE)` fed from `PARAMS_DTYPE`.
 
-**M4b — next-event estimation + MIS (planned).** Add shadow rays against the
-delta sun (a second miss program + `sceneOcclude`), replace the M4a stand-in with
-a proper `directLight`, and combine BSDF- and light-sampling with the power
-heuristic (carrying the scalar BSDF pdf across bounces).
+**M4b — next-event estimation: shadowed delta sun (done).** The M4a unshadowed
+stand-in is replaced by a proper `directLight` that shadow-tests the directional
+sun each bounce, so the frame gains contact shadows and correct occlusion. The sun
+is a **delta light**, so it is next-event-estimated *only* — a BSDF-sampled ray has
+zero probability of hitting an infinitesimal light, so there is nothing to combine
+and no double counting (this mirrors GLSL-PathTracer's `SampleDistantLight`, which
+forces `misWeight = 1`). Shadow rays reuse a second miss program (`__miss__shadow`,
+miss SBT index 1) traced with closesthit disabled + terminate-on-first-hit, plus
+cheap analytic sphere/ground occluder tests, all inside `sceneOcclude`; the trace
+still issues from raygen so `maxTraceDepth` stays 1 and `Params` is unchanged (no
+ABI churn). The sky remains BSDF-sampling only and is gathered on a miss at full
+weight. **MIS is intentionally deferred to M4c:** it first becomes necessary when
+the environment is *importance-sampled* (an env direction can be reached by both
+NEE and BSDF sampling), so the power heuristic + carried BSDF pdf land there rather
+than as dead scaffolding here.
 
-**M4c — environment-map importance sampling (planned).** Optional HDR lat-long
-environment with a host-built CDF and device importance sampling; the analytic sky
-gradient stays the default.
+**M4c — environment-map importance sampling + MIS (planned).** Optional HDR
+lat-long environment with a host-built CDF and device importance sampling; the
+analytic sky gradient stays the default. This is where multiple importance
+sampling arrives: env-NEE and BSDF-sampling both reach env directions, combined
+with the β=2 power heuristic (carrying the scalar BSDF pdf across bounces, weight 1
+on the primary ray).
 
 ### M5 — Hardening + fallback
 Native-4K rendering option; robustness pass; Intel OIDN non-temporal fallback

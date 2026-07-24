@@ -364,6 +364,14 @@ class PathTracer:
         ms_desc.missEntryFunctionName = "__miss__ms"
         ms_group, _ = self._ctx.programGroupCreate([ms_desc])
 
+        # Second miss program for shadow/occlusion rays (M4b NEE): it only clears
+        # the "occluded" payload, so its SBT record (miss index 1) is what
+        # sceneOcclude's optixTrace targets.
+        ms_shadow_desc = optix.ProgramGroupDesc()
+        ms_shadow_desc.missModule = module
+        ms_shadow_desc.missEntryFunctionName = "__miss__shadow"
+        ms_shadow_group, _ = self._ctx.programGroupCreate([ms_shadow_desc])
+
         ch_desc = optix.ProgramGroupDesc()
         ch_desc.hitgroupModuleCH = module
         ch_desc.hitgroupEntryFunctionNameCH = "__closesthit__ch"
@@ -371,8 +379,10 @@ class PathTracer:
 
         self._rg_group = rg_group[0]
         self._ms_group = ms_group[0]
+        self._ms_shadow_group = ms_shadow_group[0]
         self._ch_group = ch_group[0]
-        program_groups = [self._rg_group, self._ms_group, self._ch_group]
+        program_groups = [self._rg_group, self._ms_group,
+                          self._ms_shadow_group, self._ch_group]
 
         max_trace_depth = 1  # primary rays only in M1 (no shadow/GI recursion)
         link_options = optix.PipelineLinkOptions()
@@ -397,26 +407,45 @@ class PathTracer:
         header_fmt = f"{optix.SBT_RECORD_HEADER_SIZE}B"
         align = optix.SBT_RECORD_ALIGNMENT
 
-        def header_record(group):
+        def _record_dtype():
             itemsize = _round_up(
                 np.dtype({"names": ["header"], "formats": [header_fmt],
                           "align": True}).itemsize, align)
-            dt = np.dtype({"names": ["header"], "formats": [header_fmt],
-                           "itemsize": itemsize, "align": True})
+            return np.dtype({"names": ["header"], "formats": [header_fmt],
+                             "itemsize": itemsize, "align": True})
+
+        def header_record(group):
+            dt = _record_dtype()
             h = np.array([0], dtype=dt)
             optix.sbtRecordPackHeader(group, h)
             d = cp.cuda.alloc(dt.itemsize)
             d.copy_from_host(ctypes.c_void_p(h.ctypes.data), dt.itemsize)
             return d, dt.itemsize
 
+        def header_records(groups):
+            # Pack several program-group headers into one contiguous device buffer
+            # so they can be addressed as base + stride * index (used for the two
+            # miss records: index 0 = primary, index 1 = shadow).
+            dt = _record_dtype()
+            combined = np.zeros(len(groups), dtype=dt)
+            for i, group in enumerate(groups):
+                one = np.zeros(1, dtype=dt)
+                optix.sbtRecordPackHeader(group, one)
+                combined[i] = one[0]
+            total = dt.itemsize * len(groups)
+            d = cp.cuda.alloc(total)
+            d.copy_from_host(ctypes.c_void_p(combined.ctypes.data), total)
+            return d, dt.itemsize
+
         self._d_rg, rg_stride = header_record(self._rg_group)
-        self._d_ms, ms_stride = header_record(self._ms_group)
+        self._d_ms, ms_stride = header_records(
+            [self._ms_group, self._ms_shadow_group])
         self._d_ch, ch_stride = header_record(self._ch_group)
         self._sbt = optix.ShaderBindingTable(
             raygenRecord=self._d_rg.ptr,
             missRecordBase=self._d_ms.ptr,
             missRecordStrideInBytes=ms_stride,
-            missRecordCount=1,
+            missRecordCount=2,
             hitgroupRecordBase=self._d_ch.ptr,
             hitgroupRecordStrideInBytes=ch_stride,
             hitgroupRecordCount=1,
