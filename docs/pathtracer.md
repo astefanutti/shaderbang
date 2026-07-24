@@ -174,13 +174,21 @@ so this needs raw CUDA; deferred.
 Each milestone is a separate commit, verified on the RTX 5090.
 
 ### M0 — De-risk the OptiX/Blackwell toolchain
-The single load-bearing test, before any real rendering code. On the 5090:
-build/import `otk-pyoptix`; `optixInit` + device context on Warp's `CUcontext`
-against the R590 driver; compile a trivial raygen pipeline via NVRTC; build a GAS
-from a `wp.array` pointer and trace one ray, confirming a hit with no CPU copy;
-run `optixDenoiserInvoke` (HDR) on a `wp.array` and write the result into a
-mapped GL PBO → `glTexSubImage2D`. Plus the CPU-side enablers: guard the
-`_shaderbang.so` load, add `warp-lang` to `pyproject.toml`.
+The single load-bearing test, before any real rendering code, shipped as a
+standalone script (`python -m shaderbang.pathtracer.smoke`). On the 5090:
+import `otk-pyoptix`; `optix.init()` + device context on Warp's `CUcontext`
+(the shared CUDA primary context) against the R590 driver; compile a trivial
+raygen pipeline via NVRTC; build a GAS from a `wp.array` pointer and trace one
+ray, confirming a hit with no CPU copy; run the OptiX denoiser (HDR) on device
+buffers. Plus the CPU-side enablers: guard the `_shaderbang.so` load so the
+package imports off-target, add `warp-lang` (extras) to `pyproject.toml`.
+
+The CUDA↔GL PBO interop leg (`glMapBuffer`-free `wp.RegisteredGLBuffer` →
+`glTexSubImage2D`) is validated in M1 instead: it needs a live GL context, which
+only the native shaderbang render loop provides, and it reuses the exact
+`wp.RegisteredGLBuffer` pattern `cloth.py` already ships — so it is low-risk and
+best exercised in the real `Input`, not a standalone script that would have to
+stand up its own EGL context.
 
 ### M1 — First live frame
 `shaderbang/pathtracer/` module: OptiX pipeline (raygen / miss / closest-hit

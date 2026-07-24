@@ -3,9 +3,45 @@
 
 from ctypes import *
 import os
+import warnings
 
 
-lib = CDLL(os.path.join(os.path.dirname(__file__), "_shaderbang.so"))
+class _MissingLibrary:
+    """No-op stand-in for the native ``_shaderbang.so`` extension.
+
+    The extension provides the EGL/DRM/KMS render loop and GL entry points and
+    only builds on Linux. On a non-Linux / CUDA-less development box it may be
+    absent; falling back to this stub keeps the pure-Python and Warp parts of
+    the package importable (e.g. the cloth physics kernels and the path-tracer
+    smoke test) for off-target development and CPU-side testing.
+
+    Every attribute resolves to a callable that returns ``0`` and does nothing:
+    ``shaderbang.input`` registers ``onInit``/``onRender`` callbacks at import
+    time, so the stub must be callable to let the import succeed. The native
+    render loop never runs through the stub, so this is only useful for
+    headless, non-rendering use — any real GL/render work is silently skipped.
+    """
+
+    def __init__(self, error):
+        self._error = error
+
+    def __getattr__(self, name):
+        def _noop(*args, **kwargs):
+            return 0
+        return _noop
+
+
+try:
+    lib = CDLL(os.path.join(os.path.dirname(__file__), "_shaderbang.so"))
+except OSError as e:
+    warnings.warn(
+        f"could not load the native _shaderbang.so extension ({e}); falling "
+        "back to a no-op stub. EGL/DRM/KMS rendering is unavailable — only "
+        "headless / CPU use (e.g. Warp physics, off-target development) works.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    lib = _MissingLibrary(e)
 
 
 class OPTIONS(Structure):

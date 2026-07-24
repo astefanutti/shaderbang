@@ -5,6 +5,21 @@ dependencies = [
     "libevdev",
 ]
 requires-python = ">=3.10"
+
+[project.optional-dependencies]
+# Cloth simulation example (examples/cloth.py): NVIDIA Warp GPU physics.
+cloth = [
+    "warp-lang",
+    "numpy",
+]
+# Path tracer (shaderbang.pathtracer). Also requires, out of band, an NVIDIA
+# RTX GPU with CUDA 12.x, the OptiX SDK, and the otk-pyoptix bindings — see
+# docs/pathtracer.md. Those are not pip-installable here and are omitted.
+pathtracer = [
+    "warp-lang",
+    "numpy",
+    "cupy-cuda12x",
+]
 authors = [
     { name = "Antonin Stefanutti" },
 ]
