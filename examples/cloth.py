@@ -1578,6 +1578,13 @@ class PathTracerView(Input):
 
     FOV_Y = 40.0        # matches Camera.init's gluPerspective vertical FOV
     EXPOSURE = 1.2
+    # Samples per animating frame. While the sim runs there is no cross-frame
+    # HDR accumulation (every frame resets), so this burst is what feeds the
+    # temporal denoiser a cleaner-than-1-spp image and keeps fast cloth motion
+    # from ghosting. Rendering at half res (upscale=2) leaves the 5090 ample
+    # headroom for a few samples; dial up for less noise, down for more speed.
+    # Still frames ignore it and refine progressively (reset=False, 1 spp/frame).
+    SPP = 4
 
     def __init__(self, camera, sphere, cloth):
         super().__init__("pathtracer")
@@ -1659,7 +1666,11 @@ class PathTracerView(Input):
         reset = running or sig != self._sig
         self._sig = sig
 
-        self.pt.render(reset=reset)
+        # Burst several samples on any frame that restarts accumulation (every
+        # animating frame, plus the first still frame after motion stops); once
+        # the scene is paused and unchanged, refine with 1 spp/frame on top of
+        # the retained accumulation.
+        self.pt.render(reset=reset, spp=PathTracerView.SPP if reset else 1)
         self.pt.present()
 
         # Anchor gizmos, layered on top of the traced frame.

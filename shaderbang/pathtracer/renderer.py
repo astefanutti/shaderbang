@@ -1084,31 +1084,47 @@ class PathTracer:
     # ------------------------------------------------------------------ #
     # Render
     # ------------------------------------------------------------------ #
-    def render(self, reset=True):
-        """Trace + accumulate one sample, then denoise into ``d_denoised``.
+    def render(self, reset=True, spp=1):
+        """Trace + accumulate ``spp`` sample(s), then denoise into ``d_denoised``.
 
         ``reset=True`` restarts accumulation (use it every frame while the scene
         animates); ``reset=False`` keeps accumulating (progressive refinement
-        while paused). Call ``present()`` or ``download_ldr()`` afterwards.
+        while paused).
+
+        ``spp`` traces that many samples into the HDR accumulator *before* the
+        single denoise -- a per-frame burst. It is the main quality lever for
+        animating frames: with ``reset=True`` there is no cross-frame HDR
+        accumulation (each frame starts fresh), so ``spp`` is the only way to
+        hand the denoiser a cleaner input than a lone 1-spp trace, cutting the
+        temporal ghosting/lag it would otherwise have to invent. The denoiser,
+        the ``subframe`` history and the motion-vector snapshot advance exactly
+        once per call regardless of ``spp`` (the burst is a single displayed
+        frame at one camera/geometry pose). ``spp=1`` reproduces the old
+        one-sample-per-call behaviour. Call ``present()`` or ``download_ldr()``
+        afterwards.
         """
         if self._gas_handle == 0:
             raise RuntimeError("render() called before set_geometry()")
+        spp = max(1, int(spp))
         if reset:
             self._subframe = 0
 
         p = self._h_params[0]
-        p["subframe"] = self._subframe
         p["exposure"] = self.exposure
         p["handle"] = int(self._gas_handle)
-        self._d_params.copy_from_host(
-            ctypes.c_void_p(self._h_params.ctypes.data), PARAMS_DTYPE.itemsize)
-
-        self._optix.launch(
-            self._pipeline, self._stream_ptr, self._d_params.ptr,
-            PARAMS_DTYPE.itemsize, self._sbt, self.width, self.height, 1)
+        # Accumulate the burst: each launch reads the running subframe (so
+        # programs.cu folds it into the mean accum/(subframe+1)) and advances it.
+        for _ in range(spp):
+            p["subframe"] = self._subframe
+            self._d_params.copy_from_host(
+                ctypes.c_void_p(self._h_params.ctypes.data),
+                PARAMS_DTYPE.itemsize)
+            self._optix.launch(
+                self._pipeline, self._stream_ptr, self._d_params.ptr,
+                PARAMS_DTYPE.itemsize, self._sbt, self.width, self.height, 1)
+            self._subframe += 1
 
         self._denoise()
-        self._subframe += 1
         self._snapshot_prev()
 
     def _snapshot_prev(self):

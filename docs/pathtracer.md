@@ -220,7 +220,14 @@ Lands in two commits for reviewability:
   geometry (cloth GAS) and the two analytic colliders. Accumulation restarts
   whenever the scene moves (simulation running, or camera/sphere changed) and
   otherwise refines progressively while paused and still; the GAS is refit only
-  on frames where the cloth actually deformed. The anchor gizmos are the one
+  on frames where the cloth actually deformed. Because a restart discards the
+  cross-frame HDR accumulation, animating frames trace a small per-frame **spp
+  burst** (`render(reset=True, spp=PathTracerView.SPP)`, default 4) into the
+  accumulator before the single denoise, giving the temporal denoiser a
+  cleaner-than-1-spp input so fast cloth motion does not ghost; still frames
+  drop back to 1 spp/frame and refine progressively on the retained
+  accumulation. The denoiser, history and motion-vector snapshot advance once
+  per frame regardless of the burst. The anchor gizmos are the one
   remaining fixed-function draw, layered on top of the traced frame
   (`Cloth.draw_anchors`, called by `PathTracerView` after `present()`). Renders
   at the native framebuffer resolution for M1 — the 1080p→4K upscale is M3.
