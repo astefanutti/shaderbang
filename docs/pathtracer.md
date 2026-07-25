@@ -136,10 +136,11 @@ the unmap doesn't hand the buffer back to GL before the GPU finishes; GL must no
 touch the buffer while it is mapped. Map/unmap provide implicit GL↔CUDA
 synchronization (no external semaphores, unlike the Vulkan path).
 
-*Later optimization (post-v1):* register the GL **texture** directly
-(`cudaGraphicsGLRegisterImage` + a CUDA surface) so the denoiser writes straight
-into the texture, eliminating the PBO→texture copy. Warp interop is buffer-only,
-so this needs raw CUDA; deferred.
+*Optimization (M6, done):* register the GL **texture** directly
+(`cudaGraphicsGLRegisterImage` + a CUDA surface object) so the tone-map writes
+straight into the texture, eliminating the PBO→texture copy. Warp interop is
+buffer-only, so this drops to the cuda-python driver API; opt in with
+`interop="texture"`/`"auto"` (see M6 below).
 
 ## Integration gotchas
 
@@ -435,6 +436,56 @@ binding targeted is the ctypes `oidn` wrapper whose functions mirror the C API
 arrays as shared buffers; the exact binding surface and the HDR-flag setter name
 (which differs between OIDN 1.x and 2.x, so both spellings are probed) are marked
 `VERIFY-ON-TARGET`.
+
+### M6 — Direct-to-texture present (done)
+
+The optimization deferred under *GL/CUDA/OptiX interop* above: present the
+tone-mapped frame **straight into the GL texture** via a CUDA surface object,
+dropping the per-frame PBO→`glTexSubImage2D` copy. Selected with a new
+`PathTracer(..., interop=...)` argument:
+
+- `"pbo"` (default) — the original path, unchanged: tone-map (Warp kernel) into a
+  `wp.RegisteredGLBuffer` PBO, then `glTexSubImage2D` the PBO into the texture.
+  The only present path with no raw-CUDA dependency, so it stays the portable
+  default and the fallback.
+- `"texture"` — register the GL texture with `cuGraphicsGLRegisterImage`
+  (`…SURFACE_LDST`) and, each frame, map it on the render stream, bind a CUDA
+  **surface object** over the mapped array, and run a `surf2Dwrite` tone-map
+  kernel straight into it, then unmap. No PBO, no upload copy. Raises if the
+  interop cannot be set up.
+- `"auto"` — prefer `"texture"`, but fall back to `"pbo"` (creating the PBO
+  instead) if the raw-CUDA/texture interop is unavailable at `init_gl` time
+  (missing `cuda-python`, a kernel-compile failure, or a registration error).
+  `cloth.py` uses this, so the example gets the fast path where it works and the
+  proven PBO path everywhere else.
+
+Because Warp's GL interop is buffer-only (it wraps `cudaGraphicsGLRegisterBuffer`,
+which cannot register a texture, and it has no surface-object write), this leg
+drops below Warp to the **cuda-python driver API** for registration
+(`cuGraphicsGLRegisterImage`), per-frame map/unmap
+(`cuGraphicsMapResources` / `cuGraphicsSubResourceGetMappedArray` /
+`cuGraphicsUnmapResources`), and the surface object
+(`cuSurfObjectCreate` / `cuSurfObjectDestroy`). The tone-map kernel is the one
+piece Warp cannot express, so it is compiled at runtime with CuPy's `RawModule`
+and kept **pixel-identical** to the Warp `_tonemap_kernel` (same ACES curve, same
+1/2.2 gamma, same round-to-nearest u8); surface writes are byte-addressed on x
+(`x*4` for `uchar4`), and row 0 stays the bottom row, so the fullscreen quad's
+texcoords are unchanged across both paths.
+
+Lifetime details: the mapped array handle is stable for a fixed-size texture, so
+the surface object is built once and reused, and rebuilt only if the driver hands
+back a different array across maps (a sync precedes the rebuild so no in-flight
+kernel references the surface being destroyed). Map and unmap and the kernel all
+issue on the shared render stream, so the write orders after the denoise and
+before GL reclaims the texture; the unmap runs in a `finally` so a launch error
+never leaves the resource mapped. `close()` drains the stream, destroys the
+surface and unregisters the texture *before* the texture is deleted. The gain is
+one device→device copy per frame (largest at native 4K, ~34 MB/frame); it is
+**not** a host transfer either way, so the "no CPU-GPU transfer on the hot path"
+rule held before and after. The whole leg is `VERIFY-ON-TARGET`: it cannot run on
+the CUDA-less dev box (the `interop` validation, `_cuda_check` unpacking and
+surface-rebuild bookkeeping are unit-tested off-target; the driver calls, the
+`RawModule` surf2Dwrite compile and the map/write/unmap loop are not).
 
 ## References
 

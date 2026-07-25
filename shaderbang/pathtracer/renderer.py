@@ -13,8 +13,11 @@ the hot path:
     ground intersected analytically in the raygen program (see ``programs.cu``);
   * radiance is accumulated in an HDR buffer, run through the OptiX AI denoiser
     (single-frame HDR by default; a temporal 2x-upscale model with motion vectors
-    when constructed with ``upscale=2``), then tone-mapped (ACES) by a Warp kernel
-    straight into an OpenGL PBO for display.
+    when constructed with ``upscale=2``), then tone-mapped (ACES) straight into
+    the display surface -- either a Warp kernel into an OpenGL PBO followed by a
+    ``glTexSubImage2D`` upload (the portable default), or, with
+    ``interop="texture"``/``"auto"`` (M6), a CUDA surface-write kernel straight
+    into the GL texture, eliminating the PBO->texture copy.
 
 Everything -- OptiX, Warp, CuPy -- shares the CUDA *primary* context (OptiX is
 created with ``cu_ctx = 0``) so device memory and the stream are shared. The
@@ -132,6 +135,52 @@ def _tonemap_kernel(hdr: wp.array(dtype=wp.vec4),
 
 
 # --------------------------------------------------------------------------- #
+# M6 direct-to-texture present: the same ACES tone-map, but written straight into
+# a GL texture bound as a CUDA surface (surf2Dwrite) instead of into a PBO. This
+# is the raw-CUDA kernel that Warp cannot express (Warp's GL interop is
+# buffer-only and it has no surface-object write), compiled at runtime with CuPy's
+# RawModule and launched over the mapped GL-texture surface. It must stay
+# pixel-identical to _tonemap_kernel above so switching present paths does not
+# change the image: same ACES curve, same 1/2.2 gamma, same round-to-nearest u8.
+# Surface writes are BYTE-addressed on x, so the column offset is x*4 (uchar4).
+# --------------------------------------------------------------------------- #
+_SURF_TONEMAP_SRC = r"""
+__device__ __forceinline__ float _aces(float x) {
+    const float a = 2.51f, b = 0.03f, c = 2.43f, d = 0.59f, e = 0.14f;
+    float v = (x * (a * x + b)) / (x * (c * x + d) + e);
+    return fminf(fmaxf(v, 0.0f), 1.0f);
+}
+
+__device__ __forceinline__ unsigned char _to_u8(float x) {
+    return (unsigned char)((int)(fminf(fmaxf(x, 0.0f), 1.0f) * 255.0f + 0.5f));
+}
+
+extern "C" __global__ void tonemap_surface(
+        unsigned long long hdr_addr,   // const float4* (wp.vec4) denoised buffer
+        cudaSurfaceObject_t surf,      // the mapped GL texture
+        float exposure,
+        int width,
+        int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float4* hdr = reinterpret_cast<const float4*>(hdr_addr);
+    float4 c = hdr[y * width + x];
+    const float inv_gamma = 1.0f / 2.2f;
+    uchar4 o;
+    o.x = _to_u8(powf(_aces(c.x * exposure), inv_gamma));
+    o.y = _to_u8(powf(_aces(c.y * exposure), inv_gamma));
+    o.z = _to_u8(powf(_aces(c.z * exposure), inv_gamma));
+    o.w = (unsigned char)255;
+    // Byte-addressed x (uchar4 == 4 bytes); row 0 == bottom, matching the ray-gen
+    // and the PBO path's glTexSubImage2D upload, so the quad's texcoords are the
+    // same either way.
+    surf2Dwrite(o, surf, x * 4, y);
+}
+"""
+
+
+# --------------------------------------------------------------------------- #
 # Toolchain include-path discovery (NVRTC needs the OptiX + CUDA headers).
 # Same env vars as smoke.py.
 # --------------------------------------------------------------------------- #
@@ -207,7 +256,7 @@ class PathTracer:
     """
 
     def __init__(self, width, height, device="cuda:0", exposure=1.0,
-                 upscale=1, log_level=0, denoiser="optix"):
+                 upscale=1, log_level=0, denoiser="optix", interop="pbo"):
         width = int(width)
         height = int(height)
         upscale = int(upscale)
@@ -236,6 +285,19 @@ class PathTracer:
             raise ValueError(
                 "the OIDN backend is non-temporal and cannot upscale; use "
                 "upscale=1 (or denoiser='optix' for the 2x temporal upscaler)")
+        # Present interop (M6): how the tone-mapped frame reaches the GL texture.
+        # "pbo" (default) tone-maps into a GL PBO then uploads with
+        # glTexSubImage2D (portable, the only path with no raw-CUDA dependency);
+        # "texture" registers the GL texture as a CUDA surface and tone-maps
+        # straight into it (one device->device copy fewer per frame), raising if
+        # that cannot be set up; "auto" prefers "texture" and silently falls back
+        # to "pbo" if the raw-CUDA/texture interop is unavailable. Both texture
+        # paths are VERIFY-ON-TARGET (buffer-only Warp interop cannot express the
+        # surface write, so they drop to the cuda-python driver API).
+        if interop not in ("pbo", "texture", "auto"):
+            raise ValueError(
+                f"interop must be 'pbo', 'texture' or 'auto', got {interop!r}")
+        self._interop = interop
         self._backend = denoiser
         self.width = width
         self.height = height
@@ -312,6 +374,15 @@ class PathTracer:
         self._tex = None
         self._pbo = None
         self._pbo_reg = None
+        # M6 direct-to-texture interop state (only populated when the "texture"/
+        # "auto" path successfully registers the GL texture with CUDA).
+        self._tex_interop_ready = False
+        self._cuda_driver = None       # cuda.bindings.driver module
+        self._cuda_gl_resource = None  # CUgraphicsResource for the GL texture
+        self._cuda_surf = None         # CUsurfObject over the mapped texture
+        self._cuda_array_handle = None # int handle of the currently-bound array
+        self._surf_module = None       # CuPy RawModule (surf tone-map)
+        self._surf_kernel = None       # its tonemap_surface Function
 
     # ------------------------------------------------------------------ #
     # Pipeline / SBT
@@ -1236,16 +1307,17 @@ class PathTracer:
     # OpenGL present (fixed-function; robust across the target's GL version)
     # ------------------------------------------------------------------ #
     def init_gl(self):
-        """Create the present texture + PBO. Must be called with a GL context
-        current (i.e. from inside the shaderbang render loop)."""
+        """Create the present texture (and, unless the M6 texture interop takes
+        over, the PBO). Must be called with a GL context current (i.e. from
+        inside the shaderbang render loop)."""
         from OpenGL.GL import (
             glGenTextures, glBindTexture, glTexImage2D, glTexParameteri,
-            glGenBuffers, glBindBuffer, glBufferData,
             GL_TEXTURE_2D, GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE,
             GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_LINEAR,
             GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE,
-            GL_PIXEL_UNPACK_BUFFER, GL_STREAM_DRAW,
         )
+        # The present texture is shared by both paths (the PBO uploads into it;
+        # the surface path renders directly into it).
         self._tex = int(glGenTextures(1))
         glBindTexture(GL_TEXTURE_2D, self._tex)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
@@ -1257,25 +1329,178 @@ class PathTracer:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
         glBindTexture(GL_TEXTURE_2D, 0)
 
+        # M6: try the direct-to-texture surface path first when requested. On
+        # success no PBO is needed; on failure "auto" falls through to the PBO
+        # path below and "texture" re-raises.
+        if self._interop in ("texture", "auto"):
+            try:
+                self._init_texture_interop()
+                self._tex_interop_ready = True
+            except Exception as e:  # noqa: BLE001
+                if self._interop == "texture":
+                    raise
+                self._tex_interop_ready = False
+                if self._log_level:
+                    print(f"[pathtracer] texture interop unavailable, falling "
+                          f"back to the PBO present path: {e}")
+
+        if not self._tex_interop_ready:
+            self._init_pbo()
+        self._gl_ready = True
+
+    def _init_pbo(self):
+        """Allocate the present PBO and register it with Warp so the tone-map
+        kernel writes into it with no CPU copy (the portable present path)."""
+        from OpenGL.GL import (
+            glGenBuffers, glBindBuffer, glBufferData,
+            GL_PIXEL_UNPACK_BUFFER, GL_STREAM_DRAW,
+        )
         self._pbo = int(glGenBuffers(1))
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self._pbo)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,
                      self._out_width * self._out_height * 4,
                      None, GL_STREAM_DRAW)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-
-        # Register the PBO with Warp so the tone-map kernel writes into it with
-        # no CPU copy (same pattern cloth.py uses for its vertex buffers).
         self._pbo_reg = wp.RegisteredGLBuffer(
             self._pbo, self._device,
             wp.RegisteredGLBuffer.WRITE_DISCARD)  # VERIFY-ON-TARGET (ctor args)
-        self._gl_ready = True
+
+    # ------------------------------------------------------------------ #
+    # M6 direct-to-texture present (raw CUDA: cuGraphicsGLRegisterImage +
+    # a CUDA surface object, written by the CuPy-compiled surf2Dwrite kernel).
+    # Warp's GL interop is buffer-only, so this leg drops to the cuda-python
+    # driver API. Everything here is VERIFY-ON-TARGET.
+    # ------------------------------------------------------------------ #
+    def _init_texture_interop(self):
+        from OpenGL.GL import GL_TEXTURE_2D
+        try:
+            from cuda.bindings import driver as cuda
+        except Exception:  # noqa: BLE001 -- older cuda-python layout
+            from cuda import cuda
+        self._cuda_driver = cuda
+
+        # Compile the surface-write tone-map with CuPy's NVRTC (RawModule forces
+        # the compile now, so a compile failure is caught here and lets "auto"
+        # fall back before any frame is presented).
+        module = self._cp.RawModule(code=_SURF_TONEMAP_SRC,
+                                    options=("--use_fast_math",))
+        self._surf_kernel = module.get_function("tonemap_surface")
+        self._surf_module = module
+
+        # Register the GL texture as a CUDA graphics resource with surface
+        # load/store so a surface object can be bound over its mapped array.
+        flags = cuda.CUgraphicsRegisterFlags.CU_GRAPHICS_REGISTER_FLAGS_SURFACE_LDST
+        self._cuda_gl_resource = self._cuda_check(
+            cuda.cuGraphicsGLRegisterImage(int(self._tex), int(GL_TEXTURE_2D),
+                                           flags))
+
+    def _cuda_check(self, result):
+        """Unpack a cuda-python ``(CUresult, *payload)`` tuple, raising on error
+        and returning the payload (mirrors the NVRTC ``check`` helper above)."""
+        if not isinstance(result, (tuple, list)):
+            result = (result,)
+        err = result[0]
+        cuda = self._cuda_driver
+        if int(err) != int(cuda.CUresult.CUDA_SUCCESS):
+            msg = str(err)
+            try:
+                _, name = cuda.cuGetErrorName(err)
+                _, desc = cuda.cuGetErrorString(err)
+                msg = f"{name.decode(errors='replace')}: {desc.decode(errors='replace')}"
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError(f"CUDA driver error: {msg}")
+        rest = result[1:]
+        if not rest:
+            return None
+        return rest[0] if len(rest) == 1 else rest
+
+    def _bind_surface(self, array):
+        """(Re)create the CUDA surface object over the mapped texture array.
+
+        The mapped array handle is stable for a fixed-size texture, so the
+        surface is built once and reused every frame; it is only rebuilt if the
+        driver hands back a different array (the docs permit it to change across
+        maps). A rebuild syncs first so no in-flight tone-map kernel is still
+        referencing the surface being destroyed."""
+        cuda = self._cuda_driver
+        if self._cuda_surf is not None:
+            wp.synchronize_stream(self._wp_stream)
+            try:
+                cuda.cuSurfObjectDestroy(self._cuda_surf)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cuda_surf = None
+        desc = cuda.CUDA_RESOURCE_DESC()
+        desc.resType = cuda.CUresourcetype.CU_RESOURCE_TYPE_ARRAY
+        desc.res.array.hArray = array
+        desc.flags = 0
+        self._cuda_surf = self._cuda_check(cuda.cuSurfObjectCreate(desc))
 
     def present(self):
-        """Tone-map ``d_denoised`` into the PBO and draw it full-screen. Must be
-        called with a GL context current."""
+        """Tone-map the denoised frame into the GL texture and draw it
+        full-screen. Uses the M6 surface path when it was set up, else the PBO
+        upload. Must be called with a GL context current."""
         if not self._gl_ready:
             self.init_gl()
+        if self._tex_interop_ready:
+            self._present_texture()
+        else:
+            self._present_pbo()
+        self._draw_fullscreen_quad()
+
+    def _present_texture(self):
+        """M6: map the GL texture, tone-map straight into its surface, unmap. No
+        PBO, no glTexSubImage2D copy."""
+        cuda = self._cuda_driver
+        res = self._cuda_gl_resource
+        stream = self._stream_ptr
+        # Map on the render stream (implicit GL->CUDA sync) and fetch the array.
+        self._cuda_check(cuda.cuGraphicsMapResources(1, res, stream))
+        try:
+            array = self._cuda_check(
+                cuda.cuGraphicsSubResourceGetMappedArray(res, 0, 0))
+            handle = self._array_handle(array)
+            if self._cuda_surf is None or handle != self._cuda_array_handle:
+                self._bind_surface(array)
+                self._cuda_array_handle = handle
+
+            bx, by = 16, 16
+            gx = (self._out_width + bx - 1) // bx
+            gy = (self._out_height + by - 1) // by
+            args = (np.uint64(_device_ptr(self._d_denoised_cur)),
+                    np.uint64(int(self._cuda_surf)),
+                    np.float32(self.exposure),
+                    np.int32(self._out_width),
+                    np.int32(self._out_height))
+            # Launch on the shared render stream so the write orders after the
+            # denoise and before the unmap hands the texture back to GL.
+            with self._cp.cuda.ExternalStream(stream):
+                self._surf_kernel((gx, gy), (bx, by), args)
+        finally:
+            # Unmap on the same stream: stream-ordered after the kernel, so GL
+            # sees a complete texture. Always runs, even if the launch raised, so
+            # the resource is never left mapped.
+            self._cuda_check(cuda.cuGraphicsUnmapResources(1, res, stream))
+
+    # Sentinel handle used when a mapped array is not int-convertible: it
+    # compares equal to itself across frames, so the surface is built once and
+    # reused rather than rebuilt every frame (id() would differ per wrapper).
+    _REUSE_SURFACE = "reuse-surface"
+
+    @classmethod
+    def _array_handle(cls, array):
+        """Best-effort int handle for a cuda-python CUarray, used to detect a
+        remap returning a *different* array. Falls back to a constant sentinel if
+        the object is not int-convertible, so the surface is simply reused."""
+        try:
+            return int(array)
+        except Exception:  # noqa: BLE001
+            return cls._REUSE_SURFACE
+
+    def _present_pbo(self):
+        """Portable present: tone-map into the mapped PBO, then upload it into the
+        texture with glTexSubImage2D."""
         from OpenGL.GL import (
             glBindBuffer, glBindTexture, glTexSubImage2D,
             GL_TEXTURE_2D, GL_RGBA, GL_UNSIGNED_BYTE, GL_PIXEL_UNPACK_BUFFER,
@@ -1292,7 +1517,6 @@ class PathTracer:
                         GL_RGBA, GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
         glBindTexture(GL_TEXTURE_2D, 0)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-        self._draw_fullscreen_quad()
 
     def _draw_fullscreen_quad(self):
         from OpenGL.GL import (
@@ -1360,12 +1584,17 @@ class PathTracer:
         # GL present resources (only if init_gl ran; needs a current context).
         if getattr(self, "_gl_ready", False):
             self._release_gl()
+        else:
+            # Partially-constructed GL state: still unregister any CUDA graphics
+            # resource that got created (these are CUDA calls, not GL, so they
+            # run without a current GL context). Idempotent with _release_gl.
+            self._release_texture_interop()
 
         # Drop references to device buffers / OptiX host structs so CuPy and Warp
         # free the backing memory (these are plain allocations with no explicit
         # destroy; refcount/GC reclaims them once unreferenced).
         for attr in (
-            "_pbo_reg", "_sbt",
+            "_pbo_reg", "_sbt", "_surf_kernel", "_surf_module", "_cuda_driver",
             "_dn_input", "_dn_output", "_dn_layer", "_dn_guide", "_dn_params",
             "_dn_albedo_img", "_dn_normal_img", "_dn_flow_img",
             "_dn_out_img", "_dn_ig_img", "_out_bufs", "_d_ig",
@@ -1394,14 +1623,45 @@ class PathTracer:
             pass
         setattr(self, attr, None)
 
+    def _release_texture_interop(self):
+        """Destroy the CUDA surface object and unregister the GL texture (M6),
+        before the texture itself is deleted. Best-effort and idempotent."""
+        cuda = getattr(self, "_cuda_driver", None)
+        if cuda is None:
+            self._tex_interop_ready = False
+            return
+        # A tone-map kernel may still be in flight against the surface; drain the
+        # render stream before tearing the surface/resource down.
+        try:
+            wp.synchronize_stream(self._wp_stream)
+        except Exception:  # noqa: BLE001
+            pass
+        if self._cuda_surf is not None:
+            try:
+                cuda.cuSurfObjectDestroy(self._cuda_surf)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cuda_surf = None
+        if self._cuda_gl_resource is not None:
+            try:
+                cuda.cuGraphicsUnregisterResource(self._cuda_gl_resource)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cuda_gl_resource = None
+        self._cuda_array_handle = None
+        self._tex_interop_ready = False
+
     def _release_gl(self):
         try:
             from OpenGL.GL import glDeleteTextures, glDeleteBuffers
         except Exception:  # noqa: BLE001
+            self._release_texture_interop()
             self._gl_ready = False
             return
-        # Drop the Warp<->GL registration before the PBO is deleted so the CUDA
-        # graphics resource is unregistered first.               # VERIFY-ON-TARGET
+        # Unregister the CUDA graphics resource / surface (M6) before the texture
+        # is deleted, and drop the Warp<->GL PBO registration before the PBO is
+        # deleted, so CUDA lets go of each object first.         # VERIFY-ON-TARGET
+        self._release_texture_interop()
         self._pbo_reg = None
         if self._tex:
             try:

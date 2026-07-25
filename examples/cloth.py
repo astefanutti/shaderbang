@@ -1604,8 +1604,12 @@ class PathTracerView(Input):
         # rendering natively. Requires the patched otk-pyoptix binding (see
         # shaderbang/pathtracer/patches/); with the stock binding drop upscale to
         # get the single-frame HDR denoiser at native resolution.
+        # interop="auto" (M6): present straight into the GL texture via a CUDA
+        # surface when the raw-CUDA/texture interop is available, dropping the
+        # per-frame PBO->texture copy; it falls back to the portable PBO upload
+        # path automatically if that interop cannot be set up.
         self.pt = PathTracer(self._width // 2, self._height // 2, upscale=2,
-                             exposure=PathTracerView.EXPOSURE)
+                             exposure=PathTracerView.EXPOSURE, interop="auto")
         # Pass the cloth's per-vertex smooth normals (updated in place by
         # Cloth.update_mesh each frame) so the Disney BSDF shades a smooth
         # surface instead of faceted triangles.
