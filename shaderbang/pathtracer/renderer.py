@@ -48,37 +48,29 @@ import warp as wp
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
     "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
-    "env_data", "env_cdf",
+    "env_data", "env_cdf", "materials",
     "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
     "env_width", "env_height", "env_enabled",
+    "num_materials", "cloth_material", "sphere_material", "ground_material",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
     "light_dir", "light_color", "sky_top", "sky_bottom",
-    "sphere_center", "sphere_albedo", "sphere_radius",
-    "sphere_center_prev",
-    "ground_albedo", "ground_y",
-    "cloth_albedo_front", "cloth_albedo_back",
-    "cloth_roughness", "cloth_metallic",
-    "sphere_roughness", "sphere_metallic",
-    "ground_roughness", "ground_metallic",
+    "sphere_center", "sphere_radius",
+    "sphere_center_prev", "ground_y",
     "env_total_sum", "env_intensity", "env_rotation",
 ]
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
     "u8", "u8", "u8", "u8", "u8",
-    "u8", "u8",
+    "u8", "u8", "u8",
     "u4", "u4", "u4", "u4", "u4", "f4",
     "u4", "u4", "u4",
+    "u4", "u4", "u4", "u4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
-    ("f4", (3,)), ("f4", (3,)), "f4",
-    ("f4", (3,)),
     ("f4", (3,)), "f4",
-    ("f4", (3,)), ("f4", (3,)),
-    "f4", "f4",
-    "f4", "f4",
-    "f4", "f4",
+    ("f4", (3,)), "f4",
     "f4", "f4", "f4",
 ]
 # Build with align=True, then pin itemsize up to the 8-byte struct alignment so
@@ -768,20 +760,28 @@ class PathTracer:
         p["sky_top"] = (0.35, 0.55, 0.9)
         p["sky_bottom"] = (0.9, 0.9, 0.95)
         p["sphere_center"] = (0.0, 1.5, 0.0)
-        p["sphere_albedo"] = (0.75, 0.2, 0.2)
         p["sphere_radius"] = 0.5
         p["sphere_center_prev"] = tuple(p["sphere_center"])
-        p["ground_albedo"] = (0.6, 0.6, 0.6)
         p["ground_y"] = 0.0
-        p["cloth_albedo_front"] = (0.2, 0.45, 0.85)
-        p["cloth_albedo_back"] = (0.85, 0.6, 0.2)
-        # Per-object material scalars (roughness is used directly as GGX alpha).
-        p["cloth_roughness"] = 0.6
-        p["cloth_metallic"] = 0.0
-        p["sphere_roughness"] = 0.1
-        p["sphere_metallic"] = 0.0
-        p["ground_roughness"] = 0.9
-        p["ground_metallic"] = 0.0
+        # Material table (M7a): the scene's materials live in a device buffer
+        # indexed by material_id (see add_material / _materials_to_device). The
+        # three default slots reproduce the M6 look; consumers add more slots via
+        # add_material(). cloth_material / sphere_material / ground_material map
+        # the still-hardcoded geometry (cloth GAS, analytic sphere/ground) to
+        # their slots -- these three ids are transient and go away as the
+        # geometry itself gains a material_id (M7c/M7d).
+        self._materials_host = []
+        self._d_materials = None
+        self._cloth_material = self.add_material(
+            (0.2, 0.45, 0.85), roughness=0.6, metallic=0.0,
+            base_color_back=(0.85, 0.6, 0.2))
+        self._sphere_material = self.add_material(
+            (0.75, 0.2, 0.2), roughness=0.1, metallic=0.0)
+        self._ground_material = self.add_material(
+            (0.6, 0.6, 0.6), roughness=0.9, metallic=0.0)
+        p["cloth_material"] = self._cloth_material
+        p["sphere_material"] = self._sphere_material
+        p["ground_material"] = self._ground_material
         # Environment map (optional; wired by set_environment). 0 pointers +
         # env_enabled=0 => the analytic gradient sky above is used on a miss.
         p["env_data"] = 0
@@ -844,13 +844,13 @@ class PathTracer:
         p["sphere_center"] = _vec3(center)
         p["sphere_radius"] = float(radius)
         if albedo is not None:
-            p["sphere_albedo"] = _vec3(albedo)
+            self.update_material(int(p["sphere_material"]), base_color=albedo)
 
     def set_ground(self, y, albedo=None):
         p = self._h_params[0]
         p["ground_y"] = float(y)
         if albedo is not None:
-            p["ground_albedo"] = _vec3(albedo)
+            self.update_material(int(p["ground_material"]), base_color=albedo)
 
     def set_light(self, direction, color=(1.0, 1.0, 1.0)):
         p = self._h_params[0]
@@ -936,26 +936,73 @@ class PathTracer:
         used on a miss again. The device buffers are kept alive but disabled."""
         self._h_params[0]["env_enabled"] = 0
 
-    def set_cloth_albedo(self, front, back=None):
+    # ------------------------------------------------------------------ #
+    # Material table (M7a). Materials live in a device buffer indexed by
+    # material_id; add_material appends a slot, update_material edits one, and
+    # both re-upload the (tiny) table. This is never on the render hot path in
+    # the meaningful sense -- the table is a handful of 32-byte entries and
+    # changes at setup / on rare live tweaks, not per vertex or per pixel.
+    # ------------------------------------------------------------------ #
+    def add_material(self, base_color, roughness=0.5, metallic=0.0,
+                     base_color_back=None):
+        """Append a material to the device table and return its integer id.
+
+        ``base_color`` is the front-face albedo; ``base_color_back`` the
+        back-face albedo for two-sided surfaces (defaults to ``base_color``).
+        ``roughness`` is used directly as the GGX alpha (Disney linear
+        roughness). The returned id is passed to geometry as its ``material_id``.
+        """
+        fc = _vec3(base_color)
+        bc = _vec3(base_color_back) if base_color_back is not None else fc
+        self._materials_host.append(
+            (fc[0], fc[1], fc[2], bc[0], bc[1], bc[2],
+             float(roughness), float(metallic)))
+        self._materials_to_device()
+        return len(self._materials_host) - 1
+
+    def update_material(self, material_id, base_color=None, roughness=None,
+                        metallic=None, base_color_back=None):
+        """Modify fields of an existing material in place; unspecified fields
+        keep their current value."""
+        e = list(self._materials_host[int(material_id)])
+        if base_color is not None:
+            e[0], e[1], e[2] = _vec3(base_color)
+        if base_color_back is not None:
+            e[3], e[4], e[5] = _vec3(base_color_back)
+        if roughness is not None:
+            e[6] = float(roughness)
+        if metallic is not None:
+            e[7] = float(metallic)
+        self._materials_host[int(material_id)] = tuple(e)
+        self._materials_to_device()
+
+    def _materials_to_device(self):
+        """Upload the current material table and repoint Params.materials."""
+        if not self._materials_host:
+            return
+        arr = np.asarray(self._materials_host, dtype=np.float32).reshape(-1)
+        self._d_materials = wp.array(arr, dtype=wp.float32, device=self._device)
         p = self._h_params[0]
-        p["cloth_albedo_front"] = _vec3(front)
-        p["cloth_albedo_back"] = _vec3(back if back is not None else front)
+        p["materials"] = int(self._d_materials.ptr)
+        p["num_materials"] = len(self._materials_host)
+
+    def set_cloth_albedo(self, front, back=None):
+        self.update_material(int(self._h_params[0]["cloth_material"]),
+                             base_color=front,
+                             base_color_back=back if back is not None else front)
 
     def set_cloth_material(self, roughness, metallic=0.0):
         """Cloth Disney material. ``roughness`` is used directly as GGX alpha."""
-        p = self._h_params[0]
-        p["cloth_roughness"] = float(roughness)
-        p["cloth_metallic"] = float(metallic)
+        self.update_material(int(self._h_params[0]["cloth_material"]),
+                             roughness=roughness, metallic=metallic)
 
     def set_sphere_material(self, roughness, metallic=0.0):
-        p = self._h_params[0]
-        p["sphere_roughness"] = float(roughness)
-        p["sphere_metallic"] = float(metallic)
+        self.update_material(int(self._h_params[0]["sphere_material"]),
+                             roughness=roughness, metallic=metallic)
 
     def set_ground_material(self, roughness, metallic=0.0):
-        p = self._h_params[0]
-        p["ground_roughness"] = float(roughness)
-        p["ground_metallic"] = float(metallic)
+        self.update_material(int(self._h_params[0]["ground_material"]),
+                             roughness=roughness, metallic=metallic)
 
     def set_path_depth(self, max_depth, rr_depth=None):
         """Set the maximum number of bounces and where Russian roulette begins.

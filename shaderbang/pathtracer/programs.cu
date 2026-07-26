@@ -105,6 +105,21 @@ static __forceinline__ __device__ float3 toWorld(float3 x, float3 y, float3 z, f
 }
 
 // --------------------------------------------------------------------------- //
+// Per-object material table entry (M7a). The scene's materials live in a device
+// buffer indexed by material_id; makeMaterial reads this and fills the full
+// Disney `Material` (below) with constant defaults for the rarely-varied
+// parameters. 8 floats == 32 bytes, no internal padding (float3 has 4-byte
+// alignment), so it packs identically on host (see renderer._materials_to_device).
+// --------------------------------------------------------------------------- //
+struct GpuMaterial
+{
+    float3 baseColor;      // front-face albedo
+    float3 baseColorBack;  // back-face albedo (== baseColor for one-sided)
+    float  roughness;      // used directly as the GGX alpha (Disney linear roughness)
+    float  metallic;
+};
+
+// --------------------------------------------------------------------------- //
 // Launch parameters (mirror renderer.PARAMS_DTYPE exactly)
 // --------------------------------------------------------------------------- //
 struct Params
@@ -121,6 +136,7 @@ struct Params
     float3*                cloth_normals; // per-vertex smooth normals (0 => fall back to geometric normal)
     float4*                env_data;      // HDR lat-long env, row-major (v*W+u); 0/env_enabled=0 => analytic sky
     float*                 env_cdf;       // flat sin(theta)-weighted running-sum CDF (W*H)
+    GpuMaterial*           materials;     // material table indexed by material_id (M7a)
 
     // --- 4-byte scalars --- //
     unsigned int           width;         // input (render) width
@@ -132,6 +148,10 @@ struct Params
     unsigned int           env_width;     // env-map width in texels (0 when no env)
     unsigned int           env_height;    // env-map height in texels
     unsigned int           env_enabled;   // 1 => importance-sample the env map + MIS
+    unsigned int           num_materials; // number of entries in materials[] (M7a)
+    unsigned int           cloth_material;  // material_id of the cloth mesh (transient; removed in M7d)
+    unsigned int           sphere_material; // material_id of the analytic sphere (transient; removed in M7c)
+    unsigned int           ground_material; // material_id of the analytic ground (transient; removed in M7c)
 
     // --- float3 basis / colors (float3 has 4-byte alignment) --- //
     float3                 cam_eye;
@@ -150,24 +170,10 @@ struct Params
     float3                 sky_bottom;
 
     float3                 sphere_center;
-    float3                 sphere_albedo;
     float                  sphere_radius;
 
     float3                 sphere_center_prev; // previous-frame sphere center (rigid motion)
-
-    float3                 ground_albedo;
     float                  ground_y;
-
-    float3                 cloth_albedo_front;
-    float3                 cloth_albedo_back;
-
-    // --- per-object material scalars (M4a) --- //
-    float                  cloth_roughness;
-    float                  cloth_metallic;
-    float                  sphere_roughness;
-    float                  sphere_metallic;
-    float                  ground_roughness;
-    float                  ground_metallic;
 
     // --- environment map scalars (M4c) --- //
     float                  env_total_sum; // sum of the sin(theta)-weighted CDF weights
@@ -639,9 +645,12 @@ static __device__ float3 disneySample(const Material& mat, float eta,
     return disneyEval(mat, eta, V, N, L, pdf);
 }
 
-// Build the material for an intersected object. ``roughness`` is used directly
-// as the GGX alpha (Disney "linear roughness == alpha"), NOT alpha=roughness^2.
-static __forceinline__ __device__ Material makeMaterial(int which, bool front)
+// Build the material for an intersected object from the device material table
+// (M7a): ``material_id`` indexes params.materials, and the rarely-varied Disney
+// parameters keep constant defaults. ``roughness`` is used directly as the GGX
+// alpha (Disney "linear roughness == alpha"), NOT alpha=roughness^2. ``front``
+// selects the two-sided front/back albedo.
+static __forceinline__ __device__ Material makeMaterial(int material_id, bool front)
 {
     Material m;
     m.subsurface = 0.0f;
@@ -653,24 +662,12 @@ static __forceinline__ __device__ Material makeMaterial(int which, bool front)
     m.specTrans = 0.0f;
     m.ior = 1.5f;
     m.anisotropic = 0.0f;
-    if (which == 1)
-    {
-        m.baseColor = front ? params.cloth_albedo_front : params.cloth_albedo_back;
-        m.metallic = params.cloth_metallic;
-        m.roughness = params.cloth_roughness;
-    }
-    else if (which == 2)
-    {
-        m.baseColor = params.sphere_albedo;
-        m.metallic = params.sphere_metallic;
-        m.roughness = params.sphere_roughness;
-    }
-    else
-    {
-        m.baseColor = params.ground_albedo;
-        m.metallic = params.ground_metallic;
-        m.roughness = params.ground_roughness;
-    }
+
+    GpuMaterial g = params.materials[material_id];
+    m.baseColor = front ? g.baseColor : g.baseColorBack;
+    m.roughness = g.roughness;
+    m.metallic = g.metallic;
+
     float aspect = sqrtf(1.0f - m.anisotropic * 0.9f);
     m.ax = fmaxf(1e-3f, m.roughness / aspect);
     m.ay = fmaxf(1e-3f, m.roughness * aspect);
@@ -697,7 +694,8 @@ static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 
 
 struct Hit
 {
-    int    which;   // 0 miss, 1 cloth, 2 sphere, 3 ground
+    int    which;       // 0 miss, 1 cloth, 2 sphere, 3 ground (geometry dispatch)
+    int    material_id; // index into params.materials (shading)
     float  t;
     float3 p;       // world hit position
     float3 ng;      // geometric normal (raw orientation)
@@ -735,12 +733,14 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
     h.p = o + d * best;
     if (h.which == 1)
     {
+        h.material_id = (int)params.cloth_material;
         h.ng = normalize(make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3)));
         h.ns = normalize(make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6)));
         h.prevP = make_float3(__uint_as_float(p7), __uint_as_float(p8), __uint_as_float(p9));
     }
     else if (h.which == 2)
     {
+        h.material_id = (int)params.sphere_material;
         float3 n = normalize(h.p - params.sphere_center);
         h.ng = n;
         h.ns = n;
@@ -748,6 +748,7 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
     }
     else
     {
+        h.material_id = (int)params.ground_material;
         h.ng = make_float3(0.0f, 1.0f, 0.0f);
         h.ns = h.ng;
         h.prevP = h.p;                                                       // static
@@ -1057,7 +1058,7 @@ extern "C" __global__ void __raygen__rg()
         bool front = dot(h.ng, d) < 0.0f;
         float3 Ng = front ? h.ng : -h.ng;
         float3 Ns = (dot(h.ns, d) > 0.0f) ? -h.ns : h.ns;
-        Material mat = makeMaterial(h.which, front);
+        Material mat = makeMaterial(h.material_id, front);
         float eta = front ? (1.0f / mat.ior) : mat.ior;   // relative IOR (entering -> 1/ior)
 
         // Next-event estimation (M4b sun + M4c env): shadow-tested directional
@@ -1139,7 +1140,7 @@ extern "C" __global__ void __raygen__rg()
     else
     {
         bool front0 = dot(first.ng, d0) < 0.0f;
-        aov_albedo = makeMaterial(first.which, front0).baseColor;
+        aov_albedo = makeMaterial(first.material_id, front0).baseColor;
         // Face the shading normal toward the viewer for the view-space guide.
         float3 nf = (dot(first.ns, d0) > 0.0f) ? -first.ns : first.ns;
         float3 uh = normalize(params.cam_u);
