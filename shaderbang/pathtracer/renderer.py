@@ -48,31 +48,27 @@ import warp as wp
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
     "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
-    "env_data", "env_cdf", "materials", "lights",
+    "env_data", "env_cdf", "materials", "lights", "spheres", "planes",
     "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
     "env_width", "env_height", "env_enabled",
-    "num_materials", "cloth_material", "sphere_material", "ground_material",
-    "num_lights",
+    "num_materials", "cloth_material", "num_lights",
+    "num_spheres", "num_planes",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
     "sky_top", "sky_bottom",
-    "sphere_center", "sphere_radius",
-    "sphere_center_prev", "ground_y",
     "env_total_sum", "env_intensity", "env_rotation",
 ]
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
     "u8", "u8", "u8", "u8", "u8",
-    "u8", "u8", "u8", "u8",
+    "u8", "u8", "u8", "u8", "u8", "u8",
     "u4", "u4", "u4", "u4", "u4", "f4",
     "u4", "u4", "u4",
-    "u4", "u4", "u4", "u4",
-    "u4",
+    "u4", "u4", "u4",
+    "u4", "u4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)),
-    ("f4", (3,)), "f4",
-    ("f4", (3,)), "f4",
     "f4", "f4", "f4",
 ]
 # Build with align=True, then pin itemsize up to the 8-byte struct alignment so
@@ -759,17 +755,12 @@ class PathTracer:
         p["prev_cam_w"] = tuple(p["cam_w"])
         p["sky_top"] = (0.35, 0.55, 0.9)
         p["sky_bottom"] = (0.9, 0.9, 0.95)
-        p["sphere_center"] = (0.0, 1.5, 0.0)
-        p["sphere_radius"] = 0.5
-        p["sphere_center_prev"] = tuple(p["sphere_center"])
-        p["ground_y"] = 0.0
         # Material table (M7a): the scene's materials live in a device buffer
         # indexed by material_id (see add_material / _materials_to_device). The
         # three default slots reproduce the M6 look; consumers add more slots via
-        # add_material(). cloth_material / sphere_material / ground_material map
-        # the still-hardcoded geometry (cloth GAS, analytic sphere/ground) to
-        # their slots -- these three ids are transient and go away as the
-        # geometry itself gains a material_id (M7c/M7d).
+        # add_material(). cloth_material maps the still-hardcoded cloth GAS to its
+        # slot (transient, removed in M7d); the sphere/ground slots are now
+        # referenced by the analytic primitives below (M7c).
         self._materials_host = []
         self._d_materials = None
         self._cloth_material = self.add_material(
@@ -780,8 +771,25 @@ class PathTracer:
         self._ground_material = self.add_material(
             (0.6, 0.6, 0.6), roughness=0.9, metallic=0.0)
         p["cloth_material"] = self._cloth_material
-        p["sphere_material"] = self._sphere_material
-        p["ground_material"] = self._ground_material
+        # Analytic primitive tables (M7c): spheres and planes live in device
+        # buffers looped over on the device, each carrying its own material_id
+        # (a sphere also carries its previous-frame center for rigid motion
+        # vectors). One default sphere + one ground plane reproduce the M6 scene;
+        # consumers add more via add_sphere / add_plane. The tables upload lazily
+        # from render() when dirty (they mutate every frame, unlike the material/
+        # light tables), so no redundant per-frame transfer. The set_sphere /
+        # set_ground live setters delegate to these ids (removed with the shims
+        # in M7e).
+        self._spheres_host = []
+        self._d_spheres = None
+        self._spheres_dirty = False
+        self._planes_host = []
+        self._d_planes = None
+        self._planes_dirty = False
+        self._sphere_prim = self.add_sphere(
+            (0.0, 1.5, 0.0), 0.5, self._sphere_material)
+        self._ground_prim = self.add_plane(
+            (0.0, 1.0, 0.0), 0.0, self._ground_material)
         # Light table (M7b): analytic delta lights live in a device buffer
         # (see add_light / _lights_to_device). One default directional "sun"
         # reproduces the M4b default; set_light updates it, consumers add more
@@ -844,21 +852,114 @@ class PathTracer:
         self.set_camera(eye, _mul3(u, ulen), _mul3(v, vlen), w)
 
     def set_sphere(self, center, radius, albedo=None):
-        # No radius guard: this is a per-frame live setter (cloth.py pushes the
+        # Back-compat shim (M7c): drive the default analytic sphere. No radius
+        # guard -- this is a per-frame live setter (cloth.py pushes the
         # interactive radius every frame), and the analytic intersector uses the
         # radius only as r*r, so a stray negative value renders as |r| rather
         # than corrupting anything -- not worth crashing a running session over.
-        p = self._h_params[0]
-        p["sphere_center"] = _vec3(center)
-        p["sphere_radius"] = float(radius)
+        self.update_sphere(self._sphere_prim, center=center, radius=radius)
         if albedo is not None:
-            self.update_material(int(p["sphere_material"]), base_color=albedo)
+            self.update_material(self._sphere_material, base_color=albedo)
 
     def set_ground(self, y, albedo=None):
-        p = self._h_params[0]
-        p["ground_y"] = float(y)
+        # Back-compat shim (M7c): the ground is the default analytic plane, a
+        # horizontal plane y = const (normal (0,1,0), offset == y).
+        self.update_plane(self._ground_prim, offset=float(y))
         if albedo is not None:
-            self.update_material(int(p["ground_material"]), base_color=albedo)
+            self.update_material(self._ground_material, base_color=albedo)
+
+    # ------------------------------------------------------------------ #
+    # Analytic primitive tables (M7c). Spheres and planes live in device buffers
+    # looped over on the device (sceneIntersect / sceneOcclude), each carrying
+    # its own material_id. A sphere also stores its previous-frame center so the
+    # rigid motion-vector reprojection works for an animated ball. Unlike the
+    # material/light tables (which change at setup / on rare tweaks and upload
+    # eagerly), these mutate every frame, so add_/update_ only mark the table
+    # dirty and render() uploads once per frame before the launch -- keeping the
+    # tiny transfer off the meaningful hot path while guaranteeing the device
+    # buffer matches host state at every launch. A sphere is 8 float32 slots
+    # (center.xyz, radius, center_prev.xyz, material_id); a plane 5 slots
+    # (normal.xyz, offset, material_id). The trailing uint material_id is written
+    # into its float slot bit-for-bit (np.uint32 view), matching the device
+    # struct's trailing ``unsigned int`` -- the Light.type packing trick.
+    # ------------------------------------------------------------------ #
+    def add_sphere(self, center, radius, material_id):
+        """Append an analytic sphere and return its integer id. ``center`` is a
+        world point, ``radius`` a scalar, ``material_id`` a slot from
+        add_material(). center_prev is seeded to center (zero initial motion)."""
+        c = _vec3(center)
+        self._spheres_host.append(
+            [c[0], c[1], c[2], float(radius),
+             c[0], c[1], c[2], int(material_id)])
+        self._spheres_dirty = True
+        return len(self._spheres_host) - 1
+
+    def update_sphere(self, sphere_id, center=None, radius=None,
+                      material_id=None):
+        """Modify fields of an existing sphere in place; unspecified fields keep
+        their current value. ``center_prev`` is untouched here -- it advances in
+        _snapshot_prev after each render, so motion vectors reproject against the
+        position actually rendered last frame."""
+        e = self._spheres_host[int(sphere_id)]
+        if center is not None:
+            e[0], e[1], e[2] = _vec3(center)
+        if radius is not None:
+            e[3] = float(radius)
+        if material_id is not None:
+            e[7] = int(material_id)
+        self._spheres_dirty = True
+
+    def _spheres_to_device(self):
+        """Upload the current sphere table and repoint Params.spheres."""
+        self._spheres_dirty = False
+        if not self._spheres_host:
+            self._h_params[0]["num_spheres"] = 0
+            return
+        n = len(self._spheres_host)
+        arr = np.asarray(self._spheres_host, dtype=np.float32)   # (n, 8)
+        arr.view(np.uint32)[:, 7] = arr[:, 7].astype(np.uint32)  # material_id bits
+        flat = np.ascontiguousarray(arr.reshape(-1))
+        self._d_spheres = wp.array(flat, dtype=wp.float32, device=self._device)
+        p = self._h_params[0]
+        p["spheres"] = int(self._d_spheres.ptr)
+        p["num_spheres"] = n
+
+    def add_plane(self, normal, offset, material_id):
+        """Append an analytic infinite plane { p : dot(normal, p) == offset } and
+        return its integer id. ``normal`` is normalized here; ``material_id`` is a
+        slot from add_material(). Planes are static (no motion vectors)."""
+        nrm = _norm3(_vec3(normal))
+        self._planes_host.append(
+            [nrm[0], nrm[1], nrm[2], float(offset), int(material_id)])
+        self._planes_dirty = True
+        return len(self._planes_host) - 1
+
+    def update_plane(self, plane_id, normal=None, offset=None, material_id=None):
+        """Modify fields of an existing plane in place; unspecified fields keep
+        their current value. ``normal`` is re-normalized."""
+        e = self._planes_host[int(plane_id)]
+        if normal is not None:
+            e[0], e[1], e[2] = _norm3(_vec3(normal))
+        if offset is not None:
+            e[3] = float(offset)
+        if material_id is not None:
+            e[4] = int(material_id)
+        self._planes_dirty = True
+
+    def _planes_to_device(self):
+        """Upload the current plane table and repoint Params.planes."""
+        self._planes_dirty = False
+        if not self._planes_host:
+            self._h_params[0]["num_planes"] = 0
+            return
+        n = len(self._planes_host)
+        arr = np.asarray(self._planes_host, dtype=np.float32)   # (n, 5)
+        arr.view(np.uint32)[:, 4] = arr[:, 4].astype(np.uint32)  # material_id bits
+        flat = np.ascontiguousarray(arr.reshape(-1))
+        self._d_planes = wp.array(flat, dtype=wp.float32, device=self._device)
+        p = self._h_params[0]
+        p["planes"] = int(self._d_planes.ptr)
+        p["num_planes"] = n
 
     # ------------------------------------------------------------------ #
     # Light table (M7b). Analytic delta lights (directional + point) live in a
@@ -1077,11 +1178,11 @@ class PathTracer:
                              roughness=roughness, metallic=metallic)
 
     def set_sphere_material(self, roughness, metallic=0.0):
-        self.update_material(int(self._h_params[0]["sphere_material"]),
+        self.update_material(self._sphere_material,
                              roughness=roughness, metallic=metallic)
 
     def set_ground_material(self, roughness, metallic=0.0):
-        self.update_material(int(self._h_params[0]["ground_material"]),
+        self.update_material(self._ground_material,
                              roughness=roughness, metallic=metallic)
 
     def set_path_depth(self, max_depth, rr_depth=None):
@@ -1239,6 +1340,13 @@ class PathTracer:
         p = self._h_params[0]
         p["exposure"] = self.exposure
         p["handle"] = int(self._gas_handle)
+        # Upload the analytic primitive tables if they changed since the last
+        # frame (add_/update_sphere/plane and _snapshot_prev only mark them
+        # dirty), so the device buffers match host state at this launch.
+        if self._spheres_dirty:
+            self._spheres_to_device()
+        if self._planes_dirty:
+            self._planes_to_device()
         # Accumulate the burst: each launch reads the running subframe (so
         # programs.cu folds it into the mean accum/(subframe+1)) and advances it.
         for _ in range(spp):
@@ -1255,7 +1363,7 @@ class PathTracer:
         self._snapshot_prev()
 
     def _snapshot_prev(self):
-        """Freeze this frame's camera, sphere and cloth vertices as the
+        """Freeze this frame's camera, spheres and cloth vertices as the
         ``previous`` state the next frame's motion vectors reproject against.
 
         Runs after the launch has consumed the *current* prev_* fields. The
@@ -1269,7 +1377,13 @@ class PathTracer:
         p["prev_cam_u"] = tuple(p["cam_u"])
         p["prev_cam_v"] = tuple(p["cam_v"])
         p["prev_cam_w"] = tuple(p["cam_w"])
-        p["sphere_center_prev"] = tuple(p["sphere_center"])
+        # Advance each sphere's center_prev (slots 4..6) to the center actually
+        # rendered this frame (slots 0..2). Only re-dirty when it moved, so a
+        # static scene does not re-upload the table every refinement frame.
+        for e in self._spheres_host:
+            if e[4:7] != e[0:3]:
+                e[4], e[5], e[6] = e[0], e[1], e[2]
+                self._spheres_dirty = True
         if self._prev_vertices is not None and self._vertices is not None:
             wp.copy(self._prev_vertices, self._vertices)
         self._has_history = True

@@ -137,6 +137,32 @@ struct Light
 };
 
 // --------------------------------------------------------------------------- //
+// Analytic primitive table entries (M7c). The scene's analytic spheres and
+// planes live in device buffers looped over by sceneIntersect / sceneOcclude,
+// each carrying its own material_id (indexes params.materials). A sphere also
+// carries center_prev for rigid motion vectors (its previous-frame center); a
+// plane is static (no prev). Both pack with no internal padding (float3 has
+// 4-byte alignment), and the host writes the trailing uint material_id into its
+// float slot bit-for-bit (see renderer._spheres_to_device / _planes_to_device),
+// matching the Light.type trick. Sphere = 8 floats (32 bytes); Plane = 5 floats
+// (20 bytes).
+// --------------------------------------------------------------------------- //
+struct Sphere
+{
+    float3       center;      // world-space center
+    float        radius;      // radius (used as r*r only)
+    float3       center_prev; // previous-frame center (rigid motion vectors)
+    unsigned int material_id; // index into params.materials
+};
+
+struct Plane
+{
+    float3       normal;      // unit plane normal
+    float        offset;      // plane: dot(normal, p) == offset
+    unsigned int material_id; // index into params.materials
+};
+
+// --------------------------------------------------------------------------- //
 // Launch parameters (mirror renderer.PARAMS_DTYPE exactly)
 // --------------------------------------------------------------------------- //
 struct Params
@@ -155,6 +181,8 @@ struct Params
     float*                 env_cdf;       // flat sin(theta)-weighted running-sum CDF (W*H)
     GpuMaterial*           materials;     // material table indexed by material_id (M7a)
     Light*                 lights;        // analytic delta-light table (M7b)
+    Sphere*                spheres;       // analytic sphere table (M7c)
+    Plane*                 planes;        // analytic plane table (M7c)
 
     // --- 4-byte scalars --- //
     unsigned int           width;         // input (render) width
@@ -168,9 +196,9 @@ struct Params
     unsigned int           env_enabled;   // 1 => importance-sample the env map + MIS
     unsigned int           num_materials; // number of entries in materials[] (M7a)
     unsigned int           cloth_material;  // material_id of the cloth mesh (transient; removed in M7d)
-    unsigned int           sphere_material; // material_id of the analytic sphere (transient; removed in M7c)
-    unsigned int           ground_material; // material_id of the analytic ground (transient; removed in M7c)
     unsigned int           num_lights;    // number of entries in lights[] (M7b)
+    unsigned int           num_spheres;   // number of entries in spheres[] (M7c)
+    unsigned int           num_planes;    // number of entries in planes[] (M7c)
 
     // --- float3 basis / colors (float3 has 4-byte alignment) --- //
     float3                 cam_eye;
@@ -185,12 +213,6 @@ struct Params
 
     float3                 sky_top;
     float3                 sky_bottom;
-
-    float3                 sphere_center;
-    float                  sphere_radius;
-
-    float3                 sphere_center_prev; // previous-frame sphere center (rigid motion)
-    float                  ground_y;
 
     // --- environment map scalars (M4c) --- //
     float                  env_total_sum; // sum of the sin(theta)-weighted CDF weights
@@ -311,12 +333,15 @@ static __forceinline__ __device__ float intersectSphere(float3 o, float3 d, floa
     return -1.0f;
 }
 
-// Ray vs. infinite horizontal plane y = ground_y, or -1.
-static __forceinline__ __device__ float intersectGround(float3 o, float3 d, float y)
+// Ray vs. infinite plane { p : dot(n, p) == offset }, or -1. n need not be unit
+// (the returned t is unaffected by |n| since it cancels), but the caller passes
+// a unit normal so the shading normal is correct.
+static __forceinline__ __device__ float intersectPlane(float3 o, float3 d, float3 n, float offset)
 {
-    if (fabsf(d.y) < 1e-6f)
+    float denom = dot(n, d);
+    if (fabsf(denom) < 1e-6f)
         return -1.0f;
-    float t = (y - o.y) / d.y;
+    float t = (offset - dot(n, o)) / denom;
     return (t > 1e-4f) ? t : -1.0f;
 }
 
@@ -711,7 +736,8 @@ static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 
 
 struct Hit
 {
-    int    which;       // 0 miss, 1 cloth, 2 sphere, 3 ground (geometry dispatch)
+    int    which;       // 0 miss, 1 cloth, 2 sphere, 3 plane (geometry dispatch)
+    int    prim_index;  // index into params.spheres / params.planes (which 2 / 3)
     int    material_id; // index into params.materials (shading)
     float  t;
     float3 p;       // world hit position
@@ -720,7 +746,7 @@ struct Hit
     float3 prevP;   // previous-frame world position (motion vectors)
 };
 
-// Trace the cloth GAS and the analytic sphere/ground, return the nearest hit.
+// Trace the cloth GAS and the analytic spheres/planes, return the nearest hit.
 static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
 {
     unsigned int p0 = __float_as_uint(1e30f);
@@ -734,15 +760,24 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
             0, 1, 0,
             p0, p1, p2, p3, p4, p5, p6, p7, p8, p9);
     float t_cloth = __uint_as_float(p0);
-    float t_s = intersectSphere(o, d, params.sphere_center, params.sphere_radius);
-    float t_g = intersectGround(o, d, params.ground_y);
 
     Hit h;
     h.which = 0;
+    h.prim_index = -1;
     float best = 1e29f;
     if (t_cloth < best) { best = t_cloth; h.which = 1; }
-    if (t_s > 0.0f && t_s < best) { best = t_s; h.which = 2; }
-    if (t_g > 0.0f && t_g < best) { best = t_g; h.which = 3; }
+    for (unsigned int i = 0u; i < params.num_spheres; ++i)
+    {
+        Sphere sp = params.spheres[i];
+        float t = intersectSphere(o, d, sp.center, sp.radius);
+        if (t > 0.0f && t < best) { best = t; h.which = 2; h.prim_index = (int)i; }
+    }
+    for (unsigned int i = 0u; i < params.num_planes; ++i)
+    {
+        Plane pl = params.planes[i];
+        float t = intersectPlane(o, d, pl.normal, pl.offset);
+        if (t > 0.0f && t < best) { best = t; h.which = 3; h.prim_index = (int)i; }
+    }
     if (h.which == 0)
         return h;
 
@@ -757,16 +792,18 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
     }
     else if (h.which == 2)
     {
-        h.material_id = (int)params.sphere_material;
-        float3 n = normalize(h.p - params.sphere_center);
+        Sphere sp = params.spheres[h.prim_index];
+        h.material_id = (int)sp.material_id;
+        float3 n = normalize(h.p - sp.center);
         h.ng = n;
         h.ns = n;
-        h.prevP = h.p + (params.sphere_center_prev - params.sphere_center);  // rigid
+        h.prevP = h.p + (sp.center_prev - sp.center);                        // rigid
     }
     else
     {
-        h.material_id = (int)params.ground_material;
-        h.ng = make_float3(0.0f, 1.0f, 0.0f);
+        Plane pl = params.planes[h.prim_index];
+        h.material_id = (int)pl.material_id;
+        h.ng = normalize(pl.normal);
         h.ns = h.ng;
         h.prevP = h.p;                                                       // static
     }
@@ -785,12 +822,20 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
 // --------------------------------------------------------------------------- //
 static __forceinline__ __device__ bool sceneOcclude(float3 o, float3 d, float tmax)
 {
-    float t_s = intersectSphere(o, d, params.sphere_center, params.sphere_radius);
-    if (t_s > 1e-4f && t_s < tmax)
-        return true;
-    float t_g = intersectGround(o, d, params.ground_y);
-    if (t_g > 1e-4f && t_g < tmax)
-        return true;
+    for (unsigned int i = 0u; i < params.num_spheres; ++i)
+    {
+        Sphere sp = params.spheres[i];
+        float t_s = intersectSphere(o, d, sp.center, sp.radius);
+        if (t_s > 1e-4f && t_s < tmax)
+            return true;
+    }
+    for (unsigned int i = 0u; i < params.num_planes; ++i)
+    {
+        Plane pl = params.planes[i];
+        float t_g = intersectPlane(o, d, pl.normal, pl.offset);
+        if (t_g > 1e-4f && t_g < tmax)
+            return true;
+    }
 
     unsigned int occluded = 1u;   // assume blocked; __miss__shadow clears to 0
     optixTrace(
