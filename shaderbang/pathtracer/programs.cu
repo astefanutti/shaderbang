@@ -120,6 +120,23 @@ struct GpuMaterial
 };
 
 // --------------------------------------------------------------------------- //
+// Analytic light table entry (M7b). Both light types are *delta* lights:
+// next-event-estimated only (a BSDF-sampled ray has zero probability of hitting
+// an infinitesimal light), so directLight gathers them with misWeight = 1 and no
+// /pdf -- exactly the M4b sun treatment, now generalized to a loop over a device
+// buffer. 8 floats == 32 bytes, no padding (float3 has 4-byte alignment); the
+// host packs the uint ``type`` into the first 4 bytes bit-for-bit (see
+// renderer._lights_to_device).
+// --------------------------------------------------------------------------- //
+struct Light
+{
+    unsigned int type;       // 0 = directional, 1 = point
+    float3       dir_or_pos; // directional: normalized dir *toward* the light; point: world position
+    float3       color;      // radiance (directional) / intensity (point, before 1/dist^2)
+    float        radius;     // reserved for soft/area falloff (unused; delta lights for now)
+};
+
+// --------------------------------------------------------------------------- //
 // Launch parameters (mirror renderer.PARAMS_DTYPE exactly)
 // --------------------------------------------------------------------------- //
 struct Params
@@ -137,6 +154,7 @@ struct Params
     float4*                env_data;      // HDR lat-long env, row-major (v*W+u); 0/env_enabled=0 => analytic sky
     float*                 env_cdf;       // flat sin(theta)-weighted running-sum CDF (W*H)
     GpuMaterial*           materials;     // material table indexed by material_id (M7a)
+    Light*                 lights;        // analytic delta-light table (M7b)
 
     // --- 4-byte scalars --- //
     unsigned int           width;         // input (render) width
@@ -152,6 +170,7 @@ struct Params
     unsigned int           cloth_material;  // material_id of the cloth mesh (transient; removed in M7d)
     unsigned int           sphere_material; // material_id of the analytic sphere (transient; removed in M7c)
     unsigned int           ground_material; // material_id of the analytic ground (transient; removed in M7c)
+    unsigned int           num_lights;    // number of entries in lights[] (M7b)
 
     // --- float3 basis / colors (float3 has 4-byte alignment) --- //
     float3                 cam_eye;
@@ -164,8 +183,6 @@ struct Params
     float3                 prev_cam_v;
     float3                 prev_cam_w;
 
-    float3                 light_dir;     // normalized, points toward the light
-    float3                 light_color;
     float3                 sky_top;
     float3                 sky_bottom;
 
@@ -954,18 +971,43 @@ static __forceinline__ __device__ float3 directLight(
 {
     float3 Ld = make_float3(0.0f, 0.0f, 0.0f);
 
-    // --- Delta directional sun: NEE-only, full weight, no MIS. ---
+    // --- Analytic delta lights (directional + point): NEE-only, full weight,
+    // no MIS. Each is shadow-tested; a directional light is at infinity
+    // (tmax = 1e16), a point light attenuates as 1/dist^2 and its shadow ray
+    // stops just short of the light itself. ---
+    for (unsigned int i = 0u; i < params.num_lights; ++i)
     {
-        float3 L = params.light_dir;   // normalized, points toward the sun
+        Light lt = params.lights[i];
+        float3 L;      // direction toward the light
+        float3 Li;     // incident radiance at the surface
+        float  tmax;   // shadow-ray max distance
+        if (lt.type == 0u)                 // directional
+        {
+            L = lt.dir_or_pos;             // normalized, toward the light
+            Li = lt.color;
+            tmax = 1e16f;
+        }
+        else                               // point
+        {
+            float3 toL = lt.dir_or_pos - hitP;
+            float dist2 = dot(toL, toL);
+            if (!(dist2 > 1e-12f))
+                continue;
+            float dist = sqrtf(dist2);
+            L = toL / dist;
+            Li = lt.color / dist2;         // inverse-square falloff
+            tmax = dist - 1e-3f;           // stop before the light
+        }
+
         float pdf;
         float3 f = disneyEval(mat, eta, V, N, L, pdf);   // |N.L| folded in
-        // Skip the shadow ray if the BSDF vanishes (e.g. sun below the horizon).
+        // Skip the shadow ray if the BSDF vanishes (e.g. light below the horizon).
         if (f.x > 0.0f || f.y > 0.0f || f.z > 0.0f)
         {
             float3 offN = (dot(L, Ng) < 0.0f) ? -Ng : Ng;
             float3 so = hitP + offN * 1e-4f;
-            if (!sceneOcclude(so, L, 1e16f))
-                Ld += f * params.light_color;
+            if (!sceneOcclude(so, L, tmax))
+                Ld += f * Li;
         }
     }
 

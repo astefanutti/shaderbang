@@ -48,13 +48,14 @@ import warp as wp
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
     "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
-    "env_data", "env_cdf", "materials",
+    "env_data", "env_cdf", "materials", "lights",
     "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
     "env_width", "env_height", "env_enabled",
     "num_materials", "cloth_material", "sphere_material", "ground_material",
+    "num_lights",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
-    "light_dir", "light_color", "sky_top", "sky_bottom",
+    "sky_top", "sky_bottom",
     "sphere_center", "sphere_radius",
     "sphere_center_prev", "ground_y",
     "env_total_sum", "env_intensity", "env_rotation",
@@ -62,13 +63,14 @@ _PARAMS_NAMES = [
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
     "u8", "u8", "u8", "u8", "u8",
-    "u8", "u8", "u8",
+    "u8", "u8", "u8", "u8",
     "u4", "u4", "u4", "u4", "u4", "f4",
     "u4", "u4", "u4",
     "u4", "u4", "u4", "u4",
+    "u4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
-    ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
+    ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), "f4",
     ("f4", (3,)), "f4",
     "f4", "f4", "f4",
@@ -755,8 +757,6 @@ class PathTracer:
         p["prev_cam_u"] = tuple(p["cam_u"])
         p["prev_cam_v"] = tuple(p["cam_v"])
         p["prev_cam_w"] = tuple(p["cam_w"])
-        p["light_dir"] = _norm3((0.4, 1.0, 0.3))
-        p["light_color"] = (1.0, 1.0, 1.0)
         p["sky_top"] = (0.35, 0.55, 0.9)
         p["sky_bottom"] = (0.9, 0.9, 0.95)
         p["sphere_center"] = (0.0, 1.5, 0.0)
@@ -782,6 +782,14 @@ class PathTracer:
         p["cloth_material"] = self._cloth_material
         p["sphere_material"] = self._sphere_material
         p["ground_material"] = self._ground_material
+        # Light table (M7b): analytic delta lights live in a device buffer
+        # (see add_light / _lights_to_device). One default directional "sun"
+        # reproduces the M4b default; set_light updates it, consumers add more
+        # (directional or point) via add_light().
+        self._lights_host = []
+        self._d_lights = None
+        self._sun_light = self.add_light(
+            "directional", direction=(0.4, 1.0, 0.3), color=(1.0, 1.0, 1.0))
         # Environment map (optional; wired by set_environment). 0 pointers +
         # env_enabled=0 => the analytic gradient sky above is used on a miss.
         p["env_data"] = 0
@@ -852,10 +860,82 @@ class PathTracer:
         if albedo is not None:
             self.update_material(int(p["ground_material"]), base_color=albedo)
 
-    def set_light(self, direction, color=(1.0, 1.0, 1.0)):
+    # ------------------------------------------------------------------ #
+    # Light table (M7b). Analytic delta lights (directional + point) live in a
+    # device buffer; add_light appends one, update_light edits one, and both
+    # re-upload the (tiny) table. Both types are next-event-estimated only, so
+    # the device gathers them with misWeight = 1 and no /pdf (see directLight).
+    # ------------------------------------------------------------------ #
+    def add_light(self, kind, direction=None, position=None,
+                  color=(1.0, 1.0, 1.0), radius=0.0):
+        """Append a light to the device table and return its integer id.
+
+        ``kind`` is ``"directional"`` (needs ``direction`` -- a vector *toward*
+        the light, normalized here) or ``"point"`` (needs ``position`` -- a world
+        point; radiance attenuates as 1/dist^2 on the device). ``color`` is the
+        radiance (directional) or pre-attenuation intensity (point).
+        """
+        k = str(kind).lower()
+        if k in ("directional", "dir", "distant", "sun"):
+            t = 0
+            if direction is None:
+                raise ValueError("add_light(directional) needs a direction")
+            vec = _norm3(_vec3(direction))
+        elif k == "point":
+            t = 1
+            if position is None:
+                raise ValueError("add_light(point) needs a position")
+            vec = _vec3(position)
+        else:
+            raise ValueError(f"add_light: unknown kind {kind!r} "
+                             "(expected 'directional' or 'point')")
+        col = _vec3(color)
+        self._lights_host.append(
+            (t, vec[0], vec[1], vec[2], col[0], col[1], col[2], float(radius)))
+        self._lights_to_device()
+        return len(self._lights_host) - 1
+
+    def update_light(self, light_id, direction=None, position=None,
+                     color=None, radius=None):
+        """Modify fields of an existing light in place; unspecified fields keep
+        their current value. ``direction`` (directional) is re-normalized;
+        ``position`` (point) is stored as-is -- do not mix the two for one id."""
+        e = list(self._lights_host[int(light_id)])
+        if direction is not None:
+            e[1], e[2], e[3] = _norm3(_vec3(direction))
+        if position is not None:
+            e[1], e[2], e[3] = _vec3(position)
+        if color is not None:
+            e[4], e[5], e[6] = _vec3(color)
+        if radius is not None:
+            e[7] = float(radius)
+        self._lights_host[int(light_id)] = tuple(e)
+        self._lights_to_device()
+
+    def _lights_to_device(self):
+        """Upload the current light table and repoint Params.lights. Each entry
+        is 8 float32 slots; slot 0 holds the uint ``type`` bit-for-bit (matching
+        the device ``Light`` struct's leading ``unsigned int``), slots 1..7 the
+        float direction/position, color and radius."""
+        if not self._lights_host:
+            return
+        n = len(self._lights_host)
+        arr = np.zeros((n, 8), dtype=np.float32)
+        types = np.empty(n, dtype=np.uint32)
+        for i, e in enumerate(self._lights_host):
+            types[i] = int(e[0])
+            arr[i, 1:] = e[1:]
+        arr.view(np.uint32)[:, 0] = types      # reinterpret slot 0 as the uint type
+        flat = np.ascontiguousarray(arr.reshape(-1))
+        self._d_lights = wp.array(flat, dtype=wp.float32, device=self._device)
         p = self._h_params[0]
-        p["light_dir"] = _norm3(_vec3(direction))
-        p["light_color"] = _vec3(color)
+        p["lights"] = int(self._d_lights.ptr)
+        p["num_lights"] = n
+
+    def set_light(self, direction, color=(1.0, 1.0, 1.0)):
+        """Update the default directional 'sun' light (back-compat shim; prefer
+        add_light / update_light)."""
+        self.update_light(self._sun_light, direction=direction, color=color)
 
     def set_sky(self, top, bottom):
         p = self._h_params[0]
