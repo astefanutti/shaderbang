@@ -1416,7 +1416,7 @@ class Ground(Input):
 
     def render(self, frame, time):
         # The ground plane is intersected analytically by the path tracer
-        # (PathTracer.set_ground); there is nothing to rasterize here.
+        # (PathTracer.add_plane); there is nothing to rasterize here.
         pass
 
 
@@ -1592,6 +1592,8 @@ class PathTracerView(Input):
         self.sphere = sphere
         self.cloth = cloth
         self.pt = None
+        self._cloth_mesh = None   # deformable mesh id in the tracer's scene
+        self._sphere_id = None    # analytic sphere id (pushed live each frame)
         self._width = None
         self._height = None
         self._sig = None
@@ -1617,19 +1619,34 @@ class PathTracerView(Input):
         # path automatically if that interop cannot be set up.
         self.pt = PathTracer(self._width // 2, self._height // 2, upscale=2,
                              exposure=PathTracerView.EXPOSURE, interop="auto")
-        # Pass the cloth's per-vertex smooth normals (updated in place by
-        # Cloth.update_mesh each frame) so the Disney BSDF shades a smooth
-        # surface instead of faceted triangles.
-        self.pt.set_geometry(cloth.pos, cloth.triIds, normals=cloth.normals)
-        self.pt.set_ground(y=0.0, albedo=(0.55, 0.55, 0.6))
-        self.pt.set_light(direction=(0.5, 1.0, 0.4), color=(1.1, 1.05, 0.95))
-        self.pt.set_cloth_albedo(front=(0.2, 0.45, 0.85), back=(0.85, 0.6, 0.2))
-        self.pt.set_sphere(center=self.sphere.center, radius=self.sphere.radius,
-                           albedo=(0.8, 0.8, 0.8))
-        # Disney materials: matte fabric, a semi-glossy sphere, a diffuse floor.
-        self.pt.set_cloth_material(roughness=0.6)
-        self.pt.set_sphere_material(roughness=0.3)
-        self.pt.set_ground_material(roughness=0.9)
+        # Build the whole scene through the generic add_* API (M7): the tracer is
+        # consumer-agnostic and starts empty. Disney materials: matte two-sided
+        # fabric, a semi-glossy ball, a diffuse floor.
+        cloth_mat = self.pt.add_material(base_color=(0.2, 0.45, 0.85),
+                                         base_color_back=(0.85, 0.6, 0.2),
+                                         roughness=0.6)
+        sphere_mat = self.pt.add_material(base_color=(0.8, 0.8, 0.8),
+                                          roughness=0.3)
+        ground_mat = self.pt.add_material(base_color=(0.55, 0.55, 0.6),
+                                          roughness=0.9)
+        # The cloth is a deformable mesh: its positions and per-vertex smooth
+        # normals are rewritten in place each frame by Cloth.update_mesh, so
+        # refit() rebuilds its GAS from the very same device arrays -- no CPU
+        # copy. The normals let the Disney BSDF shade a smooth surface instead of
+        # faceted triangles.
+        self._cloth_mesh = self.pt.add_mesh(cloth.pos, cloth.triIds,
+                                            normals=cloth.normals,
+                                            material_id=cloth_mat,
+                                            deformable=True)
+        # The ball is an analytic sphere (its centre/radius are pushed live each
+        # frame, see render); the floor an analytic plane y = 0.
+        self._sphere_id = self.pt.add_sphere(center=self.sphere.center,
+                                             radius=self.sphere.radius,
+                                             material_id=sphere_mat)
+        self.pt.add_plane(normal=(0.0, 1.0, 0.0), offset=0.0,
+                          material_id=ground_mat)
+        self.pt.add_light("directional", direction=(0.5, 1.0, 0.4),
+                          color=(1.1, 1.05, 0.95))
         self.pt.set_path_depth(max_depth=4)
         self.pt.init_gl()
 
@@ -1652,7 +1669,9 @@ class PathTracerView(Input):
         # runs).
         centre = self.sphere.center + self.sphere.dc
         radius = self.sphere.radius + self.sphere.dr
-        self.pt.set_sphere(center=(centre[0], centre[1], centre[2]), radius=radius)
+        self.pt.update_sphere(self._sphere_id,
+                              center=(centre[0], centre[1], centre[2]),
+                              radius=radius)
 
         running = bool(state & (State.RUN | State.STEP))
         if running:

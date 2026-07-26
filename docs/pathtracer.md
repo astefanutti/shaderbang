@@ -494,6 +494,84 @@ the CUDA-less dev box (the `interop` validation, `_cuda_check` unpacking and
 surface-rebuild bookkeeping are unit-tested off-target; the driver calls, the
 `RawModule` surf2Dwrite compile and the map/write/unmap loop are not).
 
+### M7 — Generic, consumer-agnostic scene (done)
+
+Through M6 the *pipeline* was reusable but the *scene* was hardcoded for cloth:
+one deformable mesh in global `Params` pointers, a single analytic sphere +
+ground baked into the raygen, a 3-way material switch, and one directional sun.
+M7 turns the scene into **data** — device buffers of materials, lights and
+analytic primitives, plus an **instanced multi-mesh graph** — driven by a small
+generic `add_*` API. `cloth.py` becomes just one consumer; a second minimal
+example, [`examples/pathtracer_demo.py`](../examples/pathtracer_demo.py), proves
+reuse. The present / tone-map / denoiser / AOV stack is scene-agnostic and was
+untouched. Each sub-milestone changed the ABI for **its slice only** — the numpy
+`PARAMS_DTYPE`, the device `struct Params`, and the `-DPARAMS_EXPECTED_SIZE`
+`static_assert` move in lockstep — and left the tracer rendering.
+
+The scene model referenced from `Params`:
+
+- **Materials** (`M7a`) — a device `Material materials[]` + `num_materials`,
+  indexed by `material_id`; `makeMaterial` reads the table (front/back albedo,
+  roughness, metallic) instead of the old 3-way switch. `add_material()` appends
+  a slot and returns its id.
+- **Lights** (`M7b`) — a device `Light lights[]` + `num_lights`; `directLight`
+  loops over them. Both kinds are delta lights next-event-estimated with
+  `misWeight = 1` (no `/pdf`): **directional** (a direction, the old sun path) and
+  **point** (a position, radiance attenuated `1/dist²`, shadow ray to the point).
+  `add_light("directional"|"point", …)`. The env map is retained.
+- **Analytic primitives** (`M7c`) — device `Sphere spheres[]` / `Plane planes[]`
+  + counts, looped over in `sceneIntersect` / `sceneOcclude`; each carries its own
+  `material_id` (a sphere also stores its previous-frame centre for motion
+  vectors). `add_sphere` / `add_plane` + per-frame `update_sphere`. Unlike the
+  material/light tables (uploaded eagerly on edit), these mutate every frame, so
+  `add_/update_` only mark them dirty and `render()` uploads once per launch —
+  the tiny transfer stays off the meaningful hot path. The trailing `uint`
+  `material_id` is packed bit-for-bit into its `float` slot (a `np.uint32` view),
+  matching the device struct's trailing `unsigned int`.
+- **Meshes** (`M7d`) — moved off `Params` globals into a **single-level IAS**:
+  each mesh is one per-mesh **GAS** + one `OptixInstance` + one per-instance SBT
+  **hitgroup record** (`HitGroupData { uint3* indices; float3* normals;
+  float3* prev_vertices; uint material_id; uint flags; float prev_xform[12]; }`,
+  guarded by its own `static_assert(sizeof == 80)` via
+  `-DHITGROUP_DATA_EXPECTED_SIZE`). `__closesthit__` reaches its mesh data through
+  `optixGetSbtDataPointer()` instead of globals; `Params.handle` is now the IAS.
+  Instance `i` gets `instanceId = i` and `sbtOffset = i`, so with the raygen's
+  `optixTrace(SBToffset=0, SBTstride=1)` over single-build-input GASes the hit
+  selects hitgroup record `i`. Pipeline `traversableGraphFlags` becomes
+  `ALLOW_SINGLE_LEVEL_INSTANCING`.
+
+**Generic motion vectors** (M7d): the flow AOV that feeds the temporal denoiser is
+reconstructed per hit from the mesh kind. A **deformable** mesh
+(`prev_vertices != 0`) interpolates the previous world position with the hit's
+barycentrics over `prev_vertices` (the original cloth path). A **rigid** mesh
+(`prev_vertices == 0`) reprojects the *object-space* hit point
+(`objRayOrigin + objRayDir * tMax`) through a per-instance **previous
+object→world transform** stored in the hitgroup record. (`optixGetObjectRayDirection`
+is unnormalized, so the same `tMax` parameterizes the world and object rays; the
+`safeNormalize` zero-guard survives because `transformNormal(0) = 0`.) Two dirty
+flags drive the per-frame update: `_instances_dirty` (a rigid transform or GAS
+handle changed → re-pack + upload the `OptixInstance` array and refit the IAS) and
+`_sbt_dirty` (a `prev_xform`/material advanced in `_snapshot_prev` → re-pack the
+hitgroup records). `add_mesh(deformable=…)` builds the GAS + instance + record;
+deformable meshes update in place via `refit()`, rigid ones move via
+`set_instance_transform()`. All geometry arrays (vertices, indices, normals,
+prev-vertices) are **retained** by the mesh so the raw device pointers baked into
+the SBT record stay valid for as long as the mesh — closesthit dereferences them
+every frame, not just at GAS-build time.
+
+**Migration + second consumer** (`M7e`): `cloth.py` moved to the generic API
+(`add_material` / `add_mesh(deformable=True)` / `add_sphere` / `add_plane` /
+`add_light`, per-frame `update_sphere` + `refit`), and the temporary
+cloth-specific setters/shims (`set_geometry`, `set_sphere`, `set_ground`,
+`set_light`, `set_cloth_*`, `set_sphere_material`, `set_ground_material`) and the
+default scene slots they seeded were **deleted** — a fresh `PathTracer` now starts
+empty and the consumer builds the whole scene. `examples/pathtracer_demo.py` is a
+minimal second consumer with no cloth/Warp-sim dependency: two spinning rigid cube
+instances + an analytic sphere on a ground plane, under a directional key + warm
+point light, from a slowly orbiting camera — exercising `add_mesh(deformable=False)`,
+`set_instance_transform` (rigid motion vectors), the analytic prims, the material
+and light tables, and per-frame camera motion through the same `Input` callbacks.
+
 ## References
 
 - [NVIDIA OptiX](https://developer.nvidia.com/rtx/ray-tracing/optix) — SDK,

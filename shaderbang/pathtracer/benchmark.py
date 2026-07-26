@@ -163,15 +163,23 @@ def run(argv=None):
     for (w, h) in resolutions:
         try:
             pt = PathTracer(w, h, device=args.device, exposure=args.exposure)
-            pt.set_geometry(verts, indices)
+            cloth_mat = pt.add_material(base_color=(0.2, 0.45, 0.85),
+                                        base_color_back=(0.85, 0.6, 0.2),
+                                        roughness=0.6)
+            sphere_mat = pt.add_material(base_color=(0.8, 0.25, 0.2),
+                                         roughness=0.3)
+            ground_mat = pt.add_material(base_color=(0.55, 0.55, 0.6),
+                                         roughness=0.9)
+            pt.add_mesh(verts, indices, material_id=cloth_mat, deformable=True)
             pt.set_camera_lookat(eye=(0.0, 1.8, 6.0), target=(0.0, 1.3, 0.0),
                                  up=(0.0, 1.0, 0.0), fov_y_deg=40.0,
                                  aspect=w / float(h))
-            pt.set_sphere(center=(0.0, 1.5, 0.0), radius=0.5,
-                          albedo=(0.8, 0.25, 0.2))
-            pt.set_ground(y=0.0, albedo=(0.55, 0.55, 0.6))
-            pt.set_light(direction=(0.5, 1.0, 0.4), color=(1.1, 1.05, 0.95))
-            pt.set_cloth_albedo(front=(0.2, 0.45, 0.85), back=(0.85, 0.6, 0.2))
+            pt.add_sphere(center=(0.0, 1.5, 0.0), radius=0.5,
+                          material_id=sphere_mat)
+            pt.add_plane(normal=(0.0, 1.0, 0.0), offset=0.0,
+                         material_id=ground_mat)
+            pt.add_light("directional", direction=(0.5, 1.0, 0.4),
+                         color=(1.1, 1.05, 0.95))
 
             stream = pt._wp_stream
             sync = lambda: wp.synchronize_stream(stream)

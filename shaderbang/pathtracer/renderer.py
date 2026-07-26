@@ -270,13 +270,24 @@ def _xform12(transform):
 class PathTracer:
     """OptiX path tracer over Warp-owned geometry, presented via an OpenGL PBO.
 
-    Typical per-frame use from a shaderbang ``Input``::
+    Build the scene once from the generic ``add_*`` API, then drive it each frame
+    through a shaderbang ``Input``::
 
+        # setup (once)
+        mat = pt.add_material(base_color=(0.8, 0.2, 0.2), roughness=0.4)
+        pt.add_mesh(vertices, indices, normals=normals, material_id=mat,
+                    deformable=True)         # or deformable=False for a rigid mesh
+        pt.add_sphere(center, radius, material_id=mat)
+        pt.add_plane(normal=(0, 1, 0), offset=0.0, material_id=mat)
+        pt.add_light("directional", direction=(0.5, 1, 0.4))
+        pt.init_gl()
+        # per frame
         pt.set_camera_lookat(eye, target, up=(0, 1, 0), fov_y_deg=40, aspect=w/h)
-        pt.set_sphere(center, radius)
-        pt.refit()          # GAS in-place update after the physics moved verts
+        pt.update_sphere(ball, center=new_center)   # analytic prims move here
+        pt.set_instance_transform(cube, xform)      # rigid meshes move here
+        pt.refit()          # in-place GAS/IAS update after deformable verts moved
         pt.render()         # trace + accumulate + denoise
-        pt.present()        # tone-map -> PBO -> textured full-screen quad
+        pt.present()        # tone-map -> texture -> full-screen quad
 
     Construction compiles the pipeline and allocates all fixed-size buffers, so
     it must run on the target GPU with a current CUDA primary context (call
@@ -385,7 +396,6 @@ class PathTracer:
         # record (its indices/normals/prev_vertices/material/transform); the IAS is
         # params.handle. Populated by add_mesh / set_instance_transform / refit.
         self._meshes = []            # list of per-mesh dicts (see add_mesh)
-        self._cloth_mesh_id = None   # set_geometry back-compat: the one deformable mesh
         self._d_instances = None     # packed OptixInstance array on device (IAS input)
         self._d_instances_nbytes = 0
         self._instances_dirty = False  # a rigid transform changed -> re-upload instances
@@ -867,49 +877,29 @@ class PathTracer:
         p["prev_cam_w"] = tuple(p["cam_w"])
         p["sky_top"] = (0.35, 0.55, 0.9)
         p["sky_bottom"] = (0.9, 0.9, 0.95)
-        # Material table (M7a): the scene's materials live in a device buffer
-        # indexed by material_id (see add_material / _materials_to_device). The
-        # three default slots reproduce the M6 look; consumers add more slots via
-        # add_material(). self._cloth_material is the slot the set_geometry /
-        # set_cloth_* back-compat shims assign to the deformable cloth mesh (M7d:
-        # a mesh carries its material_id in its SBT record, not in Params); the
-        # sphere/ground slots are referenced by the analytic primitives below (M7c).
+        # Scene tables (M7). The tracer starts empty and consumer-agnostic: the
+        # consumer builds the whole scene through the generic add_* API. Nothing
+        # cloth-specific is seeded here.
+        #
+        # Materials (M7a): a device buffer indexed by material_id; add_material
+        # appends a slot, geometry references it by id.
         self._materials_host = []
         self._d_materials = None
-        self._cloth_material = self.add_material(
-            (0.2, 0.45, 0.85), roughness=0.6, metallic=0.0,
-            base_color_back=(0.85, 0.6, 0.2))
-        self._sphere_material = self.add_material(
-            (0.75, 0.2, 0.2), roughness=0.1, metallic=0.0)
-        self._ground_material = self.add_material(
-            (0.6, 0.6, 0.6), roughness=0.9, metallic=0.0)
-        # Analytic primitive tables (M7c): spheres and planes live in device
-        # buffers looped over on the device, each carrying its own material_id
-        # (a sphere also carries its previous-frame center for rigid motion
-        # vectors). One default sphere + one ground plane reproduce the M6 scene;
-        # consumers add more via add_sphere / add_plane. The tables upload lazily
-        # from render() when dirty (they mutate every frame, unlike the material/
-        # light tables), so no redundant per-frame transfer. The set_sphere /
-        # set_ground live setters delegate to these ids (removed with the shims
-        # in M7e).
+        # Analytic primitives (M7c): spheres and planes live in device buffers
+        # looped over on the device (sceneIntersect / sceneOcclude), each carrying
+        # its own material_id (a sphere also carries its previous-frame center for
+        # rigid motion vectors). Unlike the material/light tables they mutate every
+        # frame, so add_/update_ only mark them dirty and render() uploads once per
+        # frame before the launch -- keeping the tiny transfer off the hot path.
         self._spheres_host = []
         self._d_spheres = None
         self._spheres_dirty = False
         self._planes_host = []
         self._d_planes = None
         self._planes_dirty = False
-        self._sphere_prim = self.add_sphere(
-            (0.0, 1.5, 0.0), 0.5, self._sphere_material)
-        self._ground_prim = self.add_plane(
-            (0.0, 1.0, 0.0), 0.0, self._ground_material)
-        # Light table (M7b): analytic delta lights live in a device buffer
-        # (see add_light / _lights_to_device). One default directional "sun"
-        # reproduces the M4b default; set_light updates it, consumers add more
-        # (directional or point) via add_light().
+        # Delta lights (M7b): directional + point, next-event-estimated on device.
         self._lights_host = []
         self._d_lights = None
-        self._sun_light = self.add_light(
-            "directional", direction=(0.4, 1.0, 0.3), color=(1.0, 1.0, 1.0))
         # Environment map (optional; wired by set_environment). 0 pointers +
         # env_enabled=0 => the analytic gradient sky above is used on a miss.
         p["env_data"] = 0
@@ -962,23 +952,6 @@ class PathTracer:
         vlen = wlen * math.tan(0.5 * math.radians(fov_y_deg))
         ulen = vlen * aspect
         self.set_camera(eye, _mul3(u, ulen), _mul3(v, vlen), w)
-
-    def set_sphere(self, center, radius, albedo=None):
-        # Back-compat shim (M7c): drive the default analytic sphere. No radius
-        # guard -- this is a per-frame live setter (cloth.py pushes the
-        # interactive radius every frame), and the analytic intersector uses the
-        # radius only as r*r, so a stray negative value renders as |r| rather
-        # than corrupting anything -- not worth crashing a running session over.
-        self.update_sphere(self._sphere_prim, center=center, radius=radius)
-        if albedo is not None:
-            self.update_material(self._sphere_material, base_color=albedo)
-
-    def set_ground(self, y, albedo=None):
-        # Back-compat shim (M7c): the ground is the default analytic plane, a
-        # horizontal plane y = const (normal (0,1,0), offset == y).
-        self.update_plane(self._ground_prim, offset=float(y))
-        if albedo is not None:
-            self.update_material(self._ground_material, base_color=albedo)
 
     # ------------------------------------------------------------------ #
     # Analytic primitive tables (M7c). Spheres and planes live in device buffers
@@ -1145,11 +1118,6 @@ class PathTracer:
         p["lights"] = int(self._d_lights.ptr)
         p["num_lights"] = n
 
-    def set_light(self, direction, color=(1.0, 1.0, 1.0)):
-        """Update the default directional 'sun' light (back-compat shim; prefer
-        add_light / update_light)."""
-        self.update_light(self._sun_light, direction=direction, color=color)
-
     def set_sky(self, top, bottom):
         p = self._h_params[0]
         p["sky_top"] = _vec3(top)
@@ -1279,24 +1247,6 @@ class PathTracer:
         p["materials"] = int(self._d_materials.ptr)
         p["num_materials"] = len(self._materials_host)
 
-    def set_cloth_albedo(self, front, back=None):
-        self.update_material(self._cloth_material,
-                             base_color=front,
-                             base_color_back=back if back is not None else front)
-
-    def set_cloth_material(self, roughness, metallic=0.0):
-        """Cloth Disney material. ``roughness`` is used directly as GGX alpha."""
-        self.update_material(self._cloth_material,
-                             roughness=roughness, metallic=metallic)
-
-    def set_sphere_material(self, roughness, metallic=0.0):
-        self.update_material(self._sphere_material,
-                             roughness=roughness, metallic=metallic)
-
-    def set_ground_material(self, roughness, metallic=0.0):
-        self.update_material(self._ground_material,
-                             roughness=roughness, metallic=metallic)
-
     def set_path_depth(self, max_depth, rr_depth=None):
         """Set the maximum number of bounces and where Russian roulette begins.
 
@@ -1401,17 +1351,6 @@ class PathTracer:
         self._build_ias(update=False)          # (re)build the IAS with the new instance
         self._rebuild_hitgroup_sbt()           # one record per instance
         return mesh_id
-
-    def set_geometry(self, vertices, indices, normals=None):
-        """Back-compat shim (M7d): the cloth is a single deformable mesh in the
-        IAS. First call registers it; subsequent calls re-point its buffers."""
-        if self._cloth_mesh_id is None:
-            self._cloth_mesh_id = self.add_mesh(
-                vertices, indices, normals=normals,
-                material_id=self._cloth_material, deformable=True)
-        else:
-            self.update_mesh(self._cloth_mesh_id, vertices=vertices,
-                             normals=normals)
 
     def update_mesh(self, mesh_id, vertices=None, normals=None):
         """Re-point a mesh's vertex / normal buffers (rare: deformable meshes are
