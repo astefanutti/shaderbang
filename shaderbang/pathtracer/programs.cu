@@ -104,6 +104,18 @@ static __forceinline__ __device__ float3 toWorld(float3 x, float3 y, float3 z, f
     return x * v.x + y * v.y + z * v.z;
 }
 
+// Transform a point by a 3x4 row-major object->world matrix (12 floats, the same
+// layout as OptixInstance::transform). Used for rigid-instance motion vectors:
+// the previous-frame world position is the object-space hit point pushed through
+// the *previous* frame's transform (stored per instance in HitGroupData).
+static __forceinline__ __device__ float3 xformPoint(const float* m, float3 p)
+{
+    return make_float3(
+        m[0] * p.x + m[1] * p.y + m[2]  * p.z + m[3],
+        m[4] * p.x + m[5] * p.y + m[6]  * p.z + m[7],
+        m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]);
+}
+
 // --------------------------------------------------------------------------- //
 // Per-object material table entry (M7a). The scene's materials live in a device
 // buffer indexed by material_id; makeMaterial reads this and fills the full
@@ -163,6 +175,38 @@ struct Plane
 };
 
 // --------------------------------------------------------------------------- //
+// Per-instance mesh record (M7d). Each triangle-mesh instance in the IAS gets its
+// own SBT hitgroup record carrying this data; __closesthit__ch reaches it via
+// optixGetSbtDataPointer() instead of Params globals, so the tracer supports any
+// number of independent meshes. Motion vectors are generic:
+//   * deformable mesh (prev_vertices != 0): reconstruct the previous-frame world
+//     position from the hit barycentrics against prev_vertices (today's cloth path),
+//     then push through prev_xform (identity for a non-instanced deformable mesh);
+//   * rigid mesh (prev_vertices == 0): push the object-space hit point through
+//     prev_xform (the *previous* frame's object->world transform).
+// Layout is 80 bytes, 8-byte aligned (three 8-byte pointers, two uints, then a
+// 12-float transform); the host mirrors it in the SBT record dtype and guards the
+// size with a static_assert below (see renderer._hitgroup_record_dtype).
+// --------------------------------------------------------------------------- //
+struct HitGroupData
+{
+    uint3*       indices;       // triangle vertex-index triplets (prev-vertex / normal lookup)
+    float3*      normals;       // per-vertex smooth normals (0 => fall back to geometric normal)
+    float3*      prev_vertices; // previous-frame vertex positions (0 => rigid mesh)
+    unsigned int material_id;   // index into params.materials
+    unsigned int flags;         // reserved (0); keeps prev_xform 8-byte aligned
+    float        prev_xform[12];// previous-frame object->world 3x4 row-major transform
+};
+
+#ifdef HITGROUP_DATA_EXPECTED_SIZE
+// ABI guard mirroring the Params one: the host passes the SBT record's data span
+// (record itemsize - header) as a -D define. A mismatch is silent corruption in
+// closesthit, so fail the NVRTC compile instead.
+static_assert(sizeof(HitGroupData) == HITGROUP_DATA_EXPECTED_SIZE,
+              "HitGroupData size != host SBT record data span (renderer.py ABI drift)");
+#endif
+
+// --------------------------------------------------------------------------- //
 // Launch parameters (mirror renderer.PARAMS_DTYPE exactly)
 // --------------------------------------------------------------------------- //
 struct Params
@@ -172,11 +216,8 @@ struct Params
     float4*                output;        // per-frame HDR (= accum / (subframe+1)), denoiser input
     float4*                albedo;        // guide AOV: per-pixel surface albedo
     float4*                normal;        // guide AOV: per-pixel view-space normal (+z toward camera)
-    float3*                prev_vertices; // previous-frame cloth vertex positions (for motion vectors)
-    uint3*                 tri_indices;   // triangle vertex-index triplets (prev-vertex / normal lookup)
     float2*                flow;          // output motion-vector AOV (input res, curr -> prev in pixels)
-    OptixTraversableHandle handle;        // cloth GAS
-    float3*                cloth_normals; // per-vertex smooth normals (0 => fall back to geometric normal)
+    OptixTraversableHandle handle;        // scene IAS (single-level instancing over per-mesh GASes)
     float4*                env_data;      // HDR lat-long env, row-major (v*W+u); 0/env_enabled=0 => analytic sky
     float*                 env_cdf;       // flat sin(theta)-weighted running-sum CDF (W*H)
     GpuMaterial*           materials;     // material table indexed by material_id (M7a)
@@ -195,7 +236,6 @@ struct Params
     unsigned int           env_height;    // env-map height in texels
     unsigned int           env_enabled;   // 1 => importance-sample the env map + MIS
     unsigned int           num_materials; // number of entries in materials[] (M7a)
-    unsigned int           cloth_material;  // material_id of the cloth mesh (transient; removed in M7d)
     unsigned int           num_lights;    // number of entries in lights[] (M7b)
     unsigned int           num_spheres;   // number of entries in spheres[] (M7c)
     unsigned int           num_planes;    // number of entries in planes[] (M7c)
@@ -718,9 +758,11 @@ static __forceinline__ __device__ Material makeMaterial(int material_id, bool fr
 
 // --------------------------------------------------------------------------- //
 // Hit payloads: p0 = t (float bits, 1e30 = miss); p1..p3 = geometric normal Ng;
-// p4..p6 = smooth shading normal Ns; p7..p9 = previous-frame world position.
+// p4..p6 = smooth shading normal Ns; p7..p9 = previous-frame world position;
+// p10 = material_id (the hit mesh's material, read from its SBT record).
 // --------------------------------------------------------------------------- //
-static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 ns, float3 pPrev)
+static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 ns,
+                                                     float3 pPrev, unsigned int mat)
 {
     optixSetPayload_0(__float_as_uint(t));
     optixSetPayload_1(__float_as_uint(ng.x));
@@ -732,11 +774,12 @@ static __forceinline__ __device__ void setHitPayload(float t, float3 ng, float3 
     optixSetPayload_7(__float_as_uint(pPrev.x));
     optixSetPayload_8(__float_as_uint(pPrev.y));
     optixSetPayload_9(__float_as_uint(pPrev.z));
+    optixSetPayload_10(mat);
 }
 
 struct Hit
 {
-    int    which;       // 0 miss, 1 cloth, 2 sphere, 3 plane (geometry dispatch)
+    int    which;       // 0 miss, 1 mesh, 2 sphere, 3 plane (geometry dispatch)
     int    prim_index;  // index into params.spheres / params.planes (which 2 / 3)
     int    material_id; // index into params.materials (shading)
     float  t;
@@ -746,26 +789,28 @@ struct Hit
     float3 prevP;   // previous-frame world position (motion vectors)
 };
 
-// Trace the cloth GAS and the analytic spheres/planes, return the nearest hit.
+// Trace the scene IAS (all mesh instances) and the analytic spheres/planes,
+// return the nearest hit.
 static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
 {
     unsigned int p0 = __float_as_uint(1e30f);
     unsigned int p1 = 0u, p2 = 0u, p3 = 0u;
     unsigned int p4 = 0u, p5 = 0u, p6 = 0u;
     unsigned int p7 = 0u, p8 = 0u, p9 = 0u;
+    unsigned int p10 = 0u;   // material_id of the hit mesh (set by closesthit)
     optixTrace(
             params.handle, o, d,
             0.0f, 1e16f, 0.0f,
             OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE,
             0, 1, 0,
-            p0, p1, p2, p3, p4, p5, p6, p7, p8, p9);
-    float t_cloth = __uint_as_float(p0);
+            p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10);
+    float t_mesh = __uint_as_float(p0);
 
     Hit h;
     h.which = 0;
     h.prim_index = -1;
     float best = 1e29f;
-    if (t_cloth < best) { best = t_cloth; h.which = 1; }
+    if (t_mesh < best) { best = t_mesh; h.which = 1; }
     for (unsigned int i = 0u; i < params.num_spheres; ++i)
     {
         Sphere sp = params.spheres[i];
@@ -785,7 +830,7 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
     h.p = o + d * best;
     if (h.which == 1)
     {
-        h.material_id = (int)params.cloth_material;
+        h.material_id = (int)p10;
         h.ng = normalize(make_float3(__uint_as_float(p1), __uint_as_float(p2), __uint_as_float(p3)));
         h.ns = normalize(make_float3(__uint_as_float(p4), __uint_as_float(p5), __uint_as_float(p6)));
         h.prevP = make_float3(__uint_as_float(p7), __uint_as_float(p8), __uint_as_float(p9));
@@ -813,7 +858,7 @@ static __forceinline__ __device__ Hit sceneIntersect(float3 o, float3 d)
 // --------------------------------------------------------------------------- //
 // Shadow / occlusion query (M4b). A binary "is anything between (o) and the
 // light in [eps, tmax]?" test, used by next-event estimation. Analytic occluders
-// are cheap closed-form tests; the cloth GAS is traced with closesthit disabled
+// are cheap closed-form tests; the mesh IAS is traced with closesthit disabled
 // and terminate-on-first-hit (anyhit is already disabled by the geometry flag),
 // so the shadow trace does no shading work. The payload is pre-seeded "occluded"
 // and only __miss__shadow (miss SBT index 1) clears it -- reached solely when the
@@ -1259,48 +1304,69 @@ extern "C" __global__ void __miss__ms()
 
 extern "C" __global__ void __miss__shadow()
 {
-    // Reached only when a shadow ray escapes to tmax with no cloth hit: mark the
+    // Reached only when a shadow ray escapes to tmax with no mesh hit: mark the
     // path to the light as unobstructed (sceneOcclude pre-seeds payload_0 = 1).
     optixSetPayload_0(0u);
 }
 
 extern "C" __global__ void __closesthit__ch()
 {
-    // Geometric normal from the triangle vertices (needs the GAS built with
-    // ALLOW_RANDOM_VERTEX_ACCESS).
+    // Per-instance mesh data (indices / normals / prev_vertices / material /
+    // transform) from this instance's SBT hitgroup record -- no Params globals, so
+    // any number of independent meshes can share this one program.
+    const HitGroupData* hg = reinterpret_cast<const HitGroupData*>(optixGetSbtDataPointer());
+
+    // Geometric normal from the triangle's object-space vertices (needs the GAS
+    // built with ALLOW_RANDOM_VERTEX_ACCESS), then object->world. Under an IAS the
+    // vertex data comes from the instance's own GAS (optixGetGASTraversableHandle).
     const unsigned int prim = optixGetPrimitiveIndex();
     const unsigned int sbtIdx = optixGetSbtGASIndex();
     float3 v[3];
-    optixGetTriangleVertexData(params.handle, prim, sbtIdx, 0.0f, v);
+    optixGetTriangleVertexData(optixGetGASTraversableHandle(), prim, sbtIdx, 0.0f, v);
     // Zero-safe: a collapsed triangle (cross == 0) would otherwise normalize to
     // NaN and poison the denoiser normal guide (see safeNormalize).
-    float3 ng = safeNormalize(cross(v[1] - v[0], v[2] - v[0]),
+    float3 ngObj = cross(v[1] - v[0], v[2] - v[0]);
+    float3 ng = safeNormalize(optixTransformNormalFromObjectToWorldSpace(ngObj),
                               make_float3(0.0f, 1.0f, 0.0f));
 
     float2 bc = optixGetTriangleBarycentrics();
     float w0 = 1.0f - bc.x - bc.y;
-    uint3 tri = params.tri_indices[prim];
+    uint3 tri = hg->indices[prim];
 
-    // Smooth shading normal from the cloth's per-vertex normals (barycentric
-    // interpolation); fall back to the geometric normal when unavailable or when
-    // the interpolated normal cancels to ~0 (opposing normals across a sharp
-    // self-collision fold -- Warp's normalize_normals emits exactly (0,0,0)
-    // there, which would make an unguarded normalize NaN).
+    // Smooth shading normal from the mesh's per-vertex normals (barycentric
+    // interpolation, then object->world); fall back to the geometric normal when
+    // unavailable or when the interpolated normal cancels to ~0 (opposing normals
+    // across a sharp self-collision fold -- Warp's normalize_normals emits exactly
+    // (0,0,0) there, which would make an unguarded normalize NaN).
     float3 ns = ng;
-    if (params.cloth_normals != 0)
+    if (hg->normals != 0)
     {
-        float3 s = params.cloth_normals[tri.x] * w0
-                 + params.cloth_normals[tri.y] * bc.x
-                 + params.cloth_normals[tri.z] * bc.y;
-        ns = safeNormalize(s, ng);
+        float3 s = hg->normals[tri.x] * w0
+                 + hg->normals[tri.y] * bc.x
+                 + hg->normals[tri.z] * bc.y;
+        ns = safeNormalize(optixTransformNormalFromObjectToWorldSpace(s), ng);
     }
 
-    // Previous-frame world position of this exact surface point: reuse the hit's
-    // barycentrics against the *previous* frame's vertex positions (same
-    // topology, same triangle index -- only the vertices moved).
-    float3 pPrev = params.prev_vertices[tri.x] * w0
-                 + params.prev_vertices[tri.y] * bc.x
-                 + params.prev_vertices[tri.z] * bc.y;
+    // Previous-frame world position of this exact surface point (motion vectors):
+    //   * deformable mesh: reuse the hit's barycentrics against the *previous*
+    //     frame's vertex positions (same topology / triangle index; only the
+    //     vertices moved), then through the previous object->world transform;
+    //   * rigid mesh: push the object-space hit point through the previous frame's
+    //     transform (vertices are static; only the instance moved).
+    float3 pPrev;
+    if (hg->prev_vertices != 0)
+    {
+        float3 objPrev = hg->prev_vertices[tri.x] * w0
+                       + hg->prev_vertices[tri.y] * bc.x
+                       + hg->prev_vertices[tri.z] * bc.y;
+        pPrev = xformPoint(hg->prev_xform, objPrev);
+    }
+    else
+    {
+        float3 objP = optixGetObjectRayOrigin()
+                    + optixGetObjectRayDirection() * optixGetRayTmax();
+        pPrev = xformPoint(hg->prev_xform, objP);
+    }
 
-    setHitPayload(optixGetRayTmax(), ng, ns, pPrev);
+    setHitPayload(optixGetRayTmax(), ng, ns, pPrev, hg->material_id);
 }

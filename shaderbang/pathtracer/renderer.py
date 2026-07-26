@@ -40,18 +40,19 @@ import warp as wp
 
 # --------------------------------------------------------------------------- #
 # Launch parameters -- MUST match the Params struct in programs.cu field-for-
-# field. align=True reproduces C struct padding: the eight 8-byte members come
-# first (offsets 0/8/.../56), then the 4-byte scalars, then the tightly packed
-# float3s (each an ('f4', (3,)) subarray == float3; float2 == ('f4', (2,))).
-# itemsize rounds up to a multiple of 8.
+# field. align=True reproduces C struct padding: the 8-byte members come first
+# (twelve pointers + the IAS handle), then the 4-byte scalars, then the tightly
+# packed float3s (each an ('f4', (3,)) subarray == float3; float2 == ('f4',
+# (2,))). itemsize rounds up to a multiple of 8. Mesh geometry moved off Params
+# into per-instance SBT hitgroup records in M7d (see _hitgroup_record_dtype).
 # --------------------------------------------------------------------------- #
 _PARAMS_NAMES = [
     "accum", "output", "albedo", "normal",
-    "prev_vertices", "tri_indices", "flow", "handle", "cloth_normals",
+    "flow", "handle",
     "env_data", "env_cdf", "materials", "lights", "spheres", "planes",
     "width", "height", "subframe", "max_depth", "rr_depth", "exposure",
     "env_width", "env_height", "env_enabled",
-    "num_materials", "cloth_material", "num_lights",
+    "num_materials", "num_lights",
     "num_spheres", "num_planes",
     "cam_eye", "cam_u", "cam_v", "cam_w",
     "prev_cam_eye", "prev_cam_u", "prev_cam_v", "prev_cam_w",
@@ -60,11 +61,11 @@ _PARAMS_NAMES = [
 ]
 _PARAMS_FORMATS = [
     "u8", "u8", "u8", "u8",
-    "u8", "u8", "u8", "u8", "u8",
+    "u8", "u8",
     "u8", "u8", "u8", "u8", "u8", "u8",
     "u4", "u4", "u4", "u4", "u4", "f4",
     "u4", "u4", "u4",
-    "u4", "u4", "u4",
+    "u4", "u4",
     "u4", "u4",
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
     ("f4", (3,)), ("f4", (3,)), ("f4", (3,)), ("f4", (3,)),
@@ -229,6 +230,43 @@ def _vec3(x, y=None, z=None):
     return (float(x), float(y), float(z))
 
 
+def _count_triangles(indices):
+    """Triangle count from a (num_tris, 3) or flat length-3N index array."""
+    shape = getattr(indices, "shape", None)
+    if shape is not None and len(shape) == 2:
+        if shape[1] != 3:
+            raise ValueError(
+                f"expected a (num_tris, 3) index array, got shape {tuple(shape)}")
+        n = int(shape[0])
+    else:
+        n_idx = int(len(indices))
+        if n_idx % 3 != 0:
+            raise ValueError(
+                f"flat index count must be a multiple of 3, got {n_idx}")
+        n = n_idx // 3
+    if n < 1:
+        raise ValueError("geometry needs at least 1 triangle")
+    return n
+
+
+def _xform12(transform):
+    """Coerce a transform into a 12-float object->world 3x4 row-major list (the
+    OptixInstance::transform layout). Accepts a length-12 sequence, a (3, 4), or a
+    (4, 4) matrix (bottom row dropped)."""
+    arr = np.asarray(transform, dtype=np.float64)
+    if arr.shape == (12,):
+        flat = arr
+    elif arr.shape == (3, 4):
+        flat = arr.reshape(-1)
+    elif arr.shape == (4, 4):
+        flat = arr[:3, :].reshape(-1)
+    else:
+        raise ValueError(
+            "transform must be 12 floats, (3, 4) or (4, 4), got shape "
+            f"{tuple(arr.shape)}")
+    return [float(x) for x in flat]
+
+
 class PathTracer:
     """OptiX path tracer over Warp-owned geometry, presented via an OpenGL PBO.
 
@@ -342,19 +380,23 @@ class PathTracer:
         self._create_denoiser()
         self._init_params()
 
-        # GAS state (populated by set_geometry / refit).
-        self._gas_handle = 0
-        self._d_gas = None
-        self._d_temp = None
-        self._d_temp_size = 0
-        self._gas_output_size = 0
-        self._vertices = None
-        self._vtx_ptr = 0
-        self._num_vertices = 0
-        self._idx_ptr = 0
-        self._num_triangles = 0
-        self._normals = None         # per-vertex smooth normals (optional)
-        self._prev_vertices = None   # previous-frame vertex snapshot (motion vec)
+        # Scene geometry state (M7d): a list of triangle meshes, each with its own
+        # GAS, assembled into a single-level IAS. Each mesh emits one SBT hitgroup
+        # record (its indices/normals/prev_vertices/material/transform); the IAS is
+        # params.handle. Populated by add_mesh / set_instance_transform / refit.
+        self._meshes = []            # list of per-mesh dicts (see add_mesh)
+        self._cloth_mesh_id = None   # set_geometry back-compat: the one deformable mesh
+        self._d_instances = None     # packed OptixInstance array on device (IAS input)
+        self._d_instances_nbytes = 0
+        self._instances_dirty = False  # a rigid transform changed -> re-upload instances
+        self._d_ias = None           # IAS output buffer
+        self._d_ias_temp = None      # IAS build/update scratch
+        self._ias_temp_size = 0
+        self._ias_output_size = 0
+        self._ias_handle = 0
+        self._d_ch = None            # hitgroup SBT records (one per instance)
+        self._ch_stride = 0
+        self._sbt_dirty = False      # a prev_xform / material changed -> re-pack records
         self._env_data = None        # HDR env-map device buffer (optional, M4c)
         self._env_cdf = None         # env-map sin(theta)-weighted CDF (optional)
 
@@ -420,6 +462,9 @@ class PathTracer:
             # a different size than the host PARAMS_DTYPE (see the static_assert
             # in programs.cu). Silent drift here is memory corruption at launch.
             f"-DPARAMS_EXPECTED_SIZE={PARAMS_DTYPE.itemsize}".encode(),
+            # Same guard for the per-instance HitGroupData: the device struct must
+            # match the SBT record's data span (record itemsize - header).
+            f"-DHITGROUP_DATA_EXPECTED_SIZE={self._hitgroup_data_size()}".encode(),
             f"-I{optix_inc}".encode(),
             f"-I{cuda_inc}".encode(),
         ]
@@ -437,8 +482,8 @@ class PathTracer:
         self._pipeline_options = optix.PipelineCompileOptions(
             usesMotionBlur=False,
             traversableGraphFlags=int(
-                optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS),
-            numPayloadValues=10,    # t + Ng(xyz) + Ns(xyz) + prev-pos(xyz)
+                optix.TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING),
+            numPayloadValues=11,    # t + Ng(xyz) + Ns(xyz) + prev-pos(xyz) + material_id
             numAttributeValues=2,   # built-in triangle barycentrics
             exceptionFlags=int(optix.EXCEPTION_FLAG_NONE),
             pipelineLaunchParamsVariableName="params",
@@ -535,19 +580,89 @@ class PathTracer:
             d.copy_from_host(ctypes.c_void_p(combined.ctypes.data), total)
             return d, dt.itemsize
 
-        self._d_rg, rg_stride = header_record(self._rg_group)
-        self._d_ms, ms_stride = header_records(
+        # Raygen + the two miss records are scene-independent and built once. The
+        # hitgroup records are one-per-instance and (re)built by
+        # _rebuild_hitgroup_sbt as meshes are added / their transforms advance, so
+        # self._sbt stays None until the first add_mesh (render() requires a mesh).
+        self._d_rg, self._rg_stride = header_record(self._rg_group)
+        self._d_ms, self._ms_stride = header_records(
             [self._ms_group, self._ms_shadow_group])
-        self._d_ch, ch_stride = header_record(self._ch_group)
+        self._sbt = None
+
+    def _hitgroup_data_dtype(self):
+        # Device HitGroupData (programs.cu): three 8-byte pointers, two uints, then
+        # a 12-float transform. align=True reproduces the C padding; itemsize == the
+        # device sizeof(HitGroupData) (80 bytes, guarded by the static_assert).
+        return np.dtype({
+            "names": ["indices", "normals", "prev_vertices",
+                      "material_id", "flags", "prev_xform"],
+            "formats": ["u8", "u8", "u8", "u4", "u4", ("f4", (12,))],
+            "align": True,
+        })
+
+    def _hitgroup_data_size(self):
+        return int(self._hitgroup_data_dtype().itemsize)
+
+    def _hitgroup_record_dtype(self):
+        # A full SBT hitgroup record: the opaque header followed by HitGroupData.
+        # The header is 32 bytes and the pointers need 8-byte alignment, so the data
+        # lands at offset 32 (== the header size) -- byte-identical to the data-only
+        # dtype above, which the device reads via optixGetSbtDataPointer(). itemsize
+        # is rounded up to SBT_RECORD_ALIGNMENT.
+        optix = self._optix
+        header_fmt = f"{optix.SBT_RECORD_HEADER_SIZE}B"
+        names = ["header", "indices", "normals", "prev_vertices",
+                 "material_id", "flags", "prev_xform"]
+        formats = [header_fmt, "u8", "u8", "u8", "u4", "u4", ("f4", (12,))]
+        base = np.dtype({"names": names, "formats": formats, "align": True})
+        itemsize = _round_up(base.itemsize, optix.SBT_RECORD_ALIGNMENT)
+        return np.dtype({
+            "names": names,
+            "formats": [base.fields[n][0] for n in names],
+            "offsets": [base.fields[n][1] for n in names],
+            "itemsize": itemsize,
+            "align": True,
+        })
+
+    def _rebuild_hitgroup_sbt(self):
+        # Pack one hitgroup record per instance (same order as the OptixInstance
+        # array, so instance i's sbtOffset=i selects record i) and (re)create the
+        # ShaderBindingTable. Called when a mesh is added or when a rigid instance's
+        # previous-frame transform / material advances (self._sbt_dirty).
+        optix = self._optix
+        cp = self._cp
+        n = len(self._meshes)
+        if n == 0:
+            self._sbt = None
+            self._sbt_dirty = False
+            return
+        dt = self._hitgroup_record_dtype()
+        recs = np.zeros(n, dtype=dt)
+        for i, m in enumerate(self._meshes):
+            one = np.zeros(1, dtype=dt)
+            optix.sbtRecordPackHeader(self._ch_group, one)
+            recs[i] = one[0]
+            recs[i]["indices"] = int(m["idx_ptr"])
+            recs[i]["normals"] = int(m["nrm_ptr"])
+            recs[i]["prev_vertices"] = int(m["prev_ptr"])
+            recs[i]["material_id"] = int(m["material_id"])
+            recs[i]["flags"] = int(m["flags"])
+            recs[i]["prev_xform"] = np.asarray(m["prev_transform"],
+                                               dtype=np.float32)
+        total = dt.itemsize * n
+        self._d_ch = cp.cuda.alloc(total)
+        self._d_ch.copy_from_host(ctypes.c_void_p(recs.ctypes.data), total)
+        self._ch_stride = dt.itemsize
         self._sbt = optix.ShaderBindingTable(
             raygenRecord=self._d_rg.ptr,
             missRecordBase=self._d_ms.ptr,
-            missRecordStrideInBytes=ms_stride,
+            missRecordStrideInBytes=self._ms_stride,
             missRecordCount=2,
             hitgroupRecordBase=self._d_ch.ptr,
-            hitgroupRecordStrideInBytes=ch_stride,
-            hitgroupRecordCount=1,
+            hitgroupRecordStrideInBytes=self._ch_stride,
+            hitgroupRecordCount=n,
         )
+        self._sbt_dirty = False
 
     # ------------------------------------------------------------------ #
     # Buffers / denoiser / params
@@ -732,12 +847,9 @@ class PathTracer:
         p["albedo"] = int(self.d_albedo.ptr)
         p["normal"] = int(self.d_normal.ptr)
         p["flow"] = int(self.d_flow.ptr)
-        # prev_vertices / tri_indices / cloth_normals are wired by set_geometry
-        # (0 until then; a 0 cloth_normals makes the device fall back to the
-        # geometric normal for shading).
-        p["prev_vertices"] = 0
-        p["tri_indices"] = 0
-        p["cloth_normals"] = 0
+        # params.handle (the scene IAS) is wired by add_mesh; 0 until the first
+        # mesh is added (render() requires one).
+        p["handle"] = 0
         p["width"] = self.width
         p["height"] = self.height
         p["max_depth"] = 4          # bounces (set_path_depth to override)
@@ -758,9 +870,10 @@ class PathTracer:
         # Material table (M7a): the scene's materials live in a device buffer
         # indexed by material_id (see add_material / _materials_to_device). The
         # three default slots reproduce the M6 look; consumers add more slots via
-        # add_material(). cloth_material maps the still-hardcoded cloth GAS to its
-        # slot (transient, removed in M7d); the sphere/ground slots are now
-        # referenced by the analytic primitives below (M7c).
+        # add_material(). self._cloth_material is the slot the set_geometry /
+        # set_cloth_* back-compat shims assign to the deformable cloth mesh (M7d:
+        # a mesh carries its material_id in its SBT record, not in Params); the
+        # sphere/ground slots are referenced by the analytic primitives below (M7c).
         self._materials_host = []
         self._d_materials = None
         self._cloth_material = self.add_material(
@@ -770,7 +883,6 @@ class PathTracer:
             (0.75, 0.2, 0.2), roughness=0.1, metallic=0.0)
         self._ground_material = self.add_material(
             (0.6, 0.6, 0.6), roughness=0.9, metallic=0.0)
-        p["cloth_material"] = self._cloth_material
         # Analytic primitive tables (M7c): spheres and planes live in device
         # buffers looped over on the device, each carrying its own material_id
         # (a sphere also carries its previous-frame center for rigid motion
@@ -1168,13 +1280,13 @@ class PathTracer:
         p["num_materials"] = len(self._materials_host)
 
     def set_cloth_albedo(self, front, back=None):
-        self.update_material(int(self._h_params[0]["cloth_material"]),
+        self.update_material(self._cloth_material,
                              base_color=front,
                              base_color_back=back if back is not None else front)
 
     def set_cloth_material(self, roughness, metallic=0.0):
         """Cloth Disney material. ``roughness`` is used directly as GGX alpha."""
-        self.update_material(int(self._h_params[0]["cloth_material"]),
+        self.update_material(self._cloth_material,
                              roughness=roughness, metallic=metallic)
 
     def set_sphere_material(self, roughness, metallic=0.0):
@@ -1196,118 +1308,264 @@ class PathTracer:
         p["rr_depth"] = min(md, 2) if rr_depth is None else max(0, int(rr_depth))
 
     # ------------------------------------------------------------------ #
-    # Geometry / acceleration structure
+    # Geometry / acceleration structure (M7d: multi-mesh IAS)
     # ------------------------------------------------------------------ #
-    def set_geometry(self, vertices, indices, normals=None):
-        """Register triangle geometry and build the GAS.
+    def _check_instancing_support(self):
+        """Fail loudly (not with a cryptic AttributeError mid-build) if the pinned
+        otk-pyoptix lacks the single-level-instancing surface M7d needs. This is
+        the plan's on-target binding gate, enforced at the first add_mesh."""
+        optix = self._optix
+        required = ["Instance", "getDeviceRepresentation",
+                    "BuildInputInstanceArray", "INSTANCE_FLAG_NONE",
+                    "TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING"]
+        missing = [name for name in required if not hasattr(optix, name)]
+        if missing:
+            raise RuntimeError(
+                "otk-pyoptix is missing the instancing bindings M7d needs: "
+                f"{', '.join(missing)}. Rebuild the pinned otk-pyoptix with the "
+                "instance-array build input exposed.")
+
+    def add_mesh(self, vertices, indices, normals=None, material_id=0,
+                 deformable=False, transform=None):
+        """Register a triangle mesh as one instance in the scene IAS; return its
+        ``mesh_id``.
 
         ``vertices`` is a ``wp.array(dtype=wp.vec3)``; ``indices`` a
         ``wp.array(dtype=wp.int32)`` of shape ``(num_tris, 3)`` (or a flat
-        length-``3*num_tris`` array). ``normals``, if given, is a
-        ``wp.array(dtype=wp.vec3)`` of per-vertex smooth normals (one per vertex)
-        used for shading; when omitted the geometric (flat) normal is used. All
-        stay owned by the caller (the physics keeps writing ``vertices`` and
-        ``normals`` in place); we only keep their pointers.
-        """
-        self._vertices = vertices          # kept for the per-frame prev snapshot
-        self._vtx_ptr = _device_ptr(vertices)
-        self._num_vertices = int(len(vertices))
-        if self._num_vertices < 3:
-            raise ValueError(
-                f"set_geometry needs at least 3 vertices, got "
-                f"{self._num_vertices}")
-        self._idx_ptr = _device_ptr(indices)
-        shape = getattr(indices, "shape", None)
-        if shape is not None and len(shape) == 2:
-            if shape[1] != 3:
-                raise ValueError(
-                    "set_geometry expects a (num_tris, 3) index array, got "
-                    f"shape {tuple(shape)}")
-            self._num_triangles = int(shape[0])
-        else:
-            n_idx = int(len(indices))
-            if n_idx % 3 != 0:
-                raise ValueError(
-                    "set_geometry expects a flat index count that is a "
-                    f"multiple of 3, got {n_idx}")
-            self._num_triangles = n_idx // 3
-        if self._num_triangles < 1:
-            raise ValueError("set_geometry needs at least 1 triangle")
+        length-``3*num_tris`` array). ``normals``, if given, is a per-vertex
+        ``wp.array(dtype=wp.vec3)`` (one per vertex) used for smooth shading;
+        omitted => geometric normal. ``material_id`` indexes the material table
+        (see add_material). ``transform`` is the object->world placement (12 floats
+        3x4 row-major, a (3,4) or a (4,4) matrix; default identity). ``deformable``
+        meshes have their vertices rewritten in place each frame (refit() rebuilds
+        the GAS + IAS, motion vectors come from a per-vertex previous snapshot);
+        rigid meshes are placed/animated via set_instance_transform (motion vectors
+        come from the previous frame's transform). The mesh keeps references to the
+        vertex / index / normal arrays so their device memory stays alive for as long
+        as the mesh does: the per-instance SBT record stores raw pointers into them
+        and closesthit dereferences those every frame."""
+        self._check_instancing_support()
 
-        # Smooth shading normals (optional). The pointer is wired once and read
-        # by the closesthit program every frame; the caller updates the contents
-        # in place. 0 => device falls back to the geometric normal. A count
-        # mismatch would make the closesthit read past the buffer (the device
-        # indexes cloth_normals by vertex id), so reject it here.
-        self._normals = normals
-        if normals is not None and int(len(normals)) != self._num_vertices:
+        num_vertices = int(len(vertices))
+        if num_vertices < 3:
+            raise ValueError(f"add_mesh needs at least 3 vertices, got "
+                             f"{num_vertices}")
+        num_triangles = _count_triangles(indices)
+        if normals is not None and int(len(normals)) != num_vertices:
             raise ValueError(
                 f"normals length ({int(len(normals))}) must match vertex count "
-                f"({self._num_vertices})")
-        self._h_params[0]["cloth_normals"] = (
-            int(_device_ptr(normals)) if normals is not None else 0)
+                f"({num_vertices})")
 
-        # Previous-frame vertex snapshot for motion vectors. The closesthit
-        # program reads params.prev_vertices[tri.xyz]; the index buffer itself
-        # doubles as uint3* (int32 triplets are bit-identical to uint3), so
-        # tri_indices just aliases the caller's index buffer.
-        self._prev_vertices = wp.zeros(self._num_vertices, dtype=wp.vec3,
-                                       device=self._device)
-        wp.copy(self._prev_vertices, self._vertices)   # frame 0: prev == current
-        self._h_params[0]["prev_vertices"] = int(self._prev_vertices.ptr)
-        self._h_params[0]["tri_indices"] = int(self._idx_ptr)
+        # Previous-frame vertex snapshot for deformable motion vectors. The
+        # closesthit reads it via the SBT record's prev_vertices pointer; rigid
+        # meshes leave it null and reconstruct the previous position from the
+        # instance transform instead.
+        if deformable:
+            prev_vertices = wp.zeros(num_vertices, dtype=wp.vec3,
+                                     device=self._device)
+            wp.copy(prev_vertices, vertices)     # frame 0: prev == current
+            prev_ptr = int(prev_vertices.ptr)
+        else:
+            prev_vertices = None
+            prev_ptr = 0
 
-        self._build_gas(update=False)
+        xform = (_xform12(transform) if transform is not None
+                 else [1.0, 0.0, 0.0, 0.0,
+                       0.0, 1.0, 0.0, 0.0,
+                       0.0, 0.0, 1.0, 0.0])
+        mesh = {
+            "vertices": vertices,
+            "vtx_ptr": int(_device_ptr(vertices)),
+            "num_vertices": num_vertices,
+            "indices": indices,   # retained: the SBT record points into it (below)
+            "idx_ptr": int(_device_ptr(indices)),
+            "num_triangles": num_triangles,
+            "normals": normals,
+            "nrm_ptr": int(_device_ptr(normals)) if normals is not None else 0,
+            "deformable": bool(deformable),
+            "prev_vertices": prev_vertices,
+            "prev_ptr": prev_ptr,
+            "material_id": int(material_id),
+            "flags": 0,
+            "transform": list(xform),
+            "prev_transform": list(xform),   # frame 0: prev == current
+            # per-mesh GAS state
+            "d_gas": None, "d_gas_temp": None,
+            "gas_temp_size": 0, "gas_output_size": 0, "gas_handle": 0,
+        }
+        self._meshes.append(mesh)
+        mesh_id = len(self._meshes) - 1
 
-    def _triangle_input(self):
+        self._build_mesh_gas(mesh, update=False)
+        self._instances_dirty = True
+        self._build_ias(update=False)          # (re)build the IAS with the new instance
+        self._rebuild_hitgroup_sbt()           # one record per instance
+        return mesh_id
+
+    def set_geometry(self, vertices, indices, normals=None):
+        """Back-compat shim (M7d): the cloth is a single deformable mesh in the
+        IAS. First call registers it; subsequent calls re-point its buffers."""
+        if self._cloth_mesh_id is None:
+            self._cloth_mesh_id = self.add_mesh(
+                vertices, indices, normals=normals,
+                material_id=self._cloth_material, deformable=True)
+        else:
+            self.update_mesh(self._cloth_mesh_id, vertices=vertices,
+                             normals=normals)
+
+    def update_mesh(self, mesh_id, vertices=None, normals=None):
+        """Re-point a mesh's vertex / normal buffers (rare: deformable meshes are
+        normally updated in place, so refit() suffices). A changed vertex buffer
+        forces a GAS rebuild; a changed normal buffer updates the SBT record."""
+        m = self._meshes[int(mesh_id)]
+        if vertices is not None:
+            if int(len(vertices)) != m["num_vertices"]:
+                raise ValueError(
+                    "update_mesh cannot change the vertex count "
+                    f"({int(len(vertices))} != {m['num_vertices']})")
+            m["vertices"] = vertices
+            m["vtx_ptr"] = int(_device_ptr(vertices))
+            if m["deformable"]:
+                wp.copy(m["prev_vertices"], vertices)
+            self._build_mesh_gas(m, update=False)
+            self._instances_dirty = True       # GAS handle may have changed
+            self._build_ias(update=False)
+        if normals is not None:
+            if int(len(normals)) != m["num_vertices"]:
+                raise ValueError(
+                    f"normals length ({int(len(normals))}) must match vertex "
+                    f"count ({m['num_vertices']})")
+            m["normals"] = normals
+            m["nrm_ptr"] = int(_device_ptr(normals))
+            self._sbt_dirty = True
+
+    def set_instance_transform(self, mesh_id, transform):
+        """Set a rigid mesh's object->world transform (12 floats 3x4 row-major, a
+        (3,4) or a (4,4) matrix). Takes effect on the next refit()/render()."""
+        m = self._meshes[int(mesh_id)]
+        if m["deformable"]:
+            raise ValueError(
+                "set_instance_transform on a deformable mesh; deformable meshes "
+                "move via their vertex buffer + refit(), not a transform")
+        m["transform"] = _xform12(transform)
+        self._instances_dirty = True
+
+    def _triangle_input(self, mesh):
         optix = self._optix
         tri = optix.BuildInputTriangleArray()
         tri.vertexFormat = optix.VERTEX_FORMAT_FLOAT3
-        tri.numVertices = self._num_vertices
-        tri.vertexBuffers = [self._vtx_ptr]
+        tri.numVertices = mesh["num_vertices"]
+        tri.vertexBuffers = [mesh["vtx_ptr"]]
         tri.vertexStrideInBytes = 12       # wp.vec3 is tightly packed (3x f32)
         tri.indexFormat = optix.INDICES_FORMAT_UNSIGNED_INT3
-        tri.numIndexTriplets = self._num_triangles
-        tri.indexBuffer = self._idx_ptr
+        tri.numIndexTriplets = mesh["num_triangles"]
+        tri.indexBuffer = mesh["idx_ptr"]
         tri.indexStrideInBytes = 12
         tri.flags = [optix.GEOMETRY_FLAG_DISABLE_ANYHIT]
         tri.numSbtRecords = 1
         return tri
 
-    def _build_flags(self):
+    def _build_flags(self, deformable):
+        # RANDOM_VERTEX_ACCESS: closesthit reads triangle vertices for the
+        # geometric normal. ALLOW_UPDATE only for deformable meshes (refit).
         optix = self._optix
-        return int(optix.BUILD_FLAG_ALLOW_UPDATE
-                   | optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS
-                   | optix.BUILD_FLAG_PREFER_FAST_TRACE)
+        flags = int(optix.BUILD_FLAG_ALLOW_RANDOM_VERTEX_ACCESS
+                    | optix.BUILD_FLAG_PREFER_FAST_TRACE)
+        if deformable:
+            flags |= int(optix.BUILD_FLAG_ALLOW_UPDATE)
+        return flags
 
-    def _build_gas(self, update):
+    def _build_mesh_gas(self, mesh, update):
         optix = self._optix
         cp = self._cp
-        tri = self._triangle_input()
+        tri = self._triangle_input(mesh)
         opts = optix.AccelBuildOptions(
-            buildFlags=self._build_flags(),
+            buildFlags=self._build_flags(mesh["deformable"]),
             operation=(optix.BUILD_OPERATION_UPDATE if update
                        else optix.BUILD_OPERATION_BUILD),
         )
         if not update:
             sizes = self._ctx.accelComputeMemoryUsage([opts], [tri])
-            self._d_temp_size = max(sizes.tempSizeInBytes,
-                                    sizes.tempUpdateSizeInBytes)
-            self._gas_output_size = sizes.outputSizeInBytes
-            self._d_temp = cp.cuda.alloc(self._d_temp_size)
-            self._d_gas = cp.cuda.alloc(self._gas_output_size)
-        self._gas_handle = self._ctx.accelBuild(
+            mesh["gas_temp_size"] = max(sizes.tempSizeInBytes,
+                                        sizes.tempUpdateSizeInBytes)
+            mesh["gas_output_size"] = sizes.outputSizeInBytes
+            mesh["d_gas_temp"] = cp.cuda.alloc(mesh["gas_temp_size"])
+            mesh["d_gas"] = cp.cuda.alloc(mesh["gas_output_size"])
+        handle = self._ctx.accelBuild(
             self._stream_ptr, [opts], [tri],
-            self._d_temp.ptr, self._d_temp_size,
-            self._d_gas.ptr, self._gas_output_size, [])
-        self._h_params[0]["handle"] = int(self._gas_handle)
+            mesh["d_gas_temp"].ptr, mesh["gas_temp_size"],
+            mesh["d_gas"].ptr, mesh["gas_output_size"], [])
+        if int(handle) != int(mesh["gas_handle"]):
+            mesh["gas_handle"] = int(handle)
+            self._instances_dirty = True       # IAS instance data references it
+
+    def _upload_instances(self):
+        # Pack the OptixInstance array (one per mesh) and upload it as the IAS
+        # build input. instance i gets instanceId=i and sbtOffset=i so its
+        # hitgroup record (index i) is selected on a hit.
+        optix = self._optix
+        cp = self._cp
+        instances = [
+            optix.Instance(
+                transform=[float(x) for x in m["transform"]],
+                instanceId=i,
+                sbtOffset=i,
+                visibilityMask=255,
+                flags=int(optix.INSTANCE_FLAG_NONE),
+                traversableHandle=int(m["gas_handle"]),
+            )
+            for i, m in enumerate(self._meshes)
+        ]
+        data = optix.getDeviceRepresentation(instances)   # packed OptixInstance bytes
+        buf = np.frombuffer(data, dtype=np.uint8)
+        if self._d_instances is None or self._d_instances_nbytes != buf.nbytes:
+            self._d_instances = cp.cuda.alloc(int(buf.nbytes))
+            self._d_instances_nbytes = int(buf.nbytes)
+        self._d_instances.copy_from_host(
+            ctypes.c_void_p(buf.ctypes.data), int(buf.nbytes))
+        self._instances_dirty = False
+
+    def _build_ias(self, update):
+        optix = self._optix
+        cp = self._cp
+        n = len(self._meshes)
+        if n == 0:
+            return
+        # A full (re)build always re-reads freshly packed instances; a refit only
+        # needs a re-upload if a rigid transform / GAS handle changed since.
+        if (not update) or self._instances_dirty:
+            self._upload_instances()
+        inst = optix.BuildInputInstanceArray(int(self._d_instances.ptr), 0, n)
+        opts = optix.AccelBuildOptions(
+            buildFlags=int(optix.BUILD_FLAG_ALLOW_UPDATE
+                           | optix.BUILD_FLAG_PREFER_FAST_TRACE),
+            operation=(optix.BUILD_OPERATION_UPDATE if update
+                       else optix.BUILD_OPERATION_BUILD),
+        )
+        if not update:
+            sizes = self._ctx.accelComputeMemoryUsage([opts], [inst])
+            self._ias_temp_size = max(sizes.tempSizeInBytes,
+                                      sizes.tempUpdateSizeInBytes)
+            self._ias_output_size = sizes.outputSizeInBytes
+            self._d_ias_temp = cp.cuda.alloc(self._ias_temp_size)
+            self._d_ias = cp.cuda.alloc(self._ias_output_size)
+        self._ias_handle = self._ctx.accelBuild(
+            self._stream_ptr, [opts], [inst],
+            self._d_ias_temp.ptr, self._ias_temp_size,
+            self._d_ias.ptr, self._ias_output_size, [])
+        self._h_params[0]["handle"] = int(self._ias_handle)
 
     def refit(self):
-        """In-place GAS update after the physics moved the vertices. Cheap
-        relative to a full rebuild; topology/counts must be unchanged."""
-        if self._d_gas is None:
-            raise RuntimeError("refit() called before set_geometry()")
-        self._build_gas(update=True)
+        """Per-frame acceleration-structure update: refit each deformable mesh's
+        GAS (vertices moved in place) then refit the IAS (child AABBs / rigid
+        transforms changed). Cheap relative to a full rebuild; topology/counts must
+        be unchanged."""
+        if not self._meshes:
+            raise RuntimeError("refit() called before add_mesh()/set_geometry()")
+        for m in self._meshes:
+            if m["deformable"]:
+                self._build_mesh_gas(m, update=True)
+        self._build_ias(update=True)
 
     # ------------------------------------------------------------------ #
     # Render
@@ -1331,15 +1589,25 @@ class PathTracer:
         one-sample-per-call behaviour. Call ``present()`` or ``download_ldr()``
         afterwards.
         """
-        if self._gas_handle == 0:
-            raise RuntimeError("render() called before set_geometry()")
+        if not self._meshes:
+            raise RuntimeError(
+                "render() called before add_mesh()/set_geometry()")
         spp = max(1, int(spp))
         if reset:
             self._subframe = 0
 
         p = self._h_params[0]
         p["exposure"] = self.exposure
-        p["handle"] = int(self._gas_handle)
+        # Pick up a rigid transform change (set_instance_transform) even when the
+        # consumer did not call refit() this frame, and re-pack the hitgroup SBT
+        # when a previous-frame transform / material advanced (_snapshot_prev,
+        # update_mesh). refit() clears _instances_dirty, so the IAS update here is
+        # a no-op when refit() already ran this frame.
+        if self._instances_dirty:
+            self._build_ias(update=True)
+        if self._sbt_dirty:
+            self._rebuild_hitgroup_sbt()
+        p["handle"] = int(self._ias_handle)
         # Upload the analytic primitive tables if they changed since the last
         # frame (add_/update_sphere/plane and _snapshot_prev only mark them
         # dirty), so the device buffers match host state at this launch.
@@ -1363,14 +1631,14 @@ class PathTracer:
         self._snapshot_prev()
 
     def _snapshot_prev(self):
-        """Freeze this frame's camera, spheres and cloth vertices as the
-        ``previous`` state the next frame's motion vectors reproject against.
+        """Freeze this frame's camera, spheres and mesh state as the ``previous``
+        state the next frame's motion vectors reproject against.
 
         Runs after the launch has consumed the *current* prev_* fields. The
-        vertex copy is issued on the render stream (the Warp default stream,
-        shared with the physics), so it is ordered strictly after this frame's
-        trace and strictly before next frame's physics overwrites the vertices
-        in place -- no extra sync, no race on the shared buffer.
+        deformable vertex copy is issued on the render stream (the Warp default
+        stream, shared with the physics), so it is ordered strictly after this
+        frame's trace and strictly before next frame's physics overwrites the
+        vertices in place -- no extra sync, no race on the shared buffer.
         """
         p = self._h_params[0]
         p["prev_cam_eye"] = tuple(p["cam_eye"])
@@ -1384,8 +1652,16 @@ class PathTracer:
             if e[4:7] != e[0:3]:
                 e[4], e[5], e[6] = e[0], e[1], e[2]
                 self._spheres_dirty = True
-        if self._prev_vertices is not None and self._vertices is not None:
-            wp.copy(self._prev_vertices, self._vertices)
+        # Advance mesh motion-vector state: deformable meshes snapshot their
+        # vertices; rigid meshes snapshot the transform actually rendered (which
+        # re-packs their hitgroup record's prev_xform before the next launch).
+        for m in self._meshes:
+            if m["deformable"]:
+                if m["prev_vertices"] is not None and m["vertices"] is not None:
+                    wp.copy(m["prev_vertices"], m["vertices"])
+            elif m["prev_transform"] != m["transform"]:
+                m["prev_transform"] = list(m["transform"])
+                self._sbt_dirty = True
         self._has_history = True
 
     def _denoise(self):
@@ -1859,14 +2135,17 @@ class PathTracer:
             "_oidn_rgba",
             "d_accum", "d_output", "d_denoised", "d_denoised2", "d_albedo",
             "d_normal", "d_flow", "d_ldr", "_d_denoised_cur",
-            "_env_data", "_env_cdf", "_prev_vertices",
+            "_env_data", "_env_cdf",
             "_d_params", "_d_rg", "_d_ms", "_d_ch",
             "_d_state", "_d_scratch", "_d_intensity", "_d_avg_color",
-            "_d_gas", "_d_temp",
+            "_d_ias", "_d_ias_temp", "_d_instances",
         ):
             if hasattr(self, attr):
                 setattr(self, attr, None)
-        self._gas_handle = 0
+        # Per-mesh GAS buffers (device allocations held in the mesh dicts) go with
+        # the list; the previous-vertex snapshots (wp.arrays) drop with them too.
+        self._meshes = []
+        self._ias_handle = 0
 
     def _destroy_optix(self, attr):
         obj = getattr(self, attr, None)
