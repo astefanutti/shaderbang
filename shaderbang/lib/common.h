@@ -117,6 +117,7 @@ struct options {
 	bool atomic_drm_mode;
 	bool surfaceless;
 	unsigned int frames;
+	bool triple_buffer;
 };
 
 typedef int (*onInitCallback)(unsigned int width, unsigned int height);

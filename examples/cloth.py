@@ -116,6 +116,8 @@ parser.add_argument("--async-page-flip", action=argparse.BooleanOptionalAction,
                     help="use async page flipping")
 parser.add_argument("--atomic-drm-mode", action=argparse.BooleanOptionalAction,
                     help="use atomic mode setting")
+parser.add_argument("--triple-buffer", action=argparse.BooleanOptionalAction,
+                    help="use triple buffering (vblank-synced page flips, without blocking on them)")
 parser.add_argument("-n", "--frames", metavar="N", type=int,
                     help="run for N frames and exit")
 

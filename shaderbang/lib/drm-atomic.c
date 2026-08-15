@@ -93,7 +93,7 @@ static int add_plane_property(drmModeAtomicReq *req, uint32_t obj_id,
 	return drmModeAtomicAddProperty(req, obj_id, prop_info->prop_id, value);
 }
 
-static int drm_atomic_commit(uint32_t fb_id, uint32_t flags)
+static int drm_atomic_commit(uint32_t fb_id, uint32_t flags, void *user_data)
 {
 	drmModeAtomicReq *req;
 	uint32_t plane_id = drm.plane->plane->plane_id;
@@ -129,7 +129,7 @@ static int drm_atomic_commit(uint32_t fb_id, uint32_t flags)
 	add_plane_property(req, plane_id, "CRTC_W", drm.mode->hdisplay);
 	add_plane_property(req, plane_id, "CRTC_H", drm.mode->vdisplay);
 
-	ret = drmModeAtomicCommit(drm.fd, req, flags, NULL);
+	ret = drmModeAtomicCommit(drm.fd, req, flags, user_data);
 
 	drmModeAtomicFree(req);
 
@@ -140,8 +140,12 @@ static void page_flip_handler(int fd, unsigned int frame,
                               unsigned int sec, unsigned int usec, void *data)
 {
 	/* suppress 'unused parameter' warnings */
-	(void) fd, (void) frame, (void) sec, (void) usec, (void) data;
+	(void) fd, (void) frame, (void) sec, (void) usec;
 	//	printf("page flip event occurred: %12.6f\n", sec + (usec / 1000000.0));
+
+	int *waiting_for_flip = data;
+	if (waiting_for_flip)
+		*waiting_for_flip = 0;
 }
 
 static int atomic_run(const struct gbm *gbm, const struct egl *egl, int (*render)(uint64_t start_time, uint frame))
@@ -239,7 +243,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl, int (*render
 		 * Here you could also update drm plane layers if you want
 		 * hw composition
 		 */
-		ret = drm_atomic_commit(fb->fb_id, flags);
+		ret = drm_atomic_commit(fb->fb_id, flags, NULL);
 		if (ret) {
 			printf("failed to commit: %s\n", strerror(errno));
 			return -1;
@@ -272,6 +276,181 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl, int (*render
 	return ret;
 }
 
+/*
+ * Triple-buffered variant of the render loop: after committing a page
+ * flip, the next frame is immediately rendered into a third buffer,
+ * instead of waiting for the flip completion event first. The pending
+ * flip is only waited for right before committing the next one (a
+ * nonblocking atomic commit returns EBUSY while another commit is
+ * still pending on the CRTC), so at most one flip is outstanding at
+ * any time. This prevents a frame whose rendering takes slightly
+ * longer than a vblank interval from quantizing the frame rate down
+ * to the next vblank multiple, without introducing tearing: flips
+ * remain synchronized to vblank.
+ */
+static int atomic_run_triple(const struct gbm *gbm, const struct egl *egl, int (*render)(uint64_t start_time, uint frame))
+{
+	/* volatile: these live across pthread_cleanup_push, which glibc
+	 * implements with setjmp, and would be clobbered otherwise: */
+	struct gbm_bo *volatile bo = NULL;
+	struct gbm_bo *volatile pending_bo = NULL;
+	struct drm_fb *fb;
+	volatile uint32_t i = 0;
+	uint64_t start_time, report_time, cur_time;
+	int waiting_for_flip = 0;
+	volatile int err = 0;
+	int ret;
+
+	volatile uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
+
+	drmEventContext evctx = {
+			.version = 4,
+			.page_flip_handler = page_flip_handler
+	};
+
+	struct flip_drain drain = {
+			.drm = &drm,
+			.waiting_for_flip = &waiting_for_flip,
+			.evctx = &evctx,
+	};
+
+	/* Allow a modeset change for the first commit only. */
+	flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+	start_time = report_time = get_time_ns();
+
+	/* Make sure a pending flip never outlives this loop, in
+	 * particular when the render thread gets cancelled: */
+	pthread_cleanup_push(drm_drain_flip, &drain);
+
+	while (drm.frames == 0 || i < drm.frames) {
+		struct gbm_bo *next_bo;
+
+		/* Start fps measuring on second frame, to remove the time spent
+		 * compiling shader, etc, from the fps:
+		 */
+		if (i == 1) {
+			start_time = report_time = get_time_ns();
+		}
+
+		/* Back-pressure: if the GBM surface has run out of free
+		 * buffers to render into, wait for the pending flip to
+		 * retire the current scan-out buffer first:
+		 */
+		if (waiting_for_flip && !gbm_surface_has_free_buffers(gbm->surface)) {
+			ret = drm_wait_flip(&drm, &waiting_for_flip, &evctx);
+			if (ret) {
+				err = ret < 0 ? ret : 0;
+				break;
+			}
+			/* the flip away from the previous scan-out buffer has
+			 * completed, release it to render on again: */
+			if (bo)
+				gbm_surface_release_buffer(gbm->surface, bo);
+			bo = pending_bo;
+			pending_bo = NULL;
+		}
+
+		ret = render(start_time, i++);
+		if (ret) {
+			err = -1;
+			break;
+		}
+
+		/* Block until all the buffered GL operations are completed.
+		 * This is required on NVIDIA GPUs, for which the DRM drivers
+		 * do not wait for the rendering to complete, upon executing
+		 * page flipping operations.
+		 */
+		glFinish();
+
+		eglSwapBuffers(egl->display, egl->surface);
+		next_bo = gbm_surface_lock_front_buffer(gbm->surface);
+		if (!next_bo) {
+			printf("Failed to lock front buffer\n");
+			err = -1;
+			break;
+		}
+		fb = drm_fb_get_from_bo(next_bo);
+		if (!fb) {
+			printf("Failed to get a new framebuffer BO\n");
+			err = -1;
+			break;
+		}
+
+		cur_time = get_time_ns();
+		if (cur_time > (report_time + 2 * NSEC_PER_SEC)) {
+			double elapsed_time = cur_time - start_time;
+			double secs = elapsed_time / (double) NSEC_PER_SEC;
+			unsigned frames = i - 1;  /* first frame ignored */
+			printf("Rendered %u frames in %f sec (%f fps)\n",
+			       frames, secs, (double) frames / secs);
+			report_time = cur_time;
+		}
+
+		/* Check for user input: */
+		struct pollfd fdset[] = {
+				{
+						.fd = STDIN_FILENO,
+						.events = POLLIN,
+				}
+		};
+		ret = poll(fdset, ARRAY_SIZE(fdset), 0);
+		if (ret > 0) {
+			printf("user interrupted!\n");
+			break;
+		}
+
+		/* Wait for the previously committed flip right before
+		 * committing the next one, keeping at most one flip
+		 * outstanding:
+		 */
+		if (waiting_for_flip) {
+			ret = drm_wait_flip(&drm, &waiting_for_flip, &evctx);
+			if (ret) {
+				err = ret < 0 ? ret : 0;
+				break;
+			}
+			/* the flip away from the previous scan-out buffer has
+			 * completed, release it to render on again: */
+			if (bo)
+				gbm_surface_release_buffer(gbm->surface, bo);
+			bo = pending_bo;
+			pending_bo = NULL;
+		}
+
+		waiting_for_flip = 1;
+		ret = drm_atomic_commit(fb->fb_id, flags, &waiting_for_flip);
+		if (ret) {
+			printf("failed to commit: %s\n", strerror(errno));
+			waiting_for_flip = 0;
+			err = -1;
+			break;
+		}
+		pending_bo = next_bo;
+
+		/* Allow a modeset change for the first commit only. */
+		flags &= ~(DRM_MODE_ATOMIC_ALLOW_MODESET);
+	}
+
+	/* drain the pending flip, if any, before returning: */
+	pthread_cleanup_pop(1);
+
+	if (pending_bo && !waiting_for_flip && bo) {
+		/* the drained flip moved scan-out away from bo: */
+		gbm_surface_release_buffer(gbm->surface, bo);
+	}
+
+	cur_time = get_time_ns();
+	double elapsed_time = cur_time - start_time;
+	double secs = elapsed_time / (double) NSEC_PER_SEC;
+	unsigned frames = i - 1;  /* first frame ignored */
+	printf("Rendered %u frames in %f sec (%f fps)\n",
+	       frames, secs, (double) frames / secs);
+
+	return err;
+}
+
 const struct drm * init_drm_atomic(int fd, const struct options *options)
 {
 	int ret;
@@ -287,6 +466,16 @@ const struct drm * init_drm_atomic(int fd, const struct options *options)
 		return NULL;
 
 	drm.run = atomic_run;
+
+	if (options->triple_buffer) {
+		if (options->async_page_flip) {
+			printf("triple buffering disabled: superseded by async page flips\n");
+		} else if (options->surfaceless) {
+			printf("triple buffering disabled: not supported in surfaceless mode\n");
+		} else {
+			drm.run = atomic_run_triple;
+		}
+	}
 
 	return &drm;
 }

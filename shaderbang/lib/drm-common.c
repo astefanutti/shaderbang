@@ -24,9 +24,11 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -120,6 +122,62 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	gbm_bo_set_user_data(bo, fb, drm_fb_destroy_callback);
 
 	return fb;
+}
+
+int drm_wait_flip(const struct drm *drm, int *waiting_for_flip, drmEventContext *evctx)
+{
+	fd_set fds;
+	int ret;
+
+	while (*waiting_for_flip) {
+		FD_ZERO(&fds);
+		FD_SET(0, &fds);
+		FD_SET(drm->fd, &fds);
+
+		ret = select(drm->fd + 1, &fds, NULL, NULL, NULL);
+		if (ret < 0) {
+			printf("select err: %s\n", strerror(errno));
+			return ret;
+		}
+		if (ret == 0) {
+			printf("select timeout!\n");
+			return -1;
+		}
+		if (FD_ISSET(0, &fds)) {
+			printf("user interrupted!\n");
+			return 1;
+		}
+		drmHandleEvent(drm->fd, evctx);
+	}
+
+	return 0;
+}
+
+void drm_drain_flip(void *data)
+{
+	struct flip_drain *drain = data;
+	int oldstate;
+
+	/* This may run as a pthread cleanup handler upon cancellation;
+	 * make sure the cancellation points below do not re-trigger. */
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
+
+	while (*drain->waiting_for_flip) {
+		fd_set fds;
+		/* a queued page flip completes within a refresh interval,
+		 * so a bounded wait is enough (and cannot hang shutdown): */
+		struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+
+		FD_ZERO(&fds);
+		FD_SET(drain->drm->fd, &fds);
+
+		if (select(drain->drm->fd + 1, &fds, NULL, NULL, &timeout) <= 0)
+			break;
+
+		drmHandleEvent(drain->drm->fd, drain->evctx);
+	}
+
+	pthread_setcancelstate(oldstate, NULL);
 }
 
 static int32_t find_crtc_for_encoder(const drmModeRes *resources,

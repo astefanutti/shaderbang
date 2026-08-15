@@ -20,6 +20,7 @@ class OPTIONS(Structure):
         ("atomic_drm_mode", c_bool),
         ("surfaceless",     c_bool),
         ("frames",          c_uint),
+        ("triple_buffer",   c_bool),
     ]
 
 
@@ -39,6 +40,8 @@ def options(args):
         c_opts.async_page_flip = c_bool(True)
     if args.atomic_drm_mode:
         c_opts.atomic_drm_mode = c_bool(True)
+    if getattr(args, "triple_buffer", False):
+        c_opts.triple_buffer = c_bool(True)
     if args.frames:
         c_opts.frames = c_uint(args.frames)
     return c_opts
