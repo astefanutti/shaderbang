@@ -74,7 +74,26 @@ struct drm_fb {
 	uint32_t fb_id;
 };
 
+/* Arguments for drm_drain_flip, packed into a single struct so it can
+ * be used as a pthread cleanup handler. */
+struct flip_drain {
+	const struct drm *drm;
+	int *waiting_for_flip;
+	drmEventContext *evctx;
+};
+
 struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
+
+/* Block until the pending page flip event has been handled, i.e. until
+ * *waiting_for_flip is cleared by the page flip handler.
+ * Returns 0 once the flip completed, 1 on user input on stdin, and a
+ * negative value on error. */
+int drm_wait_flip(const struct drm *drm, int *waiting_for_flip, drmEventContext *evctx);
+
+/* Drain the pending page flip event, if any, with a bounded wait, so a
+ * pending flip never outlives the render loop. Usable as a pthread
+ * cleanup handler; data points to a struct flip_drain. */
+void drm_drain_flip(void *data);
 
 int find_drm_device();
 
