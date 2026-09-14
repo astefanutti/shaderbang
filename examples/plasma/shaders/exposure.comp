@@ -20,9 +20,12 @@ const int   BINS = 64;
 const float LOG_MIN = -14.0;          // bin 0 = luminance 2^-14; darker pixels only count in the total
 const float LOG_MAX = 6.0;            // bin 63 = luminance 2^6 (and above)
 const float BINS_PER_EV = float(BINS) / (LOG_MAX - LOG_MIN);
-const float PERCENTILE = 0.98;        // the brightest 2 % of the pixels: the ordinary cores and sheaths; a touched
-                                      // filament (~1 % of the frame) only pushes L_p up the ordinary population, so it
-                                      // saturates white while the others dim ~2x, as in the footage
+const float GLOBE_FRACTION = 0.094;   // L_p = the luminance exceeded by this fraction of the globe's projected pixels
+                                      // (refArea, from the camera): the brightest ~9 % of the globe = the ordinary cores
+                                      // and sheaths (= the top 2 % of the frame at the default framing). Metering on the
+                                      // globe's own area keeps the exposure independent of zoom; a touched filament
+                                      // (~5 % of the globe) only pushes L_p up the ordinary population, so it saturates
+                                      // white while the others dim ~2x, as in the footage
 const float TARGET_LUM = 0.06;        // display-linear luminance of L_p (ordinary cores then peak at B ~ 240, R/B kept)
 const float L_FLOOR = 2e-4;           // no filaments yet (startup): do not expose the electrode halo to white
 
@@ -41,6 +44,7 @@ layout(std430, binding = 3) buffer ExposureBuf {
 uniform float dt;
 uniform float bias;         // EV
 uniform int   firstFrame;
+uniform float refArea;      // the globe's projected area in metered pixels
 
 #ifdef REDUCE
 layout(rgba16f, binding = 0) uniform readonly image2D hdrImg;
@@ -71,7 +75,7 @@ void main() {
 void main() {
     if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
     // walk the histogram from the top until (1 - PERCENTILE) of the pixels have been passed
-    float want = (1.0 - PERCENTILE) * float(max(ex.total, 1));
+    float want = GLOBE_FRACTION * clamp(refArea, 1.0, float(max(ex.total, 1)));
     float acc = 0.0;
     float logP = LOG_MIN;
     for (int b = BINS - 1; b >= 0; --b) {

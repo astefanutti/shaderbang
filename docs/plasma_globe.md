@@ -490,3 +490,47 @@ visible inside, and its filaments are brighter and bluer in the first third than
   swaps it, keeping node ids for the motion vectors. Not done in this pass.
 
 Per-pass render cost at the default view: trace 2.55 ms, TAAU 0.25 ms, total 3.11 ms (solo run).
+
+### Thirteenth pass — root funnels, zoom-invariant look, soft shadows (2026-09-14)
+
+Reference for the bulb: 6× zooms of the recording and of the screenshots (`/tmp/plasma_vid/zoom_*`).
+The sharpest screenshot (10-43-23, bulb radius 172 px) shows a thin saturated pink rim line, a
+dim purple haze between the roots (dimmest quartile (65,30,61) sRGB at 0–4 mm, (26,17,40) at
+10 mm; B p25 68–80 within 4 mm, 53 at 10 mm), and every filament leaving the rim as a soft funnel
+(half-max footprint 0.7–0.8 mm per crossing at 0.5–1 mm from the bulb vs 0.42 mm at 2–3 mm) whose
+skirt is several mm wide; 10-45-48 shows the funnels saturating within a bulb radius while the
+haze stays dim, a luminous face (125,82,168) and root flares covering ~40 % of the disc.
+
+* **Funnels.** Each segment record now carries a root factor `rootF = exp(−(r − R1)/4 mm)` and
+  its own CSR dilation (+2 cells within ~3.6 mm of the bulb) in the spare `.w` of the two mitre
+  normals; the tracer widens the sheath ×(1 + 2.5·rootF) and brightens it ×(1 + 3·rootF), the
+  core widens ×2.5 into the bulb (`ROOT_WIDEN`), the first span starts on the surface, and the
+  root colour blends to the neutral pink lines (`X_ION_ROOT` 0.35 over 5 mm: the flares are
+  pink-white in the footage). Bulb limb law `0.40 + 0.25(1−μ) + 10(1−μ)⁸` (luminous face, thin edge
+  line), `ELECTRODE_RGB` (0.52, 0.20, 1.0), halo ×0.05 blended magenta→violet with distance. The
+  dimmest-quartile level near the bulb is insensitive to the halo, the funnel width and even the
+  glow (one-term-off renders: 0.67 → 0.62 without half the sheath, → 0.56 without the glow): within
+  4 mm the ring is fully covered by ~30 filaments' sheaths, so it measures the sheath, not a haze.
+* **Zoom.** Two things were defined in screen pixels: the meter (top 2 % of the frame) and the
+  glow kernel (24 internal px), so zooming out re-exposed the picture and kept a touched
+  filament's bloom the same width. The meter now takes the luminance exceeded by 9.4 % of the
+  globe's *projected* pixels (`refArea` from the camera), and the glow kernel and gain scale with
+  the projected globe radius (weights interpolated in a table fitted once for 24–192 px).
+  Measured: touched core white width 16.6 px at the default distance, 7.3 px at twice the
+  distance (0.44; proportional would be 0.5); bulb face (98,59,133) vs (99,60,135), rim 218 vs 210.
+* **Soft shadows.** `rectIrradiance` takes 4 jittered points per panel per frame (pcg4d seeded
+  by pixel and frame; TAAU integrates them), each tested against the glass sphere (55 %), the bulb
+  and the base. Trace 2.55 → 2.85 ms at the default view.
+* **Research (agent on another model; web search is blocked here, the agent used OSTI, Crossref
+  and direct PDFs).** PPPL-4485 is Campanell, Laird, Provost, Vasquez, Zweben, *Measurements of the
+  Motion of Plasma Filaments in a Plasma Ball* (2010), https://www.osti.gov/servlets/purl/973080:
+  Ne+Xe 740 Torr, 26 kHz, 5 kV, ~1 mA, 6 cm × 0.5–1 mm filaments that start at the electrode
+  surface and emerge perpendicular to it; at 400 ns exposure the instantaneous intensity
+  *increases* with radius — the bright thick root is a time-integration effect, which is what a
+  camera and this renderer show; the discharge starts as a diffuse glow around the electrode out
+  of which the filaments grow; dying filaments retract into the electrode in ~0.5 ms; no footprint
+  size or halo ratio is given. Brandenburg 2017 (PSST 26 053001): anode glow + 30 µm cathode
+  layer per microdischarge, channels broaden on the dielectric. nimitz's Shadertoy XsjXRm: tendril
+  half-width ∝ 1/ramp near the electrode with brightness ∝ ramp, i.e. the flare *is* the halo, no
+  separate additive term — the same construction as the funnels above. Kim & Lin 2004: the
+  apparent thickness is HDR bleaching of the APSF glow.

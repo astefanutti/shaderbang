@@ -41,6 +41,8 @@ VIDEO_NEUTRAL = (1.00, 0.30, 0.62)   # 'video' preset: pink (feet, electrode)   
 VIDEO_ION = (0.22, 0.17, 0.75)       # 'video' preset: violet-blue shaft                    CHOSEN (footage)
 X_ION_FOOT = 0.45             # ionised-line fraction at the glass foot: pink (the footage shows magenta
                               # feet and branches under a hand, not the pure Ne I orange)
+X_ION_ROOT = 0.35            # ionised-line fraction at the bulb (pink-white root flares)
+X_ION_ROOT_LEN = 5.0e-3      # m: blend length of the root colour
 X_ION_FOOT_LEN = 8.0e-3       # blend length before the glass (m)
 I_STRIKE_REF = 3.0e-5
 CORE_RADIUS = 0.45e-3         # rendered core radius at 50 uA; r ~ I^0.4, clamped at 1.5 mm (the cross-section
@@ -370,7 +372,12 @@ def k_node_xion(node_pos: wp.array(dtype=wp.vec3), node_tree: wp.array(dtype=wp.
         return
     ik = tree_current[node_tree[i]]
     shaft = wp.clamp(0.93 + 0.05 * wp.log(wp.max(ik, 1.0e-9) / I_STRIKE_REF) / wp.log(10.0), 0.85, 0.97)
-    w = wp.clamp((R2I - wp.length(node_pos[i])) / X_ION_FOOT_LEN, 0.0, 1.0)
+    rr = wp.length(node_pos[i])
+    # the root flares are pink-white in the footage (the neutral lines of the electrode's glow
+    # region): blend towards X_ION_ROOT within X_ION_ROOT_LEN of the bulb
+    wr = wp.clamp((rr - R1) / X_ION_ROOT_LEN, 0.0, 1.0)
+    shaft = X_ION_ROOT + (shaft - X_ION_ROOT) * wr
+    w = wp.clamp((R2I - rr) / X_ION_FOOT_LEN, 0.0, 1.0)
     node_xion[i] = X_ION_FOOT + (shaft - X_ION_FOOT) * w
 
 

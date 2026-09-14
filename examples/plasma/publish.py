@@ -49,8 +49,9 @@ SEG_STRIDE = 7               # vec4 per segment record (see k_segments)
 ROOT_R = 0.011                # electrode radius (plasma.params.R1)
 ROOT_FLARE = 2.5              # extra brightness at the root (x3.5 at the bulb surface)
 ROOT_FLARE_LEN = 2.5e-3       # m: e-folding length of the root flare
-ROOT_WIDEN = 0.6              # extra core radius at the bulb surface (x1.6), e-folding ROOT_WIDEN_LEN
+ROOT_WIDEN = 1.5              # extra core radius at the bulb surface (x2.5), e-folding ROOT_WIDEN_LEN
 ROOT_WIDEN_LEN = 3.0e-3       # m
+ROOT_FUNNEL_LEN = 4.0e-3      # m: e-folding length of the sheath funnel at the root (tracer FUNNEL_*)
 GRID_N = 96
 GRID_CELLS = GRID_N * GRID_N * GRID_N
 GRID_EXTENT = R2I            # grid covers [-R2I, R2I]^3
@@ -285,8 +286,15 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
     segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, x_ion)
     segments[base + 3] = wp.vec4(q0[0], q0[1], q0[2], float(t))
     segments[base + 4] = wp.vec4(q1[0], q1[1], q1[2], float(f))
-    segments[base + 5] = wp.vec4(n_a[0], n_a[1], n_a[2], 0.0)
-    segments[base + 6] = wp.vec4(n_b[0], n_b[1], n_b[2], 0.0)
+    # root funnel factor (1 at the bulb, e-fold ROOT_FUNNEL_LEN): the tracer widens and brightens
+    # the sheath of these spans; their CSR footprint is dilated 2 more cells to hold the wider skirt
+    mid_r = wp.length(0.5 * (p0 + p1))
+    root_f = wp.exp(-(mid_r - ROOT_R) / ROOT_FUNNEL_LEN)
+    dil = float(DILATION)
+    if root_f > 0.3:
+        dil = float(DILATION + 2)
+    segments[base + 5] = wp.vec4(n_a[0], n_a[1], n_a[2], root_f)
+    segments[base + 6] = wp.vec4(n_b[0], n_b[1], n_b[2], dil)
 
 
 @wp.func
@@ -310,8 +318,8 @@ def seg_extent(a: wp.vec3, b: wp.vec3):
 
 
 @wp.func
-def in_cube(c: wp.vec3i, p: wp.vec3i) -> bool:
-    return wp.abs(c[0] - p[0]) <= DILATION and wp.abs(c[1] - p[1]) <= DILATION and wp.abs(c[2] - p[2]) <= DILATION
+def in_cube(c: wp.vec3i, p: wp.vec3i, d: int) -> bool:
+    return wp.abs(c[0] - p[0]) <= d and wp.abs(c[1] - p[1]) <= d and wp.abs(c[2] - p[2]) <= d
 
 
 @wp.kernel
@@ -327,10 +335,11 @@ def k_csr_count(segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=wp.
     pa = wp.vec3(a[0], a[1], a[2])
     pb = wp.vec3(b[0], b[1], b[2])
     lo, hi, ext = seg_extent(pa, pb)
+    dil = int(segments[SEG_STRIDE * s + 6][3])          # per-segment dilation (root funnels: +2 cells)
     if ext <= LONG_SEG_CELLS:
-        for z in range(wp.max(lo[2] - DILATION, 0), wp.min(hi[2] + DILATION, GRID_N - 1) + 1):
-            for y in range(wp.max(lo[1] - DILATION, 0), wp.min(hi[1] + DILATION, GRID_N - 1) + 1):
-                for x in range(wp.max(lo[0] - DILATION, 0), wp.min(hi[0] + DILATION, GRID_N - 1) + 1):
+        for z in range(wp.max(lo[2] - dil, 0), wp.min(hi[2] + dil, GRID_N - 1) + 1):
+            for y in range(wp.max(lo[1] - dil, 0), wp.min(hi[1] + dil, GRID_N - 1) + 1):
+                for x in range(wp.max(lo[0] - dil, 0), wp.min(hi[0] + dil, GRID_N - 1) + 1):
                     wp.atomic_add(cell_count, cell_index(wp.vec3i(x, y, z)), 1)
         return
     n = ext + 1
@@ -339,11 +348,11 @@ def k_csr_count(segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=wp.
         ck = cell_coord(pa + (pb - pa) * (float(k) / float(n)))
         if ck[0] == prev[0] and ck[1] == prev[1] and ck[2] == prev[2]:
             continue
-        for z in range(wp.max(ck[2] - DILATION, 0), wp.min(ck[2] + DILATION, GRID_N - 1) + 1):
-            for y in range(wp.max(ck[1] - DILATION, 0), wp.min(ck[1] + DILATION, GRID_N - 1) + 1):
-                for x in range(wp.max(ck[0] - DILATION, 0), wp.min(ck[0] + DILATION, GRID_N - 1) + 1):
+        for z in range(wp.max(ck[2] - dil, 0), wp.min(ck[2] + dil, GRID_N - 1) + 1):
+            for y in range(wp.max(ck[1] - dil, 0), wp.min(ck[1] + dil, GRID_N - 1) + 1):
+                for x in range(wp.max(ck[0] - dil, 0), wp.min(ck[0] + dil, GRID_N - 1) + 1):
                     c = wp.vec3i(x, y, z)
-                    if not in_cube(c, prev):
+                    if not in_cube(c, prev, dil):
                         wp.atomic_add(cell_count, cell_index(c), 1)
         prev = ck
 
@@ -361,10 +370,11 @@ def k_csr_scatter(segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=w
     pa = wp.vec3(a[0], a[1], a[2])
     pb = wp.vec3(b[0], b[1], b[2])
     lo, hi, ext = seg_extent(pa, pb)
+    dil = int(segments[SEG_STRIDE * s + 6][3])          # per-segment dilation (root funnels: +2 cells)
     if ext <= LONG_SEG_CELLS:
-        for z in range(wp.max(lo[2] - DILATION, 0), wp.min(hi[2] + DILATION, GRID_N - 1) + 1):
-            for y in range(wp.max(lo[1] - DILATION, 0), wp.min(hi[1] + DILATION, GRID_N - 1) + 1):
-                for x in range(wp.max(lo[0] - DILATION, 0), wp.min(hi[0] + DILATION, GRID_N - 1) + 1):
+        for z in range(wp.max(lo[2] - dil, 0), wp.min(hi[2] + dil, GRID_N - 1) + 1):
+            for y in range(wp.max(lo[1] - dil, 0), wp.min(hi[1] + dil, GRID_N - 1) + 1):
+                for x in range(wp.max(lo[0] - dil, 0), wp.min(hi[0] + dil, GRID_N - 1) + 1):
                     c = cell_index(wp.vec3i(x, y, z))
                     slot = cell_start[c] + wp.atomic_add(cell_fill, c, 1)
                     if slot < ITEMS_MAX:
@@ -376,11 +386,11 @@ def k_csr_scatter(segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=w
         ck = cell_coord(pa + (pb - pa) * (float(k) / float(n)))
         if ck[0] == prev[0] and ck[1] == prev[1] and ck[2] == prev[2]:
             continue
-        for z in range(wp.max(ck[2] - DILATION, 0), wp.min(ck[2] + DILATION, GRID_N - 1) + 1):
-            for y in range(wp.max(ck[1] - DILATION, 0), wp.min(ck[1] + DILATION, GRID_N - 1) + 1):
-                for x in range(wp.max(ck[0] - DILATION, 0), wp.min(ck[0] + DILATION, GRID_N - 1) + 1):
+        for z in range(wp.max(ck[2] - dil, 0), wp.min(ck[2] + dil, GRID_N - 1) + 1):
+            for y in range(wp.max(ck[1] - dil, 0), wp.min(ck[1] + dil, GRID_N - 1) + 1):
+                for x in range(wp.max(ck[0] - dil, 0), wp.min(ck[0] + dil, GRID_N - 1) + 1):
                     cc = wp.vec3i(x, y, z)
-                    if not in_cube(cc, prev):
+                    if not in_cube(cc, prev, dil):
                         c = cell_index(cc)
                         slot = cell_start[c] + wp.atomic_add(cell_fill, c, 1)
                         if slot < ITEMS_MAX:

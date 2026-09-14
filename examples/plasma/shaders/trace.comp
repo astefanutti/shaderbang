@@ -31,10 +31,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const float SHEATH_SCALE    = 3.0;        // sheath radius = SHEATH_SCALE x core radius (both grow with the current)
 const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core colour (a tint made the hue depend on the core/sheath mix per pixel: blue-purple patches along a filament)
+const float FUNNEL_WIDEN    = 2.5;        // ~3 mm wide soft bases (screenshot: broad flares where the filaments leave the bulb)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
+                                          // soft skirt several mm wide at the bulb narrowing within a bulb radius)
+const float FUNNEL_LIGHT    = 3.0;        // sheath light x(1 + FUNNEL_LIGHT * rootF) at the root (screenshot: the
+                                          // funnels saturate within a bulb radius, the haze between them stays dim)
 const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
                                           // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
 const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
-const vec3  ELECTRODE_RGB   = vec3(0.55, 0.12, 1.00); // glow discharge covering the electrode: magenta (footage rim (113,52,147) sRGB)
+const vec3  ELECTRODE_RGB   = vec3(0.52, 0.20, 1.00); // glow discharge covering the electrode: magenta-violet (screenshot face (125,82,168) sRGB)
 const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
@@ -111,6 +115,15 @@ float fresnelDielectric(float cosI, float eta) {
 }
 
 // ---- environment ---------------------------------------------------------------------------------
+// pcg4d hash (Jarzynski & Olano 2020) for the soft-shadow jitter
+void pcg4d(inout uvec4 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+    v = v ^ (v >> 16u);
+    v.x += v.y * v.w; v.y += v.z * v.x; v.z += v.x * v.y; v.w += v.y * v.z;
+}
+float rand(inout uvec4 seed) { pcg4d(seed); return float(seed.x) / float(0xffffffffu); }
+
 vec3 lineLightDiffuse(vec3 p, vec3 n);                     // defined with the line lights below
 vec3 lineLightSpecular(vec3 p, vec3 n, vec3 v, float roughness);
 
@@ -156,15 +169,19 @@ vec3 rectRadiance(vec3 p, vec3 d, float blur) {
 
 // irradiance of the panels at a point (small-source form factor), shadowed by the globe's base
 // and bulb (opaque) and dimmed through the glass sphere
-vec3 rectIrradiance(vec3 p, vec3 n) {
+const int SHADOW_SAMPLES = 4;            // jittered points per panel per frame (TAAU averages them): soft shadows
+vec3 rectIrradiance(vec3 p, vec3 n, inout uvec4 seed) {
     vec3 sum = vec3(0.0);
     for (int i = 0; i < NRECT; ++i) {
-        vec3 L = RECT_C[i] - p;
+      vec3 nl = rectNormal(i);
+      float A = 4.0 * length(RECT_U[i]) * length(RECT_V[i]);
+      for (int k = 0; k < SHADOW_SAMPLES; ++k) {
+        vec3 q = RECT_C[i] + (2.0 * rand(seed) - 1.0) * RECT_U[i] + (2.0 * rand(seed) - 1.0) * RECT_V[i];
+        vec3 L = q - p;
         float d2 = dot(L, L);
         float dist = sqrt(d2);
         L /= dist;
-        float A = 4.0 * length(RECT_U[i]) * length(RECT_V[i]);
-        float ff = A * max(dot(n, L), 0.0) * max(dot(rectNormal(i), -L), 0.0) / (d2 + 0.25 * A);
+        float ff = (A / float(SHADOW_SAMPLES)) * max(dot(n, L), 0.0) * max(dot(nl, -L), 0.0) / (d2 + 0.05 * A);
         if (ff <= 0.0) continue;
         float vis = 1.0;
         vec2 g = sphereRoots(p, L, R2O);
@@ -182,6 +199,7 @@ vec3 rectIrradiance(vec3 p, vec3 n) {
             }
         }
         sum += RECT_L[i] * ff * vis;
+      }
     }
     return sum;
 }
@@ -220,9 +238,9 @@ float baseHit(vec3 ro, vec3 rd, out vec3 n) {
 // the table: dark, slightly glossy. Lambert under the panels (with the globe's shadow) and the
 // filaments, plus a Fresnel-weighted gloss: blurred panels, the filaments as glossy line-light
 // reflections (their mirror image in the table), the globe's dark body where it blocks the panels
-vec3 tableShade(vec3 p, vec3 n, vec3 rd) {
+vec3 tableShade(vec3 p, vec3 n, vec3 rd, inout uvec4 seed) {
     vec3 albedo = vec3(0.16, 0.15, 0.14);
-    vec3 diff = albedo / PI * (rectIrradiance(p, n) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n) * 1.0);
+    vec3 diff = albedo / PI * (rectIrradiance(p, n, seed) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n) * 1.0);
     vec3 r = reflect(rd, n);
     float cosT = max(dot(n, -rd), 0.0);
     float F = 0.04 + 0.96 * pow(1.0 - cosT, 5.0);
@@ -233,9 +251,9 @@ vec3 tableShade(vec3 p, vec3 n, vec3 rd) {
     return diff + F * spec;
 }
 
-vec3 baseShade(vec3 p, vec3 n, vec3 rd) {
+vec3 baseShade(vec3 p, vec3 n, vec3 rd, inout uvec4 seed) {
     vec3 albedo = vec3(0.05, 0.05, 0.055);
-    return albedo / PI * (rectIrradiance(p, n) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n))
+    return albedo / PI * (rectIrradiance(p, n, seed) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n))
          + 0.03 * lineLightSpecular(p, n, -rd, 0.3);
 }
 
@@ -456,13 +474,16 @@ Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
             // core (5/2 profile, r_k) + the diffuse glow sheath of the channel (3/2 profile,
             // SHEATH_SCALE r_k, carrying SHEATH_FRACTION of the light: the visible halo)
             vec3 nA = seg[SEGS * s + 5].xyz, nB = seg[SEGS * s + 6].xyz;
+            float rootF = seg[SEGS * s + 5].w;                      // 1 at the bulb: the root funnel
+            float vis = CELL * seg[SEGS * s + 6].w;                 // this segment's CSR reach
             float dmin = raySegmentDist(ro, rd, t0, t1, a.xyz, b.xyz);
-            if (dmin > VIS_RADIUS) continue;
-            float window = smoothstep(VIS_RADIUS, 0.45 * VIS_RADIUS, dmin);
+            if (dmin > vis) continue;
+            float window = smoothstep(vis, 0.45 * vis, dmin);
             // core (5/2 profile, r_k) + sheath (3/2 profile, SHEATH_SCALE r_k, SHEATH_FRACTION of the
             // light), both closed-form per span and mitre-clipped at the joints
             float eCore = capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, core, 1, chainStart, chainEnd);
-            float eSheath = window * SHEATH_FRACTION * capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, SHEATH_SCALE * core, 0, chainStart, chainEnd);
+            float eSheath = window * SHEATH_FRACTION * (1.0 + FUNNEL_LIGHT * rootF)
+                          * capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, SHEATH_SCALE * core * (1.0 + FUNNEL_WIDEN * rootF), 0, chainStart, chainEnd);
             // the cooler sheath radiates more of the neutral (pink) lines than the core
             vec3 contrib = pw * eCore + pw * SHEATH_TINT * eSheath;
             r.emission += contrib;
@@ -568,6 +589,7 @@ float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
 const float HALO_REACH = 0.030;
 const vec3  HALO_RGB   = vec3(0.20, 0.08, 1.0);      // the diffuse glow around the bulb: deep violet (footage (77,52,172) sRGB at 3 mm)
 const vec3  SHEATH_RGB = vec3(0.45, 0.10, 1.00);     // the glow layer hugging the electrode: violet-magenta (footage (85,45,167) at 1 mm)
+const vec3  HALO_NEAR_RGB = vec3(0.60, 0.15, 1.00);  // the haze between the roots within a few mm: violet-magenta (screenshots: (22,16,48) to (60,29,60))
 vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
     vec2 reach = sphereRoots(ro, rd, R1 + HALO_REACH);
     if (reach.y <= t0) return vec3(0.0);
@@ -593,7 +615,10 @@ vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
             float q2 = q * q;
             float halo = q2 * q2;                                        // (R1/r)^4
             float sheath = exp(-(r - R1) / 0.0012);                      // electrode sheath, ~1 mm
-            sum += (halo * HALO_RGB * 0.15 + sheath * SHEATH_RGB * 0.6) * dt;   // footage: the rim glow continues ~1 mm outside the bulb, deep violet beyond
+            // the haze is the bulb's magenta within a few mm and violet beyond (screenshot: (60,29,60) sRGB
+            // between the roots at 2-4 mm, (26,17,40) at 10 mm)
+            vec3 haloCol = mix(HALO_RGB, HALO_NEAR_RGB, exp(-(r - R1) / 0.004));
+            sum += (halo * haloCol * 0.05 + sheath * SHEATH_RGB * 0.6) * dt;   // the funnels carry the light; the haze is dim (screenshot p25 B 70-80)
         }
     }
     return sum * iTot;
@@ -682,6 +707,7 @@ vec2 project(mat4 m, vec3 p) {
 
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    uvec4 seed = uvec4(uint(pix.x), uint(pix.y), uint(flags.z), 17u);     // per-pixel, per-frame: soft-shadow jitter
     ivec2 res = ivec2(jitterRes.zw);
     if (pix.x >= res.x || pix.y >= res.y) return;
     vec2 ndc = (vec2(pix) + 0.5 + jitterRes.xy) / vec2(res) * 2.0 - 1.0;
@@ -831,7 +857,9 @@ void main() {
                     float mu = abs(dot(rdGas, nE));
                     // limb brightening of a thin luminous shell: dark centre, bright rim (the
                     // photos show the electrode as a pink ring around a dark ball)
-                    float grazing = 0.004 + 0.5 * (1.0 - mu) + 8.0 * pow(1.0 - mu, 4.0);   // thin bright rim, dark ball
+                    // a luminous face with a modest limb (screenshot: the ring 1 mm inside the edge is only ~1.5x
+                    // the face; the bright collar around the bulb is the root funnels, not the rim)
+                    float grazing = 0.40 + 0.25 * (1.0 - mu) + 10.0 * pow(1.0 - mu, 8.0);   // face 0.4, a thin bright edge line
                     // the glow discharge over the bulb intensifies with the strongest attached channel
                     // (footage: the ball turns bright pink all over under a touch while I_tot barely
                     // moves): sheath gain = sum of (I_k / 50 uA)^2.5 over the roots, 1 for ~30 x 40 uA
@@ -864,7 +892,7 @@ void main() {
                             float tT = (rdOut.y < -1e-6) ? (TABLE_Y - pX.y) / rdOut.y : -1.0;
                             if (tT > 0.0) {
                                 vec3 pT = pX + rdOut * tT;
-                                through = (1.0 - Fx) * tableShade(pT, vec3(0.0, 1.0, 0.0), rdOut);
+                                through = (1.0 - Fx) * tableShade(pT, vec3(0.0, 1.0, 0.0), rdOut, seed);
                             } else {
                                 through = (1.0 - Fx) * roomRadiance(pX, rdOut);
                             }
@@ -895,11 +923,11 @@ void main() {
         }
     } else if (tBase > 0.0) {
         vec3 pB = ro + rd * tBase;
-        hdr = baseShade(pB, nBase, rd);
+        hdr = baseShade(pB, nBase, rd, seed);
         layer = 0.0; hitDist = tBase; mvPointCur = pB; mvPointPrev = pB; haveMv = true;
     } else if (tTable > 0.0) {
         vec3 pT = ro + rd * tTable;
-        hdr = tableShade(pT, vec3(0.0, 1.0, 0.0), rd);
+        hdr = tableShade(pT, vec3(0.0, 1.0, 0.0), rd, seed);
         layer = 0.0; hitDist = tTable; mvPointCur = pT; mvPointPrev = pT; haveMv = true;
     } else {
         hdr = roomRadiance(ro, rd);

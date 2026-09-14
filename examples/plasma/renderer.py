@@ -36,6 +36,9 @@ from plasma.circuit import SIG_MAX, F_MAX
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 GLOW_LEVELS = 6
+GLOW_TABLE_PX = (24, 32, 48, 64, 96, 128, 192)   # glow kernels fitted once; interpolated with the zoom
+R2O_M = 0.0775                                   # plasma.params.R2O: the globe's outer radius (m)
+GLOBE_REF_FRACTION = 0.347                       # projected globe radius / internal height at the reference framing
 HALTON_PHASES = 32
 DEFAULT_GLOW_WEIGHTS = (0.55, 0.40, 0.28, 0.20, 0.14, 0.10)
 
@@ -181,6 +184,10 @@ class Renderer(Input):
         self.state_fn = state_fn
         self.debug_fn = debug_fn
         self.args = args
+        self._glow_table = None
+        self._glow_kernel_now = 24.0
+        self._glow_gain_scale = 1.0
+        self.ref_area = 1.0
         self.knobs = {"glow_width": 24.0, "exposure_bias": 0.0, "glow_gain": 0.4, "rad_scale": 60.0,
                       "ambient_gain": 0.0, "look": 0.0, "tonemap": 1.0, "exposure": 0.0}
         # look 1 = nimitz shading; tonemap 1 = camera clip (0 = AgX); exposure > 0 = fixed (0 = metered)   # glow: a tight camera PSF; the halo is the physical sheath   # glow width = APSF kernel radius (internal px); ambient = volume glow gain
@@ -260,6 +267,25 @@ class Renderer(Input):
         for name in ("trace", "glow", "exposure", "taau", "present", "upload"):
             self.timers[name] = TimerQuery(name)
         self._sigma_pack_kernel = _k_pack_sigma
+
+    def _glow_weights_for(self, kernel_px):
+        """Pyramid weights for a glow kernel, interpolated in a table fitted once (a fit costs ~15 ms)."""
+        if self._glow_table is None:
+            try:
+                from plasma.apsf import pyramid_weights_default
+                self._glow_table = [(k, list(pyramid_weights_default(GLOW_LEVELS, k))) for k in GLOW_TABLE_PX]
+            except Exception:
+                self._glow_table = []
+        if not self._glow_table:
+            return list(self.glow_weights)
+        ks = [k for k, _ in self._glow_table]
+        if kernel_px <= ks[0]:
+            return list(self._glow_table[0][1])
+        for (k0, w0), (k1, w1) in zip(self._glow_table, self._glow_table[1:]):
+            if kernel_px <= k1:
+                f = (kernel_px - k0) / (k1 - k0)
+                return [a + (b - a) * f for a, b in zip(w0, w1)]
+        return list(self._glow_table[-1][1])
 
     def set_glow_width(self, kernel_px):
         """Glow width knob = APSF kernel radius (internal pixels, 24-195): refit the pyramid weights."""
@@ -352,6 +378,22 @@ class Renderer(Input):
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT)
         t.end()
 
+        # ---- zoom: the globe's projected radius in internal pixels drives the meter's reference
+        # area and the glow kernel/gain, so widths and brightness scale with the camera distance
+        # (a fixed-pixel glow and a frame-wide meter made a touched filament and the bulb's halo
+        # look the same at any zoom)
+        cam_basis = self.camera.basis()
+        eye_p = np.asarray(cam_basis[0], np.float64); cv_p = np.asarray(cam_basis[2], np.float64)
+        dist = max(float(np.linalg.norm(eye_p)), 1e-3)
+        r_px = (R2O_M / dist) / max(float(np.linalg.norm(cv_p)), 1e-6) * (self.ih / 2.0)
+        self.ref_area = float(np.pi * r_px * r_px)
+        zoom = r_px / (GLOBE_REF_FRACTION * self.ih)
+        self._glow_gain_scale = min(1.0, zoom)
+        kernel = float(min(max(self.knobs["glow_width"] * zoom, 24.0), 192.0))
+        if abs(kernel - self._glow_kernel_now) > 0.06 * self._glow_kernel_now:
+            self.glow_weights = self._glow_weights_for(kernel)
+            self._glow_kernel_now = kernel
+
         # ---- P2 glow pyramid
         t = self.timers["glow"]; t.begin()
         if flags.glow:
@@ -394,6 +436,7 @@ class Renderer(Input):
         glUseProgram(self.prog_exposure_resolve)
         glUniform1f(glGetUniformLocation(self.prog_exposure_resolve, "dt"), 1.0 / 60.0)
         glUniform1f(glGetUniformLocation(self.prog_exposure_resolve, "bias"), float(self.knobs["exposure_bias"]))
+        glUniform1f(glGetUniformLocation(self.prog_exposure_resolve, "refArea"), float(self.ref_area))
         glUniform1i(glGetUniformLocation(self.prog_exposure_resolve, "firstFrame"), 1 if self.first_frame else 0)
         glDispatchCompute(1, 1, 1)
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
@@ -430,7 +473,7 @@ class Renderer(Input):
         glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, self.tex_noise)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, self.ssbo_exposure)
         glUniform1f(glGetUniformLocation(self.prog_present, "glowGain"),
-                    float(self.knobs["glow_gain"]) if flags.glow else 0.0)
+                    float(self.knobs["glow_gain"]) * self._glow_gain_scale if flags.glow else 0.0)
         glUniform1i(glGetUniformLocation(self.prog_present, "debugView"), 1 if self.debug_fn() == 1 else 0)
         glUniform1i(glGetUniformLocation(self.prog_present, "passthrough"), 1 if int(self.knobs["look"]) == 1 else 0)
         glUniform1i(glGetUniformLocation(self.prog_present, "tonemapMode"), int(self.knobs["tonemap"]))
