@@ -454,3 +454,39 @@ bulb face (158,110,201); touched core white 19 px. Solo timing (headless, 4K, 30
 median 4.13 ms, p99 5.72 ms. Not yet matched: the recording's hand is a whole palm (a 3–5 cm pink
 patch on the glass) where ours is one finger point, its bulb is translucent with the support rod
 visible inside, and its filaments are brighter and bluer in the first third than near the glass.
+
+### Twelfth pass — roots, room lighting, second recording, re-strike rate (2026-09-14)
+
+* **Roots.** The channels hovered a gap above the bulb: the root node sits at R1 + h and the first
+  span started there. The first span now starts on the bulb surface (`publish.k_segments`, parent
+  = root), the core widens ×1.6 into the bulb over 3 mm (`ROOT_WIDEN`) on top of the ×3.5 flare, and
+  the glow layer around the bulb was recoloured from the recording's radial profile (medians per
+  mm from the surface: rim (113,52,147) → (118,63,180) at the surface → (85,45,167) at 1 mm →
+  (77,52,172) at 3 mm → (48,29,124) at 8 mm): the electrode sheath is violet-magenta (0.45, 0.10,
+  1.0) ×0.6, the (R1/r)⁴ halo deep violet (0.20, 0.08, 1.0) ×0.15, `ELECTRODE_RGB` (0.55, 0.12, 1.0).
+  Ours after: (152,90,213) / (109,81,169) / (95,72,150) / (77,60,122) / (56,44,92) — the levels match,
+  the halo between filaments is still greyer than the recording's (G/B 0.49 vs 0.30). Wikipedia's
+  plasma-globe article (fetched; the PPPL report is not in `papers/`) adds only that each tendril
+  competes for a footprint on the inner electrode with a thin dark boundary around it.
+* **Room.** Three rectangular panel lights (key, fill, rim: centre / half-axes / radiance constants
+  in `trace.comp`) replace the soft window: mirrored in the glass (branch A), diffuse on a dark
+  glossy table (`tableShade`: small-source form factor with the globe's base and bulb as shadow
+  casters and the glass at 55 % transmission; Fresnel-weighted gloss = blurred panels, the globe's
+  dark body, and the filaments as glossy line-light reflections), a 5 cm black base under the
+  globe (`baseHit`/`baseShade`). Trace 1.74 → 2.55 ms at the default view (the table shading).
+* **Second recording** (`Screencast from 2026-09-14 21-07-51.webm`, 1328×1201, variable rate,
+  55 s; the same globe from further back). Dilated (1.5 mm) overlap 0.56–0.68 / 0.45–0.48 /
+  0.30–0.37 at ~67 / 100 / 200 ms, consistent with the first recording and with the sim's
+  0.61 / 0.53 / 0.24. Its colours are pinker and dimmer (ordinary peaks R/B ≈ 0.8 vs 0.6): a
+  different white balance/exposure of the same globe — the first, closer recording stays the
+  colour reference.
+* **Re-striking every frame.** Tried by shortening the Poisson timer: mean 0.25 s → 30 attached,
+  3.5 re-routes per filament per second; 0.1 s → 16 attached; 0.05 s → 6 attached. The total
+  re-route throughput saturates at ~90 per second whatever the timer, because a regrowth takes 2–3
+  frames at S_MAX = 16 steps (2.4 cm per frame) and a regrowing tree carries no current, so the
+  population collapses. Per-frame re-striking needs same-frame regrowth: either S_MAX ≈ 48 (a 6 cm
+  channel in one frame; growth is ~half of the 1.8 ms sim graph, so ~+2 ms), or a dedicated
+  "regrow in place" kernel that rebuilds a channel along its hot-channel memory in one launch and
+  swaps it, keeping node ids for the motion vectors. Not done in this pass.
+
+Per-pass render cost at the default view: trace 2.55 ms, TAAU 0.25 ms, total 3.11 ms (solo run).

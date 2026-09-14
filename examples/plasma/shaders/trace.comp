@@ -34,7 +34,7 @@ const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core
 const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
                                           // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
 const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
-const vec3  ELECTRODE_RGB   = vec3(0.55, 0.17, 1.00); // glow discharge covering the electrode: magenta (footage rim (118,71,157) sRGB)
+const vec3  ELECTRODE_RGB   = vec3(0.55, 0.12, 1.00); // glow discharge covering the electrode: magenta (footage rim (113,52,147) sRGB)
 const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
@@ -111,12 +111,132 @@ float fresnelDielectric(float cosI, float eta) {
 }
 
 // ---- environment ---------------------------------------------------------------------------------
-vec3 roomRadiance(vec3 d) {
-    // a dim room: warm floor bounce, cool ceiling, one soft window at +x
+vec3 lineLightDiffuse(vec3 p, vec3 n);                     // defined with the line lights below
+vec3 lineLightSpecular(vec3 p, vec3 n, vec3 v, float roughness);
+
+// ---- the room: a dark gradient plus three rectangular panel lights (key, fill, rim) that show
+// up as reflections in the glass, light the table and cast the globe's shadow on it, so the
+// scene reads while the camera moves. Panels: centre, half-axes (m), radiance (linear).
+const int   NRECT = 3;
+const vec3  RECT_C[3] = vec3[3](vec3(-0.55, 0.50, 0.45), vec3(0.65, 0.25, 0.30), vec3(0.15, 0.65, -0.60));
+const vec3  RECT_U[3] = vec3[3](vec3(0.22, 0.0, -0.16), vec3(0.16, 0.0, 0.18), vec3(0.30, 0.0, 0.0));
+const vec3  RECT_V[3] = vec3[3](vec3(0.0, 0.16, 0.0), vec3(0.0, 0.12, 0.0), vec3(0.0, 0.10, 0.0));
+const vec3  RECT_L[3] = vec3[3](vec3(2.4, 2.2, 2.0), vec3(0.85, 0.95, 1.4), vec3(1.2, 1.0, 1.5));
+const float TABLE_GLOSS = 0.10;          // tan of the table's glossy cone half angle
+const float BASE_R = 0.05, BASE_H = 0.03; // the dark base the globe sits on
+
+vec3 roomBase(vec3 d) {
     float up = d.y * 0.5 + 0.5;
-    vec3 base = mix(vec3(0.007, 0.0056, 0.005), vec3(0.0035, 0.0042, 0.0063), up);   // the footage: a dark room
-    float window = smoothstep(0.75, 0.95, dot(d, normalize(vec3(1.0, 0.35, 0.2))));
-    return base + window * vec3(0.30, 0.32, 0.36);
+    return mix(vec3(0.007, 0.0056, 0.005), vec3(0.0035, 0.0042, 0.0063), up);       // the footage: a dark room
+}
+
+vec3 rectNormal(int i) {
+    vec3 n = normalize(cross(RECT_U[i], RECT_V[i]));
+    return dot(n, RECT_C[i]) > 0.0 ? -n : n;                                         // faces the globe
+}
+
+// radiance of the panels along a ray (blur = tan of the cone half angle for glossy lookups)
+vec3 rectRadiance(vec3 p, vec3 d, float blur) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < NRECT; ++i) {
+        vec3 n = rectNormal(i);
+        float dn = dot(d, n);
+        if (dn >= 0.0) continue;
+        float t = dot(RECT_C[i] - p, n) / dn;
+        if (t <= 0.0) continue;
+        vec3 q = p + d * t - RECT_C[i];
+        float su = dot(q, RECT_U[i]) / dot(RECT_U[i], RECT_U[i]);
+        float sv = dot(q, RECT_V[i]) / dot(RECT_V[i], RECT_V[i]);
+        float eu = max(blur * t / length(RECT_U[i]), 0.02), ev = max(blur * t / length(RECT_V[i]), 0.02);
+        float w = (1.0 - smoothstep(1.0 - eu, 1.0 + eu, abs(su))) * (1.0 - smoothstep(1.0 - ev, 1.0 + ev, abs(sv)));
+        sum += RECT_L[i] * w;
+    }
+    return sum;
+}
+
+// irradiance of the panels at a point (small-source form factor), shadowed by the globe's base
+// and bulb (opaque) and dimmed through the glass sphere
+vec3 rectIrradiance(vec3 p, vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < NRECT; ++i) {
+        vec3 L = RECT_C[i] - p;
+        float d2 = dot(L, L);
+        float dist = sqrt(d2);
+        L /= dist;
+        float A = 4.0 * length(RECT_U[i]) * length(RECT_V[i]);
+        float ff = A * max(dot(n, L), 0.0) * max(dot(rectNormal(i), -L), 0.0) / (d2 + 0.25 * A);
+        if (ff <= 0.0) continue;
+        float vis = 1.0;
+        vec2 g = sphereRoots(p, L, R2O);
+        if (g.x > 0.0 && g.x < dist) vis *= 0.55;                                    // through the glass
+        vec2 b = sphereRoots(p, L, R1);
+        if (b.x > 0.0 && b.x < dist) vis = 0.0;                                      // the bulb
+        // the base cylinder (side only; the table point is below its top)
+        float a2 = L.x * L.x + L.z * L.z;
+        if (a2 > 1e-9) {
+            float bq = p.x * L.x + p.z * L.z, cq = p.x * p.x + p.z * p.z - BASE_R * BASE_R;
+            float h = bq * bq - a2 * cq;
+            if (h > 0.0) {
+                float t0 = (-bq - sqrt(h)) / a2;
+                if (t0 > 0.0 && t0 < dist && (p.y + L.y * t0) < TABLE_Y + BASE_H) vis = 0.0;
+            }
+        }
+        sum += RECT_L[i] * ff * vis;
+    }
+    return sum;
+}
+
+vec3 roomRadiance(vec3 p, vec3 d) {
+    return roomBase(d) + rectRadiance(p, d, 0.0);
+}
+
+// the base under the globe: a dark cylinder from the table up BASE_H; returns t (or -1) and n
+float baseHit(vec3 ro, vec3 rd, out vec3 n) {
+    float best = -1.0;
+    n = vec3(0.0, 1.0, 0.0);
+    float top = TABLE_Y + BASE_H;
+    if (abs(rd.y) > 1e-9) {                                                          // top disc
+        float t = (top - ro.y) / rd.y;
+        vec3 q = ro + rd * t;
+        if (t > 0.0 && q.x * q.x + q.z * q.z <= BASE_R * BASE_R) best = t;
+    }
+    float a = rd.x * rd.x + rd.z * rd.z;                                             // side
+    if (a > 1e-12) {
+        float b = ro.x * rd.x + ro.z * rd.z, c = ro.x * ro.x + ro.z * ro.z - BASE_R * BASE_R;
+        float h = b * b - a * c;
+        if (h > 0.0) {
+            float t = (-b - sqrt(h)) / a;
+            float y = ro.y + rd.y * t;
+            if (t > 0.0 && y > TABLE_Y && y < top && (best < 0.0 || t < best)) {
+                best = t;
+                vec3 q = ro + rd * t;
+                n = normalize(vec3(q.x, 0.0, q.z));
+            }
+        }
+    }
+    return best;
+}
+
+// the table: dark, slightly glossy. Lambert under the panels (with the globe's shadow) and the
+// filaments, plus a Fresnel-weighted gloss: blurred panels, the filaments as glossy line-light
+// reflections (their mirror image in the table), the globe's dark body where it blocks the panels
+vec3 tableShade(vec3 p, vec3 n, vec3 rd) {
+    vec3 albedo = vec3(0.16, 0.15, 0.14);
+    vec3 diff = albedo / PI * (rectIrradiance(p, n) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n) * 1.0);
+    vec3 r = reflect(rd, n);
+    float cosT = max(dot(n, -rd), 0.0);
+    float F = 0.04 + 0.96 * pow(1.0 - cosT, 5.0);
+    vec3 panels = rectRadiance(p, r, TABLE_GLOSS);
+    vec2 g = sphereRoots(p, r, R2O);
+    if (g.x > 0.0) panels *= 0.12;                                                    // the globe's body in the reflection
+    vec3 spec = panels + roomBase(r) + (flags.y == 1 ? 0.85 * lineLightSpecular(p, n, -rd, 0.20) : vec3(0.0));
+    return diff + F * spec;
+}
+
+vec3 baseShade(vec3 p, vec3 n, vec3 rd) {
+    vec3 albedo = vec3(0.05, 0.05, 0.055);
+    return albedo / PI * (rectIrradiance(p, n) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n))
+         + 0.03 * lineLightSpecular(p, n, -rd, 0.3);
 }
 
 // ---- line lights (Karis / UE4 2013, eq. 15-16 diffuse, representative point specular) -----------
@@ -446,8 +566,8 @@ float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
 // 1/r^4 tail is integrated over the ray's overlap with r < R1 + HALO_REACH by 16 samples split at
 // the closest approach (denser near the electrode).
 const float HALO_REACH = 0.030;
-const vec3  HALO_RGB   = vec3(0.62, 0.42, 1.0);      // Xe / Ne+ diffuse violet
-const vec3  SHEATH_RGB = vec3(1.00, 0.45, 0.75);     // the pink sheath layer on the electrode
+const vec3  HALO_RGB   = vec3(0.20, 0.08, 1.0);      // the diffuse glow around the bulb: deep violet (footage (77,52,172) sRGB at 3 mm)
+const vec3  SHEATH_RGB = vec3(0.45, 0.10, 1.00);     // the glow layer hugging the electrode: violet-magenta (footage (85,45,167) at 1 mm)
 vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
     vec2 reach = sphereRoots(ro, rd, R1 + HALO_REACH);
     if (reach.y <= t0) return vec3(0.0);
@@ -473,7 +593,7 @@ vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
             float q2 = q * q;
             float halo = q2 * q2;                                        // (R1/r)^4
             float sheath = exp(-(r - R1) / 0.0012);                      // electrode sheath, ~1 mm
-            sum += (halo * HALO_RGB * 0.05 + sheath * SHEATH_RGB * 0.3) * dt;
+            sum += (halo * HALO_RGB * 0.15 + sheath * SHEATH_RGB * 0.6) * dt;   // footage: the rim glow continues ~1 mm outside the bulb, deep violet beyond
         }
     }
     return sum * iTot;
@@ -580,8 +700,11 @@ void main() {
     int candTotal = 0;
 
     vec2 outer = sphereRoots(ro, rd, R2O);
-    // table plane
+    // table plane and the base the globe sits on (whichever of them or the glass is nearest)
     float tTable = (rd.y < -1e-6) ? (TABLE_Y - ro.y) / rd.y : -1.0;
+    vec3 nBase;
+    float tBase = baseHit(ro, rd, nBase);
+    if (tBase > 0.0 && outer.x > 0.0 && tBase < outer.x) outer = vec2(-1.0);        // the base in front of the glass
 
     if (int(knobs.w) == 1) {
         // ---- nimitz look: straight rays through the sphere, his colours, no tonemapping
@@ -633,7 +756,7 @@ void main() {
 
         // A: outer reflection
         vec3 rA = reflect(rd, nO);
-        vec3 radA = roomRadiance(rA);
+        vec3 radA = roomRadiance(pO, rA);
         if (flags.y == 1) radA += lineLightSpecular(pO, nO, -rd, 0.04);
         hdr += Fo * radA;
 
@@ -701,7 +824,7 @@ void main() {
                     // dark centre with a bright rim and bright attachment points)
                     vec3 albedo = vec3(0.006);
                     vec3 lit = albedo * (flags.y == 1 ? lineLightDiffuse(pEnd, nE) : vec3(0.0)) / PI
-                             + 0.06 * lineLightSpecular(pEnd, nE, -rdGas, 0.12) + roomRadiance(reflect(rdGas, nE)) * 0.015;   // a glassy bulb: soft filament reflections
+                             + 0.06 * lineLightSpecular(pEnd, nE, -rdGas, 0.12) + roomRadiance(pEnd, reflect(rdGas, nE)) * 0.015;   // a glassy bulb: soft filament reflections
                     // the glow discharge covers the electrode: an emissive surface, brightness with the
                     // total current, brighter at grazing view (thin luminous layer seen edge on)
                     // a translucent luminous shell: bright rim (limb brightening), darker centre
@@ -741,10 +864,9 @@ void main() {
                             float tT = (rdOut.y < -1e-6) ? (TABLE_Y - pX.y) / rdOut.y : -1.0;
                             if (tT > 0.0) {
                                 vec3 pT = pX + rdOut * tT;
-                                vec3 lit = vec3(0.35, 0.33, 0.30) * (flags.y == 1 ? lineLightDiffuse(pT, vec3(0.0, 1.0, 0.0)) : vec3(0.0)) / PI;
-                                through = (1.0 - Fx) * (lit + vec3(0.35, 0.33, 0.30) * roomRadiance(vec3(0.0, 1.0, 0.0)) * 0.1);
+                                through = (1.0 - Fx) * tableShade(pT, vec3(0.0, 1.0, 0.0), rdOut);
                             } else {
-                                through = (1.0 - Fx) * roomRadiance(rdOut);
+                                through = (1.0 - Fx) * roomRadiance(pX, rdOut);
                             }
                         }
                         hdr += wGas * (1.0 - Ff) * tint * tint2 * through;
@@ -761,24 +883,26 @@ void main() {
                     float wC = wGas * Ff;
                     hdr += wC * tint * em2;
                     emissive += wC * tint * em2;
-                    hdr += wC * tint * 0.5 * roomRadiance(rdC) * 0.2;   // terminate with a dim ambient
+                    hdr += wC * tint * 0.1 * roomBase(rdC);            // terminate with a dim ambient
                     if (in2.capped) atomicAdd(flagged, 1);
                     candTotal += in2.candidates;
                 }
                 if (bestLumAll > 0.02) { layer = 3.0 + (layer - floor(layer)); hitDist = tO + glassPath + in1.bestT; }
             } else {
                 // TIR at the inner surface (grazing): treat as glass-only
-                hdr += wB * tint * roomRadiance(rdG);
+                hdr += wB * tint * roomRadiance(pO, rdG);
             }
         }
+    } else if (tBase > 0.0) {
+        vec3 pB = ro + rd * tBase;
+        hdr = baseShade(pB, nBase, rd);
+        layer = 0.0; hitDist = tBase; mvPointCur = pB; mvPointPrev = pB; haveMv = true;
     } else if (tTable > 0.0) {
         vec3 pT = ro + rd * tTable;
-        vec3 n = vec3(0.0, 1.0, 0.0);
-        vec3 albedo = vec3(0.12, 0.11, 0.10);        // a dark table: the footage shows nothing below the globe
-        hdr = albedo * ((flags.y == 1 ? lineLightDiffuse(pT, n) : vec3(0.0)) / PI + roomRadiance(n) * 0.1);
+        hdr = tableShade(pT, vec3(0.0, 1.0, 0.0), rd);
         layer = 0.0; hitDist = tTable; mvPointCur = pT; mvPointPrev = pT; haveMv = true;
     } else {
-        hdr = roomRadiance(rd);
+        hdr = roomRadiance(ro, rd);
         layer = 0.0; hitDist = 1e4;
         mvPointCur = ro + rd * 100.0; mvPointPrev = mvPointCur; haveMv = true;
     }

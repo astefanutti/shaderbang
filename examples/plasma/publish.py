@@ -49,6 +49,8 @@ SEG_STRIDE = 7               # vec4 per segment record (see k_segments)
 ROOT_R = 0.011                # electrode radius (plasma.params.R1)
 ROOT_FLARE = 2.5              # extra brightness at the root (x3.5 at the bulb surface)
 ROOT_FLARE_LEN = 2.5e-3       # m: e-folding length of the root flare
+ROOT_WIDEN = 0.6              # extra core radius at the bulb surface (x1.6), e-folding ROOT_WIDEN_LEN
+ROOT_WIDEN_LEN = 3.0e-3       # m
 GRID_N = 96
 GRID_CELLS = GRID_N * GRID_N * GRID_N
 GRID_EXTENT = R2I            # grid covers [-R2I, R2I]^3
@@ -243,6 +245,13 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
         xg = chain_smooth(node_pos, node_parent, node_next, node_flags, g)
         p0 = 0.5 * (xp + xg)
         q0 = 0.5 * (qp + chain_smooth(node_prev_pos, node_parent, node_next, node_flags, g))
+    else:
+        # the parent is the root (h above the bulb): the first span starts on the bulb surface, so
+        # the channel grows out of the electrode's glow layer instead of hovering a gap above it
+        p0 = xp / wp.max(wp.length(xp), 1.0e-6) * (ROOT_R + 0.0002)
+        q0 = qp / wp.max(wp.length(qp), 1.0e-6) * (ROOT_R + 0.0002)
+    # the base of a channel widens into the bulb's glow layer (the footage: roots like a tree's)
+    radius = radius * (1.0 + ROOT_WIDEN * wp.exp(-(wp.length(p0) - ROOT_R) / ROOT_WIDEN_LEN))
     # mitre planes: bisectors between this span and its neighbours (flat cut where there is none)
     u = p1 - p0
     u = u / wp.max(wp.length(u), 1.0e-9)
