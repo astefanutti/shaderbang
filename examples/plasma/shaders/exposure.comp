@@ -1,0 +1,107 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// Auto-exposure, highlight priority (what a phone camera does on a plasma globe: the filament
+// cores sit just under saturation whatever the black background does). Compiled twice:
+//   -DREDUCE  : one workgroup per 16x16 tile of the HDR image builds a 64-bin log2(luma)
+//               histogram in shared memory and adds it to the exposure SSBO
+//   -DRESOLVE : one invocation finds the luminance L_p under which PERCENTILE of the pixels lie
+//               (interpolated inside its bin), targets exposure * L_p = TARGET_LUM, adapts the EV
+//               asymmetrically (fast when the scene brightens, slow when it darkens) and writes the
+//               exposure multiplier used by present.frag.
+// A log-average meter was abandoned: with 95 % of the frame black its result was set by the
+// luminance floor of the background, not by the filaments, and any change of the background
+// level re-exposed the whole picture.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const int   BINS = 64;
+const float LOG_MIN = -14.0;          // bin 0 = luminance 2^-14; darker pixels only count in the total
+const float LOG_MAX = 6.0;            // bin 63 = luminance 2^6 (and above)
+const float BINS_PER_EV = float(BINS) / (LOG_MAX - LOG_MIN);
+const float PERCENTILE = 0.98;        // the brightest 2 % of the pixels: the ordinary cores and sheaths; a touched
+                                      // filament (~1 % of the frame) only pushes L_p up the ordinary population, so it
+                                      // saturates white while the others dim ~2x, as in the footage
+const float TARGET_LUM = 0.06;        // display-linear luminance of L_p (ordinary cores then peak at B ~ 240, R/B kept)
+const float L_FLOOR = 2e-4;           // no filaments yet (startup): do not expose the electrode halo to white
+
+layout(std430, binding = 3) buffer ExposureBuf {
+    int   total;            // pixels metered
+    int   unused;
+    float evPrev;           // adapted EV of the previous frame
+    float evCur;            // adapted EV of this frame
+    float exposure;         // multiplier applied to HDR radiance
+    float exposureRatio;    // exposure / previous exposure (history rescale for TAAU)
+    float lumP;             // L_p of this frame (diagnostics)
+    float pad1;
+    int   bins[BINS];
+} ex;
+
+uniform float dt;
+uniform float bias;         // EV
+uniform int   firstFrame;
+
+#ifdef REDUCE
+layout(rgba16f, binding = 0) uniform readonly image2D hdrImg;
+shared int tileBins[BINS];
+shared int tileCount;
+
+void main() {
+    uint li = gl_LocalInvocationIndex;
+    if (li < uint(BINS)) tileBins[li] = 0;
+    if (li == 0u) tileCount = 0;
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(hdrImg);
+    if (p.x < size.x && p.y < size.y) {
+        vec3 c = imageLoad(hdrImg, p).rgb;
+        float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        atomicAdd(tileCount, 1);
+        if (lum > 0.0) {
+            float l = log2(lum);
+            if (l >= LOG_MIN) atomicAdd(tileBins[min(int((l - LOG_MIN) * BINS_PER_EV), BINS - 1)], 1);
+        }
+    }
+    barrier();
+    if (li < uint(BINS) && tileBins[li] > 0) atomicAdd(ex.bins[li], tileBins[li]);
+    if (li == 0u) atomicAdd(ex.total, tileCount);
+}
+#else
+void main() {
+    if (gl_GlobalInvocationID.x != 0u || gl_GlobalInvocationID.y != 0u) return;
+    // walk the histogram from the top until (1 - PERCENTILE) of the pixels have been passed
+    float want = (1.0 - PERCENTILE) * float(max(ex.total, 1));
+    float acc = 0.0;
+    float logP = LOG_MIN;
+    for (int b = BINS - 1; b >= 0; --b) {
+        float n = float(ex.bins[b]);
+        if (acc + n >= want && n > 0.0) {
+            float f = (want - acc) / n;                          // fraction of this bin above L_p
+            logP = LOG_MIN + (float(b) + 1.0 - f) / BINS_PER_EV;
+            break;
+        }
+        acc += n;
+    }
+    float lumP = max(exp2(logP), L_FLOOR);
+    float evTarget = log2(lumP / TARGET_LUM);                    // exposure = 2^-(ev - bias)
+    float ev;
+    if (firstFrame == 1) {
+        ev = evTarget;
+    } else {
+        // asymmetric adaptation: a brighter scene (a touched filament) is handled in 0.1 s, a darker one in 1 s
+        float tau = evTarget > ex.evCur ? 0.1 : 1.0;
+        float a = 1.0 - exp(-dt / tau);
+        ev = mix(ex.evCur, evTarget, a);
+    }
+    float prevExposure = ex.exposure;
+    float exposure = exp2(-(ev - bias));
+    ex.evPrev = ex.evCur;
+    ex.evCur = ev;
+    ex.exposureRatio = (firstFrame == 1 || prevExposure <= 0.0) ? 1.0 : exposure / prevExposure;
+    ex.exposure = exposure;
+    ex.lumP = lumP;
+    ex.total = 0;
+    for (int b = 0; b < BINS; ++b) ex.bins[b] = 0;
+}
+#endif

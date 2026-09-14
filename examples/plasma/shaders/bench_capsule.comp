@@ -1,0 +1,83 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// M1 micro-benchmark 1: per-candidate cost of the closed-form capsule emission integral.
+// Every pixel evaluates uCount segments over the same parameter range (uClip == 0) or over the ray's chord
+// through the inner glass sphere (uClip == 1, pixels missing the globe do no work).
+// Defines injected by the benchmark: KERNEL 3 -> 1/(d^2+eps^2)^(3/2) (algebraic), KERNEL 2 -> 1/(d^2+eps^2) (atan);
+// DIVERGENT 0 -> every pixel walks the segments in the same order (broadcast SSBO loads, the plan's protocol),
+// DIVERGENT 1 -> every pixel starts at a pcg-hashed offset so the lanes of a warp fetch different Segment
+// records (the DDA regime, where candidates differ per pixel).
+
+#include "common.glsl"
+
+#ifndef KERNEL
+#define KERNEL 3
+#endif
+#ifndef DIVERGENT
+#define DIVERGENT 0
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer Segments { Segment segs[]; };
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+uniform int uCount;
+uniform int uClip;
+uniform float uTLen;
+uniform float uScale;
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pix, uRes)))
+        return;
+
+    vec3 rd = cameraRay(pix, vec2(0.5));
+    vec3 ro = uEye;
+    // unclipped: a globe-sized range starting where the ray comes closest to the globe (same work for every ray)
+    float t0 = max(dot(-ro, rd) - GLOBE_R2I, 0.0);
+    float t1 = t0 + uTLen;
+    if (uClip != 0)
+    {
+        vec2 t = sphIntersect(ro, rd, vec3(0.0), GLOBE_R2I);
+        if (t.y <= 0.0)
+        {
+            imageStore(uOut, pix, vec4(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+        t0 = max(t.x, 0.0);
+        t1 = t.y;
+    }
+    // re-base the origin at the range start: smaller magnitudes in q(t) (see common.glsl, Precision)
+    ro += t0 * rd;
+    t1 -= t0;
+    t0 = 0.0;
+
+    float acc = 0.0;
+#if DIVERGENT
+    uvec4 seed = uvec4(uint(pix.x), uint(pix.y), 0x9e3779b9u, uint(uCount));
+    pcg4d(seed);
+    int idx = int(seed.x % uint(uCount));
+#endif
+    for (int i = 0; i < uCount; ++i)
+    {
+#if DIVERGENT
+        Segment s = segs[idx];
+        if (++idx >= uCount)
+            idx = 0;
+#else
+        Segment s = segs[i];
+#endif
+        float eps2 = s.p0e.w * s.p0e.w;
+#if KERNEL == 3
+        acc += s.p1w.w * eps2 * capsuleEmission3(ro, rd, t0, t1, s.p0e.xyz, s.p1w.xyz, eps2);
+#else
+        acc += s.p1w.w * s.p0e.w * capsuleEmission2(ro, rd, t0, t1, s.p0e.xyz, s.p1w.xyz, eps2);
+#endif
+    }
+    acc *= uScale;
+    imageStore(uOut, pix, vec4(acc * vec3(1.0, 0.55, 0.85), 1.0));
+}

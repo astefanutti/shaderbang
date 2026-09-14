@@ -1,0 +1,87 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// M1 micro-benchmark 4: stand-in 2x temporal upscale (plan 5.6, without the layered motion vectors).
+// Per output pixel at mode resolution: reproject through the rg16f motion image (uv offset, sampled bilinearly
+// at the input resolution), 5-tap Catmull-Rom history fetch, 3x3 neighbourhood mean / variance clamp in YCoCg
+// at the input resolution, blend uBlend of the current sample, write the new history.
+
+#include "common.glsl"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D uColor;     // input resolution, rgba16f
+layout(binding = 1) uniform sampler2D uMotion;    // input resolution, rg16f (uv offset, current <- previous)
+layout(binding = 2) uniform sampler2D uHistory;   // output resolution, rgba16f
+layout(rgba16f, binding = 0) uniform writeonly image2D uHistoryOut;
+
+uniform ivec2 uOutRes;
+uniform ivec2 uInRes;
+uniform float uBlend;
+uniform float uGamma;
+
+// Catmull-Rom with the 4 corner taps dropped (5 bilinear fetches) -- the standard TAA history filter.
+vec3 sampleCatmullRom5(sampler2D tex, vec2 uv, vec2 texSize)
+{
+    vec2 samplePos = uv * texSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / w12;
+    vec2 texPos0 = (texPos1 - 1.0) / texSize;
+    vec2 texPos3 = (texPos1 + 2.0) / texSize;
+    vec2 texPos12 = (texPos1 + offset12) / texSize;
+
+    vec3 result = vec3(0.0);
+    float wsum = 0.0;
+    result += texture(tex, vec2(texPos12.x, texPos0.y)).rgb * w12.x * w0.y;  wsum += w12.x * w0.y;
+    result += texture(tex, vec2(texPos0.x, texPos12.y)).rgb * w0.x * w12.y;  wsum += w0.x * w12.y;
+    result += texture(tex, vec2(texPos12.x, texPos12.y)).rgb * w12.x * w12.y; wsum += w12.x * w12.y;
+    result += texture(tex, vec2(texPos3.x, texPos12.y)).rgb * w3.x * w12.y;  wsum += w3.x * w12.y;
+    result += texture(tex, vec2(texPos12.x, texPos3.y)).rgb * w12.x * w3.y;  wsum += w12.x * w3.y;
+    return result / wsum;
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pix, uOutRes)))
+        return;
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(uOutRes);
+    vec3 current = texture(uColor, uv).rgb;
+    vec2 motion = texture(uMotion, uv).xy;
+    vec2 prevUV = uv - motion;
+
+    vec3 history = sampleCatmullRom5(uHistory, prevUV, vec2(uOutRes));
+
+    // 3x3 neighbourhood statistics at the input resolution, in YCoCg
+    ivec2 c = ivec2(uv * vec2(uInRes));
+    vec3 m1 = vec3(0.0);
+    vec3 m2 = vec3(0.0);
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+        ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), uInRes - 1);
+        vec3 s = RGBToYCoCg(texelFetch(uColor, q, 0).rgb);
+        m1 += s;
+        m2 += s * s;
+    }
+    m1 /= 9.0;
+    vec3 sigma = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+    vec3 lo = m1 - uGamma * sigma;
+    vec3 hi = m1 + uGamma * sigma;
+
+    vec3 hy = clamp(RGBToYCoCg(history), lo, hi);
+    history = YCoCgToRGB(hy);
+
+    bool offscreen = any(lessThan(prevUV, vec2(0.0))) || any(greaterThan(prevUV, vec2(1.0)));
+    float w = offscreen ? 1.0 : uBlend;
+    vec3 outColor = mix(history, current, w);
+    imageStore(uHistoryOut, pix, vec4(outColor, 1.0));
+}

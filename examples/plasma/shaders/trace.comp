@@ -1,0 +1,800 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// P1 -- the plasma globe tracer (one compute invocation per internal-resolution pixel).
+//
+//  * Glass: three concentric analytic spheres (outer R2O, inner R2I, electrode R1), a table plane
+//    and a procedural room. Deterministic split, no random numbers, no denoiser:
+//      A  outer reflection            weight F_o                -> room + line-light specular
+//      B  refract in, cross the gas   weight (1-F_o)(1-F_i)     -> emission along the interior path,
+//         then at the far inner wall: transmit (room through the glass) and
+//      C  reflect (Fresnel / TIR)     weight F_far               -> a second interior path -> transmit
+//    Exact dielectric Fresnel (pbrt FrDielectric), Beer-Lambert soda-lime tint per glass path,
+//    1/eta^2 on radiance crossing into the glass and back (net 1 for what exits again).
+//  * Filaments: Amanatides-Woo DDA over the 96^3 uniform-grid CSR of segment ids; every new
+//    segment (mailbox of 8) adds its CLOSED-FORM emission integral over the whole interior path
+//    for a compact core e(d) = P * 3 eps^3/(2 pi) / (d^2 + eps^2)^(5/2) (eps = r_k) plus a faint
+//    sheath e(d) = 0.02 P * eps'/(2 pi) / (d^2 + eps'^2)^(3/2) (eps' = 3 r_k):
+//      d^2(t) = A t^2 + B t + C along the ray; with R = A t^2 + B t + C', C' = C + eps^2, D = 4 A C' - B^2
+//      integral R^(-3/2) dt = 2 (2 A t + B) / (D sqrt R)
+//      integral R^(-5/2) dt = 2 (2 A t + B) / (3 D R^(3/2)) + 16 A (2 A t + B) / (3 D^2 sqrt R)
+//    split into cap / body / cap ranges by the line parameter of the closest point.
+//    A hard cap of MAX_CANDIDATES per ray is enforced and histogrammed.
+//  * Coarse volume (T - T0, ambient emission, |u|, mask): 32-step march for the ambient glow.
+//  * Scene lighting from the filaments: Karis/UE4 closed-form line-segment irradiance over the
+//    per-tree polyline lights (diffuse) + representative-point specular for the glass.
+//  * Outputs: HDR radiance, emissive-only radiance (glow input), motion vector (internal pixels,
+//    curr - prev) and (layer id [+0.5 mixed Fresnel], hit distance) for the temporal upscale.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float SHEATH_SCALE    = 3.0;        // sheath radius = SHEATH_SCALE x core radius (both grow with the current)
+const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core colour (a tint made the hue depend on the core/sheath mix per pixel: blue-purple patches along a filament)
+const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
+                                          // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
+const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
+const vec3  ELECTRODE_RGB   = vec3(0.55, 0.17, 1.00); // glow discharge covering the electrode: magenta (footage rim (118,71,157) sRGB)
+const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
+const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
+const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
+const vec3  FOOT_RGB        = vec3(1.00, 0.34, 0.72); // surface discharge at a foot: magenta
+
+layout(rgba16f, binding = 0) uniform writeonly image2D outHdr;
+layout(rgba16f, binding = 1) uniform writeonly image2D outEmissive;
+layout(rg16f,   binding = 2) uniform writeonly image2D outMotion;
+layout(rg32f,   binding = 3) uniform writeonly image2D outLayer;
+
+layout(binding = 0) uniform sampler3D volumeTex;        // 96^3 RGBA16F {T - T0, ambient, |u|, mask}
+
+layout(std140, binding = 0) uniform Params {
+    vec4 eye;            // xyz camera position
+    vec4 camU;           // right * tan(fov/2) * aspect
+    vec4 camV;           // up * tan(fov/2)
+    vec4 camW;           // forward
+    mat4 vp;             // current view-projection
+    mat4 vpPrev;         // previous view-projection
+    vec4 jitterRes;      // xy jitter (internal px), zw internal resolution
+    vec4 knobs;          // x radiance scale, y ambient volume gain (radiance per (kW/m^3 * m)), z time, w unused
+    ivec4 flags;         // x debug view, y lights on, z frame, w volume on
+    vec4 gas;            // xyz unused, w gravity sign (heat shimmer direction)
+};
+
+layout(std430, binding = 1) readonly buffer Segments { vec4 seg[]; };          // SEGS vec4 per segment
+const int SEGS = 7;
+layout(std430, binding = 2) readonly buffer CellStart { int cellStart[]; };
+layout(std430, binding = 3) readonly buffer CellCount { int cellCount[]; };
+layout(std430, binding = 4) readonly buffer CellItems { int cellItems[]; };
+layout(std430, binding = 5) readonly buffer Lights { vec4 light[]; };          // 3 vec4 per light span
+layout(std430, binding = 6) readonly buffer Sigma { vec4 sigma[]; };           // 2 vec4 per record: {dir, amp} {radius, alive, ringAge, 0}
+layout(std430, binding = 7) buffer Histogram { int hist[64]; int flagged; int pad[3]; };
+
+const float R1  = 0.011;
+const float R2I = 0.075;
+const float R2O = 0.0775;
+const float IOR = 1.52;
+const float TABLE_Y = -R2O - 0.03;      // the globe sits on a 3 cm base
+const int   GRID_N = 96;
+const float GRID_EXTENT = R2I;
+const float CELL = 2.0 * GRID_EXTENT / float(GRID_N);
+const float VIS_RADIUS = 2.0 * CELL;      // publish.DILATION cells: a ray farther than this from a segment
+                                          // may never visit its cells, so the halo fades to zero there
+const int   MAX_CANDIDATES = 1024;
+const int   MAILBOX = 16;
+const int   LIGHT_MAX = 256;
+const int   SIG_MAX = 64;
+const int   VOLUME_STEPS = 32;
+const vec3  GLASS_ABSORB = vec3(0.6, 0.25, 0.9) * 8.0;    // soda-lime: faint green, per metre
+const float PI = 3.14159265;
+
+// ---- geometry -----------------------------------------------------------------------------------
+// Both roots of a ray / sphere (centre at the origin) intersection, projection form (iq); (-1,-1) on miss.
+vec2 sphereRoots(vec3 ro, vec3 rd, float r) {
+    float b = dot(ro, rd);
+    vec3 qc = ro - b * rd;
+    float h = r * r - dot(qc, qc);
+    if (h < 0.0) return vec2(-1.0);
+    h = sqrt(h);
+    return vec2(-b - h, -b + h);
+}
+
+// Exact dielectric Fresnel (pbrt FrDielectric); eta = ior_t / ior_i, cosI >= 0 on entering side.
+float fresnelDielectric(float cosI, float eta) {
+    cosI = clamp(cosI, -1.0, 1.0);
+    if (cosI < 0.0) { eta = 1.0 / eta; cosI = -cosI; }
+    float sin2T = (1.0 - cosI * cosI) / (eta * eta);
+    if (sin2T >= 1.0) return 1.0;
+    float cosT = sqrt(max(0.0, 1.0 - sin2T));
+    float rParl = (eta * cosI - cosT) / (eta * cosI + cosT);
+    float rPerp = (cosI - eta * cosT) / (cosI + eta * cosT);
+    return 0.5 * (rParl * rParl + rPerp * rPerp);
+}
+
+// ---- environment ---------------------------------------------------------------------------------
+vec3 roomRadiance(vec3 d) {
+    // a dim room: warm floor bounce, cool ceiling, one soft window at +x
+    float up = d.y * 0.5 + 0.5;
+    vec3 base = mix(vec3(0.007, 0.0056, 0.005), vec3(0.0035, 0.0042, 0.0063), up);   // the footage: a dark room
+    float window = smoothstep(0.75, 0.95, dot(d, normalize(vec3(1.0, 0.35, 0.2))));
+    return base + window * vec3(0.30, 0.32, 0.36);
+}
+
+// ---- line lights (Karis / UE4 2013, eq. 15-16 diffuse, representative point specular) -----------
+vec3 lineLightDiffuse(vec3 p, vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < LIGHT_MAX; ++i) {
+        vec4 a = light[3 * i];
+        if (a.w <= 0.0) continue;
+        vec3 L0 = a.xyz - p;
+        vec3 L1 = light[3 * i + 1].xyz - p;
+        vec3 pw = light[3 * i + 2].xyz;
+        float l0 = length(L0), l1 = length(L1);
+        float irr = 2.0 * clamp(dot(n, L0) / (2.0 * l0) + dot(n, L1) / (2.0 * l1), 0.0, 1.0)
+                  / (l0 * l1 + dot(L0, L1) + 2.0e-6);
+        sum += pw * irr;
+    }
+    return sum;
+}
+
+vec3 lineLightSpecular(vec3 p, vec3 n, vec3 v, float roughness) {
+    vec3 r = reflect(-v, n);
+    float a2 = roughness * roughness;
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < LIGHT_MAX; ++i) {
+        vec4 a = light[3 * i];
+        if (a.w <= 0.0) continue;
+        vec3 L0 = a.xyz - p;
+        vec3 Ld = light[3 * i + 1].xyz - a.xyz;
+        float t = (dot(r, L0) * dot(r, Ld) - dot(L0, Ld)) / max(dot(Ld, Ld) - dot(r, Ld) * dot(r, Ld), 1e-9);
+        vec3 L = L0 + clamp(t, 0.0, 1.0) * Ld;
+        float d2 = dot(L, L);
+        L = normalize(L);
+        vec3 h = normalize(L + v);
+        float nh = max(dot(n, h), 0.0);
+        float dd = nh * nh * (a2 - 1.0) + 1.0;
+        float D = a2 / (PI * dd * dd + 1e-9);
+        float norm = a2 / (a2 + 0.5 * length(Ld) / sqrt(d2 + 1e-9));   // energy normalisation for the widened lobe
+        vec3 pw = light[3 * i + 2].xyz;
+        sum += pw * D * norm * norm * max(dot(n, L), 0.0) / (d2 + 1e-6) * 0.05;
+    }
+    return sum;
+}
+
+// ---- filament emission ---------------------------------------------------------------------------
+// Numerically stable closed forms. With s = t - t_c measured from the closest approach and
+// P = d_perp^2 + eps^2, R = A s^2 + P and x = s sqrt(A/P):
+//   integral R^(-3/2) ds = [ x / sqrt(x^2+1) ] / (P sqrt A)                 G3(x) = 1 - T3(x), T3 = 1/(q (q+x))
+//   integral R^(-5/2) ds = [ x (2x^2+3) / (3 (x^2+1)^(3/2)) ] / (P^2 sqrt A)  G5(x) = 2/3 - T5(x), T5 = (2q+x)/(3 q^3 (q+x)^2)
+// (q = sqrt(x^2+1), x >= 0). The differences G(x1) - G(x0) are formed from the complements T, which
+// never cancel catastrophically -- the naive antiderivative in t reaches ~1e13 for 0.5 mm filaments.
+float T3(float x) { float q = sqrt(x * x + 1.0); return 1.0 / (q * (q + x)); }
+float T5(float x) { float q = sqrt(x * x + 1.0); return (2.0 * q + x) / (3.0 * q * q * q * (q + x) * (q + x)); }
+
+float gDiff(int pw, float x0, float x1) {
+    float full = pw == 0 ? 1.0 : (2.0 / 3.0);
+    if (x0 >= 0.0 && x1 >= 0.0) return pw == 0 ? T3(x0) - T3(x1) : T5(x0) - T5(x1);
+    if (x0 <= 0.0 && x1 <= 0.0) return pw == 0 ? T3(-x1) - T3(-x0) : T5(-x1) - T5(-x0);
+    return pw == 0 ? (full - T3(x1)) + (full - T3(-x0)) : (full - T5(x1)) + (full - T5(-x0));
+}
+
+// integral over s in [s0, s1] of (A s^2 + P)^(-3/2) (pw 0) or (A s^2 + P)^(-5/2) (pw 1)
+float profileIntegral(int pw, float A, float P, float s0, float s1) {
+    if (A < 1e-7) return pw == 0 ? (s1 - s0) / (P * sqrt(P)) : (s1 - s0) / (P * P * sqrt(P));
+    float k = sqrt(A / P);
+    float g = gDiff(pw, s0 * k, s1 * k);
+    return pw == 0 ? g / (P * sqrt(A)) : g / (P * P * sqrt(A));
+}
+
+// ray parameter of the closest approach between the ray [t0, t1] and the segment a-b
+float raySegmentT(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b) {
+    vec3 ab = b - a;
+    float L2 = max(dot(ab, ab), 1e-12);
+    vec3 w0 = ro - a;
+    float d_ru = dot(rd, ab), d_uu = L2, d_rw = dot(rd, w0), d_uw = dot(ab, w0);
+    float den = d_uu - d_ru * d_ru;
+    float s = (den > 1e-9 * L2) ? clamp((d_ru * d_rw - d_uw) / den, 0.0, 1.0) : 0.5;
+    return clamp(dot(a + ab * s - ro, rd), t0, t1);
+}
+
+// closest distance between the ray [t0, t1] and the segment a-b (clamped closest points)
+float raySegmentDist(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b) {
+    vec3 ab = b - a;
+    float L2 = max(dot(ab, ab), 1e-12);
+    vec3 w0 = ro - a;
+    float d_rr = 1.0, d_ru = dot(rd, ab), d_uu = L2;
+    float d_rw = dot(rd, w0), d_uw = dot(ab, w0);
+    float den = d_rr * d_uu - d_ru * d_ru;
+    float s, t;
+    if (den > 1e-9 * L2) {
+        s = (d_ru * d_rw - d_rr * d_uw) / den;      // segment parameter in [0, 1]
+        s = clamp(s, 0.0, 1.0);
+    } else s = 0.5;
+    t = clamp(dot(a + ab * s - ro, rd), t0, t1);
+    vec3 p = ro + rd * t;
+    s = clamp(dot(p - a, ab) / L2, 0.0, 1.0);
+    return length(p - (a + ab * s));
+}
+
+float segDist(vec3 p, vec3 a, vec3 b) {
+    vec3 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-12), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// emission along ray [t0, t1] from a capsule a-b of radius eps: cap / body / cap closed forms.
+// Interior joints of a chain get NO caps: consecutive spans share their end points, so the next
+// span's body already covers the region past b (a cap there double-counts a sphere of radius eps
+// at every node: visible beading along the filament). Caps only at a chain's free ends.
+float capsuleEmission(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b, vec3 nA, vec3 nB, float eps, int pw, bool capA, bool capB) {
+    vec3 ab = b - a;
+    float L = length(ab);
+    if (L < 1e-6) return 0.0;
+    vec3 u = ab / L;
+    vec3 w0 = ro - a;
+    float ru = dot(rd, u);
+    float wu = dot(w0, u);
+    float e2 = eps * eps;
+    // line parameter of the closest point: s(t) = wu + ru t ; body where 0 <= s <= L
+    float sa, sb;
+    if (abs(ru) > 1e-6) { sa = (0.0 - wu) / ru; sb = (L - wu) / ru; if (sa > sb) { float tmp = sa; sa = sb; sb = tmp; } }
+    else { if (wu >= 0.0 && wu <= L) { sa = -1e30; sb = 1e30; } else { sa = 1e30; sb = 1e30; } }
+    float total = 0.0;
+    // body: distance to the infinite line, clipped to the slab between the two mitre planes
+    // dot(x - a, nA) >= 0 and dot(x - b, nB) <= 0 (bisectors of the joints: consecutive spans
+    // tile space exactly; a flat cut where a chain ends, where the caps take over)
+    float b0 = t0, b1 = t1;
+    {
+        float dA = dot(rd, nA), cA = dot(a - ro, nA);          // dot(x(t) - a, nA) = dA t - cA
+        if (abs(dA) > 1e-6) { float tA = cA / dA; if (dA > 0.0) b0 = max(b0, tA); else b1 = min(b1, tA); }
+        else if (cA > 0.0) b1 = b0;
+        float dB = dot(rd, nB), cB = dot(b - ro, nB);          // dot(x(t) - b, nB) = dB t - cB
+        if (abs(dB) > 1e-6) { float tB = cB / dB; if (dB > 0.0) b1 = min(b1, tB); else b0 = max(b0, tB); }
+        else if (cB < 0.0) b1 = b0;
+    }
+    if (b1 > b0) {
+        float A = 1.0 - ru * ru;
+        vec3 n = cross(rd, u);
+        float n2 = dot(n, n);
+        float dperp2 = n2 > 1e-12 ? (dot(w0, n) * dot(w0, n)) / n2 : dot(w0 - wu * u, w0 - wu * u);
+        float tc = n2 > 1e-12 ? (wu * ru - dot(w0, rd)) / A : 0.0;
+        total += profileIntegral(pw, A, dperp2 + e2, b0 - tc, b1 - tc);
+    }
+    // cap at a: t where s(t) < 0  (distance to the point a) -- only for the first segment of a chain,
+    // every interior node already gets the end cap of its incoming segment
+    if (capA) {
+        float c0 = t0, c1 = t1;
+        if (abs(ru) > 1e-6) { if (ru > 0.0) c1 = min(t1, sa); else c0 = max(t0, sb); }
+        else if (wu >= 0.0) c1 = c0;
+        if (c1 > c0) {
+            float tc = -dot(w0, rd);
+            vec3 pv = w0 - dot(w0, rd) * rd;
+            total += profileIntegral(pw, 1.0, dot(pv, pv) + e2, c0 - tc, c1 - tc);
+        }
+    }
+    // cap at b: t where s(t) > L  (distance to the point b) -- free chain ends only
+    if (capB) {
+        vec3 w1 = ro - b;
+        float c0 = t0, c1 = t1;
+        if (abs(ru) > 1e-6) { if (ru > 0.0) c0 = max(t0, sb); else c1 = min(t1, sa); }
+        else if (wu <= L) c1 = c0;
+        if (c1 > c0) {
+            float tc = -dot(w1, rd);
+            vec3 pv = w1 - dot(w1, rd) * rd;
+            total += profileIntegral(pw, 1.0, dot(pv, pv) + e2, c0 - tc, c1 - tc);
+        }
+    }
+    // unit power per metre of channel: plane integrals are 2 pi / eps (3/2) and 2 pi / (3 eps^3) (5/2)
+    return pw == 0 ? total * eps / (2.0 * PI) : total * 3.0 * eps * eps * eps / (2.0 * PI);
+}
+
+ivec3 cellOf(vec3 p) { return ivec3(floor((p + vec3(GRID_EXTENT)) / CELL)); }
+int cellIndex(ivec3 c) { return (c.z * GRID_N + c.y) * GRID_N + c.x; }
+
+struct Interior { vec3 emission; vec3 ambient; float bestLum; int bestSeg; float bestT; int candidates; bool capped; };
+
+// Integrate filament emission and the coarse volume along ray [t0, t1] (inside the gas).
+Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
+    Interior r;
+    r.emission = vec3(0.0); r.ambient = vec3(0.0); r.bestLum = 0.0; r.bestSeg = -1; r.bestT = t0; r.candidates = 0; r.capped = false;
+    // A segment sits in every cell of its dilated footprint, so a ray meets it in several
+    // consecutive cells. It is integrated exactly once: in the cell that contains the ray's
+    // closest approach to it (always a listed cell, since that point is within the footprint).
+    // No mailbox: a bounded mailbox misses revisits once many segments share a region, and every
+    // miss double-counts a whole span, stepping the brightness at a cell boundary.
+    const float T_EPS = 1e-5;
+
+    // --- Amanatides-Woo DDA
+    vec3 p0 = ro + rd * t0;
+    ivec3 c = clamp(cellOf(p0), ivec3(0), ivec3(GRID_N - 1));
+    ivec3 stepDir = ivec3(sign(rd));
+    vec3 invDir = 1.0 / (abs(rd) + vec3(1e-9));
+    vec3 cellMin = vec3(c) * CELL - vec3(GRID_EXTENT);
+    vec3 nextBoundary = cellMin + (vec3(greaterThan(rd, vec3(0.0)))) * CELL;
+    vec3 tMax = t0 + abs(nextBoundary - p0) * invDir;
+    vec3 tDelta = CELL * invDir;
+    float t = t0;
+    for (int iter = 0; iter < 3 * GRID_N; ++iter) {
+        int ci = cellIndex(c);
+        int start = cellStart[ci];
+        int count = cellCount[ci];
+        float tCellIn = t;
+        float tCellOut = min(min(tMax.x, tMax.y), tMax.z);
+        for (int k = 0; k < count; ++k) {
+            int s = cellItems[start + k];
+            vec4 a = seg[SEGS * s];
+            vec4 b = seg[SEGS * s + 1];
+            float tc = raySegmentT(ro, rd, t0, t1, a.xyz, b.xyz);
+            if (tc < tCellIn - T_EPS || tc >= tCellOut - T_EPS) continue;   // handled in another cell
+            if (r.candidates >= MAX_CANDIDATES) { r.capped = true; break; }
+            r.candidates++;
+            vec3 pw = seg[SEGS * s + 2].xyz;
+            if (a.w <= 0.0) continue;
+            float core = a.w;
+            int nodeFlags = int(seg[SEGS * s + 4].w);
+            bool chainStart = (nodeFlags & 16) != 0;       // NODE_ROOT
+            bool chainEnd = (nodeFlags & 8) != 0;          // NODE_FOOT: the span ends at the glass
+            // core (5/2 profile, r_k) + the diffuse glow sheath of the channel (3/2 profile,
+            // SHEATH_SCALE r_k, carrying SHEATH_FRACTION of the light: the visible halo)
+            vec3 nA = seg[SEGS * s + 5].xyz, nB = seg[SEGS * s + 6].xyz;
+            float dmin = raySegmentDist(ro, rd, t0, t1, a.xyz, b.xyz);
+            if (dmin > VIS_RADIUS) continue;
+            float window = smoothstep(VIS_RADIUS, 0.45 * VIS_RADIUS, dmin);
+            // core (5/2 profile, r_k) + sheath (3/2 profile, SHEATH_SCALE r_k, SHEATH_FRACTION of the
+            // light), both closed-form per span and mitre-clipped at the joints
+            float eCore = capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, core, 1, chainStart, chainEnd);
+            float eSheath = window * SHEATH_FRACTION * capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, SHEATH_SCALE * core, 0, chainStart, chainEnd);
+            // the cooler sheath radiates more of the neutral (pink) lines than the core
+            vec3 contrib = pw * eCore + pw * SHEATH_TINT * eSheath;
+            r.emission += contrib;
+            float lum = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
+            if (lum > r.bestLum) {
+                r.bestLum = lum; r.bestSeg = s;
+                // parametric t of the closest approach to the segment (for the motion vector)
+                vec3 u = normalize(b.xyz - a.xyz);
+                vec3 w0 = ro - a.xyz;
+                float ru = dot(rd, u);
+                float denom = max(1.0 - ru * ru, 1e-6);
+                r.bestT = clamp((dot(w0, u) * ru - dot(w0, rd)) / denom, t0, t1);
+            }
+        }
+        if (r.capped) break;
+        // advance
+        if (tMax.x < tMax.y && tMax.x < tMax.z) { t = tMax.x; c.x += stepDir.x; tMax.x += tDelta.x; }
+        else if (tMax.y < tMax.z)               { t = tMax.y; c.y += stepDir.y; tMax.y += tDelta.y; }
+        else                                    { t = tMax.z; c.z += stepDir.z; tMax.z += tDelta.z; }
+        if (t > t1 || any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(GRID_N)))) break;
+    }
+
+    // --- coarse volume march (ambient glow)
+    if (flags.w == 1) {
+        float dt = (t1 - t0) / float(VOLUME_STEPS);
+        for (int i = 0; i < VOLUME_STEPS; ++i) {
+            vec3 p = ro + rd * (t0 + (float(i) + 0.5) * dt);
+            vec3 uvw = (p + vec3(GRID_EXTENT)) / (2.0 * GRID_EXTENT);
+            vec4 v = texture(volumeTex, uvw);
+            r.ambient += AMBIENT_RGB * v.y * dt;                          // splat only (the footage has no haze)
+        }
+    }
+    return r;
+}
+
+// surface-charge foot discs on the inner glass at a wall hit point (unit direction n)
+vec3 footGlow(vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < SIG_MAX; ++i) {
+        vec4 rec = sigma[2 * i];
+        vec4 rec2 = sigma[2 * i + 1];
+        if (rec2.y < 0.5 || rec.w <= 0.0) continue;
+        float theta = acos(clamp(dot(n, rec.xyz), -1.0, 1.0));
+        // the surface discharge at the foot: size and brightness follow the foot's current (rec2.w,
+        // uA): a thin filament ends in a faint 1.5 mm spot, a touched one in a bright ~6 mm blob
+        float iRel = rec2.w / 50.0;
+        if (iRel <= 0.0) continue;
+        float sig = clamp(0.002 * pow(iRel, 0.6), 0.0012, 0.012) / R2I;   // 1.7 mm at 40 uA; ~6 mm under a finger (the footage's pink patch on the glass)
+        float disc = exp(-0.5 * theta * theta / (sig * sig));
+        // no negative light: the old "dark annulus" term subtracted a grey ring from whatever lay in
+        // front of the far wall, which clipped the red and green of dim filament pixels to zero and
+        // left pure-blue patches along the filaments (the blue/purple striping)
+        sum += disc * FOOT_RGB * (0.08 * iRel);
+    }
+    return sum;
+}
+
+// root spots on the electrode surface (unit direction n): every channel's attachment point glows,
+// the footage's pink-white "bulbs" at the roots; size ~ I^0.3, brightness ~ I^1.5 (the touched
+// root is white-hot), with a 4x wider dim halo that lights the ball around a strong root
+vec4 rootGlow(vec3 n) {                                              // rgb: spots; w: sum of iRel^2.5 (sheath gain)
+    vec3 sum = vec3(0.0);
+    float gain = 0.0;
+    for (int t = 0; t < F_MAX; ++t) {
+        vec4 rec = sigma[2 * (SIG_MAX + t)];
+        vec4 rec2 = sigma[2 * (SIG_MAX + t) + 1];
+        if (rec2.y < 0.5 || rec.w <= 0.0) continue;
+        float iRel = rec.w / 50.0;                                   // rec.w: uA
+        float theta = acos(clamp(dot(n, rec.xyz), -1.0, 1.0));
+        float sig = 0.0005 * pow(iRel, 0.3) / R1;                    // 0.5 mm at 50 uA, ~1 mm at 0.5 mA
+        float spot = exp(-0.5 * theta * theta / (sig * sig));
+        float halo = exp(-0.5 * theta * theta / (16.0 * sig * sig));
+        // the halo is a strong-root effect only (~I^3): thirty ordinary roots leave the ball's face
+        // dark (footage (33,13,41)), one touched root lights the whole ball pink
+        float ih = min(iRel, 20.0);
+        // both ~I^3: thirty ordinary roots leave no dots on the ball (their flares are on the
+        // filaments themselves), a touched root is a white blob with a pink halo
+        sum += ROOT_RGB * ((0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
+        gain += ih * ih * sqrt(ih);
+    }
+    return vec4(sum, gain);
+}
+
+// the stem: a vertical rod of radius STEM_R below the bulb (y < -R1/2; its top is inside the bulb)
+float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
+    float a = rd.x * rd.x + rd.z * rd.z;
+    float c = ro.x * ro.x + ro.z * ro.z - STEM_R * STEM_R;
+    if (c < 0.0 && ro.y < -0.5 * R1) return 1e-5;                   // starts inside the rod (globe bottom)
+    if (a < 1e-12) return -1.0;
+    float b = ro.x * rd.x + ro.z * rd.z;
+    float h = b * b - a * c;
+    if (h < 0.0) return -1.0;
+    float t0 = (-b - sqrt(h)) / a;
+    if (t0 > 0.0 && t0 < tMaxHit && (ro.y + rd.y * t0) < -0.5 * R1) return t0;
+    return -1.0;
+}
+
+// Electrode halo: the diffuse glow discharge around the electrode where every filament's current
+// converges. Emission density ~ j * E ~ (R1/r)^4 (both fall as 1/r^2 around a sphere), scaled by
+// the total current (gas.x, mA), plus a thin bright surface layer (the electrode sheath); the
+// 1/r^4 tail is integrated over the ray's overlap with r < R1 + HALO_REACH by 16 samples split at
+// the closest approach (denser near the electrode).
+const float HALO_REACH = 0.030;
+const vec3  HALO_RGB   = vec3(0.62, 0.42, 1.0);      // Xe / Ne+ diffuse violet
+const vec3  SHEATH_RGB = vec3(1.00, 0.45, 0.75);     // the pink sheath layer on the electrode
+vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
+    vec2 reach = sphereRoots(ro, rd, R1 + HALO_REACH);
+    if (reach.y <= t0) return vec3(0.0);
+    float a0 = max(t0, reach.x), a1 = min(t1, reach.y);
+    if (a1 <= a0) return vec3(0.0);
+    float tc = clamp(-dot(ro, rd), a0, a1);
+    float iTot = gas.x;                                  // mA
+    vec3 sum = vec3(0.0);
+    for (int side = 0; side < 2; ++side) {
+        float s0 = (side == 0) ? a0 : tc;
+        float s1 = (side == 0) ? tc : a1;
+        float len = s1 - s0;
+        if (len <= 0.0) continue;
+        for (int i = 0; i < 8; ++i) {
+            // quadratic spacing towards the closest approach
+            float u0 = float(i) / 8.0, u1 = float(i + 1) / 8.0;
+            float w0 = (side == 0) ? 1.0 - (1.0 - u0) * (1.0 - u0) : u0 * u0;
+            float w1 = (side == 0) ? 1.0 - (1.0 - u1) * (1.0 - u1) : u1 * u1;
+            float t = s0 + len * 0.5 * (w0 + w1);
+            float dt = len * (w1 - w0);
+            float r = max(length(ro + rd * t), R1);
+            float q = R1 / r;
+            float q2 = q * q;
+            float halo = q2 * q2;                                        // (R1/r)^4
+            float sheath = exp(-(r - R1) / 0.0012);                      // electrode sheath, ~1 mm
+            sum += (halo * HALO_RGB * 0.05 + sheath * SHEATH_RGB * 0.3) * dt;
+        }
+    }
+    return sum * iTot;
+}
+
+// ---- experiment: the look of examples/plasma_globe.glsl (nimitz) driven by the simulated filaments
+// His 13 procedural rays become the simulated segments (found through the CSR grid); the rest is
+// his recipe: tubes whose radius flares at the electrode and at the glass (map()'s ins*outs
+// scaling), a soft interior (smoothstep over ~1 mm inside the tube), a position palette, noise
+// flicker, max over rays at a point, sum along the ray, no tonemapping, flow-noise reflections on
+// the sphere. Display-referred output: the present pass passes it through (knobs.w == 1).
+float nzHash(float n) { return fract(sin(n) * 43758.5453); }
+float nzNoise(vec3 p) {
+    vec3 ip = floor(p), fp = fract(p);
+    fp = fp * fp * (3.0 - 2.0 * fp);
+    float n = dot(ip, vec3(1.0, 57.0, 113.0));
+    float a = mix(mix(nzHash(n), nzHash(n + 1.0), fp.x), mix(nzHash(n + 57.0), nzHash(n + 58.0), fp.x), fp.y);
+    float b = mix(mix(nzHash(n + 113.0), nzHash(n + 114.0), fp.x), mix(nzHash(n + 170.0), nzHash(n + 171.0), fp.x), fp.y);
+    return mix(a, b, fp.z);
+}
+const mat3 NZ_M3 = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+float nzFlow(vec3 p, float t) {
+    float z = 2.0, rz = 0.0;
+    vec3 bp = p;
+    for (int i = 1; i < 5; ++i) {
+        p += t * 0.1;
+        rz += (sin(nzNoise(p + t * 0.8) * 6.0) * 0.5 + 0.5) / z;
+        p = mix(bp, p, 0.6);
+        z *= 2.0;
+        p *= 2.01;
+        p *= NZ_M3;
+    }
+    return rz;
+}
+
+vec3 nimitzInterior(vec3 ro, vec3 rd, float t0, float t1, float time) {
+    const float STEP = 0.00075;
+    vec3 sum = vec3(0.0);
+    float distScale = 1.0 / (log(max(length(ro) / R2I - 2.0, 1.05)) + 0.75);   // his 1/(log(d-2)+.75), camera at 5 units
+    float stepScale = STEP / (0.03 * R2I);                                      // his step was 0.03 sphere radii
+    float rIn = R1 / R2I;
+    int iters = 0;
+    for (float t = t0 + 0.5 * STEP; t < t1 && iters < 320; t += STEP, ++iters) {
+        vec3 p = ro + rd * t;
+        ivec3 c = cellOf(p);
+        if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(GRID_N)))) continue;
+        int ci = cellIndex(c);
+        int start = cellStart[ci], count = cellCount[ci];
+        if (count == 0) continue;
+        float lp = length(p) / R2I;
+        float ins = smoothstep(rIn, 0.5, lp);                          // his smoothstep(.11, .46, lp)
+        float outs = 0.15 + smoothstep(0.0, 0.15, abs(lp - 1.0));
+        float s = max(ins * outs, 0.08);
+        vec3 best = vec3(0.0);
+        float bestLum = 0.0;
+        for (int k = 0; k < count && k < 24; ++k) {
+            int si = cellItems[start + k];
+            vec4 a = seg[SEGS * si], b = seg[SEGS * si + 1];
+            if (a.w <= 0.0) continue;
+            float d = 0.5 * segDist(p, a.xyz, b.xyz);                  // his segm() returns half the distance
+            float radius = min(2.0 * a.w / s, 0.5 * VIS_RADIUS);       // his 0.011 / (ins * outs)
+            float inside = smoothstep(0.0, 0.0011, radius - d);        // his smoothstep(0, .015, -r.x)
+            if (inside <= 0.0) continue;
+            float tree = floor(b.w);
+            float alpha = fract(b.w * 10.0) * 10.0;                    // pack: tree + 0.1 class + 0.001 alpha
+            vec3 col = sin(vec3(1.05, 2.5, 1.52) * 3.94 + s) * 0.85 + 0.4;   // his palette on ins * outs
+            col *= inside;
+            col *= smoothstep(0.04, 0.2, abs(lp - 1.1));
+            col *= smoothstep(rIn - 0.1, rIn + 0.14, lp);              // his smoothstep(.1, .34, lp)
+            float bright = clamp(pow(a.w / 0.45e-3, 1.25), 0.35, 3.0); // ~sqrt(I / 50 uA) from the core radius
+            float flick = 1.2 - nzNoise(vec3(lp * 2.0 + tree * 13.0 + time * 5.0, tree, 0.5)) * 1.1;
+            vec3 contrib = abs(col) * 5.0 * flick * bright * max(alpha, 0.2);
+            float lum = dot(contrib, vec3(0.3333));
+            if (lum > bestLum) { bestLum = lum; best = contrib; }
+        }
+        sum += best * stepScale * distScale * 2.0;
+    }
+    return sum;
+}
+
+vec2 project(mat4 m, vec3 p) {
+    vec4 c = m * vec4(p, 1.0);
+    vec2 ndc = c.xy / max(c.w, 1e-6);
+    return (ndc * vec2(0.5, 0.5) + 0.5) * jitterRes.zw;   // internal pixels (no jitter)
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 res = ivec2(jitterRes.zw);
+    if (pix.x >= res.x || pix.y >= res.y) return;
+    vec2 ndc = (vec2(pix) + 0.5 + jitterRes.xy) / vec2(res) * 2.0 - 1.0;
+    vec3 ro = eye.xyz;
+    vec3 rd = normalize(camU.xyz * ndc.x + camV.xyz * ndc.y + camW.xyz);
+    float radScale = knobs.x;
+
+    vec3 hdr = vec3(0.0);
+    vec3 emissive = vec3(0.0);
+    float layer = 0.0;
+    float hitDist = 1e4;
+    vec3 mvPointCur = vec3(0.0);
+    vec3 mvPointPrev = vec3(0.0);
+    bool haveMv = false;
+    float bestLumAll = 0.0;
+    int candTotal = 0;
+
+    vec2 outer = sphereRoots(ro, rd, R2O);
+    // table plane
+    float tTable = (rd.y < -1e-6) ? (TABLE_Y - ro.y) / rd.y : -1.0;
+
+    if (int(knobs.w) == 1) {
+        // ---- nimitz look: straight rays through the sphere, his colours, no tonemapping
+        float time = knobs.z * 1.1;
+        vec3 col = vec3(0.0125, 0.0, 0.025);
+        vec2 mvN = vec2(0.0);
+        float layerN = 0.0, hitN = 1e4;
+        if (outer.x > 0.0) {
+            vec2 inner = sphereRoots(ro, rd, R2I);
+            vec2 el = sphereRoots(ro, rd, R1);
+            float tEnd = inner.y;
+            bool hitEl = el.x > 0.0 && el.x < tEnd;
+            if (hitEl) tEnd = el.x;
+            if (inner.y > 0.0) col = max(col, nimitzInterior(ro, rd, max(inner.x, 0.0), tEnd, time));
+            // the electrode: his rays flare into a pink blob at the centre; here a luminous ball
+            float dmin = length(ro + rd * clamp(-dot(ro, rd), 0.0, 1e4));
+            float blob = smoothstep(R1 + 0.012, R1 - 0.010, dmin);
+            float rim = smoothstep(R1 - 0.008, R1, dmin) * smoothstep(R1 + 0.012, R1 + 0.002, dmin);
+            float speck = 0.5 + 0.5 * nzNoise((ro + rd * clamp(-dot(ro, rd), 0.0, 1e4)) * 400.0 + time);
+            col = max(col, vec3(1.0, 0.30, 0.65) * (0.45 * blob * speck + 0.6 * rim) * (1.0 + 0.2 * nzNoise(vec3(time * 3.0, 1.0, 2.0))));
+            // his sphere reflections (flow noise on the outer and inner hit normals)
+            vec3 pO = ro + rd * outer.x;
+            vec3 n1 = pO / R2O;
+            vec3 n2 = (ro + rd * outer.y) / R2O;
+            float nz = -log(abs(nzFlow(reflect(rd, n1) * 1.2, time) - 0.01));
+            float nz2 = -log(abs(nzFlow(reflect(rd, n2) * 1.2, -time) - 0.01));
+            col += (0.1 * nz * nz * vec3(0.12, 0.12, 0.5) + 0.05 * nz2 * nz2 * vec3(0.55, 0.2, 0.55)) * 0.8;
+            layerN = 1.0; hitN = outer.x;
+            mvN = project(vp, pO) - project(vpPrev, pO);
+        }
+        col *= 1.3;
+        imageStore(outHdr, pix, vec4(max(col, vec3(0.0)), 1.0));
+        imageStore(outEmissive, pix, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(outMotion, pix, vec4(mvN, 0.0, 0.0));
+        imageStore(outLayer, pix, vec4(layerN, hitN, 0.0, 0.0));
+        return;
+    }
+
+    if (outer.x > 0.0) {
+        // ---- primary hit on the outer glass
+        float tO = outer.x;
+        vec3 pO = ro + rd * tO;
+        vec3 nO = pO / R2O;
+        float cosI = -dot(rd, nO);
+        float Fo = fresnelDielectric(cosI, IOR);
+        layer = 1.0; hitDist = tO;
+        mvPointCur = pO; mvPointPrev = pO; haveMv = true;
+        if (Fo > 0.05 && Fo < 0.95) layer += 0.5;     // mixed Fresnel: widen the temporal clamp
+
+        // A: outer reflection
+        vec3 rA = reflect(rd, nO);
+        vec3 radA = roomRadiance(rA);
+        if (flags.y == 1) radA += lineLightSpecular(pO, nO, -rd, 0.04);
+        hdr += Fo * radA;
+
+        // B: refract into the glass, then into the gas
+        vec3 rdG = refract(rd, nO, 1.0 / IOR);
+        float wB = (1.0 - Fo);
+        if (dot(rdG, rdG) > 0.0) {
+            // through the shell to the inner surface (entering the gas)
+            vec2 inner = sphereRoots(pO, rdG, R2I);
+            float glassPath = 0.0;
+            vec3 pI; vec3 rdGas; vec3 nI; float Fi;
+            bool enteredGas = false;
+            if (inner.x > 0.0) {
+                glassPath = inner.x;
+                pI = pO + rdG * inner.x;
+                nI = pI / R2I;                       // outward normal; ray goes inward
+                float cI = -dot(rdG, nI);
+                Fi = fresnelDielectric(cI, 1.0 / IOR);   // glass -> gas
+                rdGas = refract(rdG, nI, IOR);
+                enteredGas = dot(rdGas, rdGas) > 0.0;
+            }
+            vec3 tint = exp(-GLASS_ABSORB * glassPath);
+            if (enteredGas) {
+                float wGas = wB * (1.0 - Fi);
+                // interior path 1: from pI to the far inner wall or the electrode
+                vec2 far = sphereRoots(pI, rdGas, R2I);
+                float tFar = far.y;
+                vec2 el = sphereRoots(pI, rdGas, R1);
+                bool hitElectrode = el.x > 0.0 && el.x < tFar;
+                float tEnd = hitElectrode ? el.x : tFar;
+                float tStem = stemHit(pI, rdGas, tEnd);
+                bool hitStem = tStem > 0.0;
+                if (hitStem) { tEnd = tStem; hitElectrode = false; }
+                Interior in1 = traceInterior(pI, rdGas, 0.0, tEnd);
+                vec3 em1 = in1.emission * radScale + in1.ambient * knobs.y + corona(pI, rdGas, 0.0, tEnd) * radScale;
+                hdr += wGas * tint * em1;
+                emissive += wGas * tint * em1;
+                if (in1.bestLum * radScale > bestLumAll && in1.bestSeg >= 0) {
+                    bestLumAll = in1.bestLum * radScale;
+                    // layer 3 candidate: motion from the segment's previous position at the same parameter
+                    vec4 a = seg[SEGS * in1.bestSeg], b = seg[SEGS * in1.bestSeg + 1];
+                    vec4 pa = seg[SEGS * in1.bestSeg + 3], pb = seg[SEGS * in1.bestSeg + 4];
+                    vec3 p = pI + rdGas * in1.bestT;
+                    vec3 ab = b.xyz - a.xyz;
+                    float u = clamp(dot(p - a.xyz, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+                    mvPointCur = p;
+                    mvPointPrev = p - (mix(a.xyz, b.xyz, u) - mix(pa.xyz, pb.xyz, u));
+                }
+                if (in1.capped) atomicAdd(flagged, 1);
+                atomicAdd(hist[min(in1.candidates / 8, 63)], 1);
+                candTotal += in1.candidates;
+
+                vec3 pEnd = pI + rdGas * tEnd;
+                if (hitStem) {
+                    // the dark matte rod, lit a little by the filaments
+                    vec3 nS = normalize(vec3(pEnd.x, 0.0, pEnd.z));
+                    vec3 lit = vec3(0.04) * (flags.y == 1 ? lineLightDiffuse(pEnd, nS) : vec3(0.0)) / PI
+                             + 0.02 * lineLightSpecular(pEnd, nS, -rdGas, 0.4);
+                    hdr += wGas * tint * lit;
+                    if (bestLumAll < 0.02) { layer = 2.0; hitDist = tO + glassPath + tEnd; mvPointCur = pEnd; mvPointPrev = pEnd; }
+                } else if (hitElectrode) {
+                    // dark polished electrode lit by the filaments
+                    vec3 nE = pEnd / R1;
+                    // the bulb is a dark glass ball: little diffuse, a faint gloss (the footage shows a
+                    // dark centre with a bright rim and bright attachment points)
+                    vec3 albedo = vec3(0.006);
+                    vec3 lit = albedo * (flags.y == 1 ? lineLightDiffuse(pEnd, nE) : vec3(0.0)) / PI
+                             + 0.06 * lineLightSpecular(pEnd, nE, -rdGas, 0.12) + roomRadiance(reflect(rdGas, nE)) * 0.015;   // a glassy bulb: soft filament reflections
+                    // the glow discharge covers the electrode: an emissive surface, brightness with the
+                    // total current, brighter at grazing view (thin luminous layer seen edge on)
+                    // a translucent luminous shell: bright rim (limb brightening), darker centre
+                    float mu = abs(dot(rdGas, nE));
+                    // limb brightening of a thin luminous shell: dark centre, bright rim (the
+                    // photos show the electrode as a pink ring around a dark ball)
+                    float grazing = 0.004 + 0.5 * (1.0 - mu) + 8.0 * pow(1.0 - mu, 4.0);   // thin bright rim, dark ball
+                    // the glow discharge over the bulb intensifies with the strongest attached channel
+                    // (footage: the ball turns bright pink all over under a touch while I_tot barely
+                    // moves): sheath gain = sum of (I_k / 50 uA)^2.5 over the roots, 1 for ~30 x 40 uA
+                    vec4 roots = rootGlow(nE);
+                    float sheathGain = clamp(roots.w / 20.0, 0.5, 12.0);
+                    vec3 glow = (ELECTRODE_RGB * (0.012 * gas.x * grazing * sheathGain) + roots.rgb) * radScale;   // rim bright, not clipped (footage (118,71,157))
+                    hdr += wGas * tint * (lit + glow);
+                    emissive += wGas * tint * glow;
+                    if (bestLumAll < 0.02) { layer = 2.0; hitDist = tO + glassPath + tEnd; mvPointCur = pEnd; mvPointPrev = pEnd; }
+                } else {
+                    // far inner wall: foot discs, transmit to the room, reflect back through the gas (C)
+                    vec3 nF = pEnd / R2I;                    // outward normal; ray goes outward
+                    float cF = dot(rdGas, nF);
+                    float Ff = fresnelDielectric(cF, IOR);   // gas -> glass
+                    vec3 feet = footGlow(nF) * radScale;
+                    hdr += wGas * tint * feet;
+                    emissive += wGas * tint * feet;
+                    // transmit: glass path then out
+                    vec3 rdG2 = refract(rdGas, -nF, 1.0 / IOR);
+                    if (dot(rdG2, rdG2) > 0.0) {
+                        vec2 out2 = sphereRoots(pEnd, rdG2, R2O);
+                        float gp2 = max(out2.y, 0.0);
+                        vec3 pX = pEnd + rdG2 * gp2;
+                        vec3 nX = pX / R2O;
+                        vec3 rdOut = refract(rdG2, -nX, IOR);
+                        vec3 tint2 = exp(-GLASS_ABSORB * gp2);
+                        vec3 through = vec3(0.0);
+                        if (dot(rdOut, rdOut) > 0.0) {
+                            float Fx = fresnelDielectric(dot(rdG2, nX), 1.0 / IOR);
+                            float tT = (rdOut.y < -1e-6) ? (TABLE_Y - pX.y) / rdOut.y : -1.0;
+                            if (tT > 0.0) {
+                                vec3 pT = pX + rdOut * tT;
+                                vec3 lit = vec3(0.35, 0.33, 0.30) * (flags.y == 1 ? lineLightDiffuse(pT, vec3(0.0, 1.0, 0.0)) : vec3(0.0)) / PI;
+                                through = (1.0 - Fx) * (lit + vec3(0.35, 0.33, 0.30) * roomRadiance(vec3(0.0, 1.0, 0.0)) * 0.1);
+                            } else {
+                                through = (1.0 - Fx) * roomRadiance(rdOut);
+                            }
+                        }
+                        hdr += wGas * (1.0 - Ff) * tint * tint2 * through;
+                    }
+                    // C: reflect at the inner wall, second interior path
+                    vec3 rdC = reflect(rdGas, nF);
+                    vec2 far2 = sphereRoots(pEnd, rdC, R2I);
+                    vec2 el2 = sphereRoots(pEnd, rdC, R1);
+                    float tEnd2 = (el2.x > 0.0 && el2.x < far2.y) ? el2.x : far2.y;
+                    float tStem2 = stemHit(pEnd, rdC, tEnd2);
+                    if (tStem2 > 0.0) tEnd2 = tStem2;                 // the rod occludes the reflected path too
+                    Interior in2 = traceInterior(pEnd, rdC, 1e-4, tEnd2);
+                    vec3 em2 = in2.emission * radScale + in2.ambient * knobs.y + corona(pEnd, rdC, 0.0, tEnd2) * radScale;
+                    float wC = wGas * Ff;
+                    hdr += wC * tint * em2;
+                    emissive += wC * tint * em2;
+                    hdr += wC * tint * 0.5 * roomRadiance(rdC) * 0.2;   // terminate with a dim ambient
+                    if (in2.capped) atomicAdd(flagged, 1);
+                    candTotal += in2.candidates;
+                }
+                if (bestLumAll > 0.02) { layer = 3.0 + (layer - floor(layer)); hitDist = tO + glassPath + in1.bestT; }
+            } else {
+                // TIR at the inner surface (grazing): treat as glass-only
+                hdr += wB * tint * roomRadiance(rdG);
+            }
+        }
+    } else if (tTable > 0.0) {
+        vec3 pT = ro + rd * tTable;
+        vec3 n = vec3(0.0, 1.0, 0.0);
+        vec3 albedo = vec3(0.12, 0.11, 0.10);        // a dark table: the footage shows nothing below the globe
+        hdr = albedo * ((flags.y == 1 ? lineLightDiffuse(pT, n) : vec3(0.0)) / PI + roomRadiance(n) * 0.1);
+        layer = 0.0; hitDist = tTable; mvPointCur = pT; mvPointPrev = pT; haveMv = true;
+    } else {
+        hdr = roomRadiance(rd);
+        layer = 0.0; hitDist = 1e4;
+        mvPointCur = ro + rd * 100.0; mvPointPrev = mvPointCur; haveMv = true;
+    }
+
+    // motion vector: current pixel of the point minus its previous pixel (static interface rule)
+    vec2 mv = vec2(0.0);
+    if (haveMv) mv = project(vp, mvPointCur) - project(vpPrev, mvPointPrev);
+
+    int dbg = flags.x;
+    vec3 outC = hdr;
+    if (dbg == 2) outC = vec3(floor(layer) / 3.0, fract(layer) * 2.0, 0.0);
+    else if (dbg == 3) outC = vec3(abs(mv) * 0.1, 0.0);
+    else if (dbg == 5) outC = vec3(float(candTotal) / float(MAX_CANDIDATES), float(candTotal) / 64.0, 0.0);
+
+    imageStore(outHdr, pix, vec4(max(outC, vec3(0.0)), 1.0));
+    imageStore(outEmissive, pix, vec4(max(emissive, vec3(0.0)), 1.0));
+    imageStore(outMotion, pix, vec4(mv, 0.0, 0.0));
+    imageStore(outLayer, pix, vec4(layer, hitDist, 0.0, 0.0));
+}

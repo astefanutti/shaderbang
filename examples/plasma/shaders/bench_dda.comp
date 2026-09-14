@@ -1,0 +1,167 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// M1 micro-benchmark 2: Amanatides-Woo DDA over a uniform-grid CSR of filament segments with an 8-entry mailbox,
+// evaluating the closed-form capsule integral for every new candidate, with the hard per-ray cap of the plan.
+// Output image: r = integrals evaluated (candidates), g = cell steps, b = candidate tests (incl. mailbox hits),
+// a = radiance; a ray hit the cap iff r >= CAND_CAP (the host derives the flag from r).
+// Stats SSBO: [0] rays inside the globe, [1] total candidate tests (incl. mailbox hits), [2] total evaluations,
+// [3] flagged rays, [4 .. 4+HIST_BINS) histogram of evaluations per ray (HIST_BIN_WIDTH per bin, last bin open).
+// Defines: GRID_N (96), CAND_CAP (270), HISTOGRAM (1), EVAL (1; 0 = traversal and mailbox only, no integral).
+
+#include "common.glsl"
+
+#ifndef GRID_N
+#define GRID_N 96
+#endif
+#ifndef CAND_CAP
+#define CAND_CAP 270
+#endif
+#ifndef HISTOGRAM
+#define HISTOGRAM 1
+#endif
+#ifndef EVAL
+#define EVAL 1
+#endif
+#define HIST_BINS 64
+#define HIST_BIN_WIDTH 5u
+#define MAILBOX 8
+#define MAX_STEPS (3 * GRID_N + 2)
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer Segments { Segment segs[]; };
+layout(std430, binding = 1) readonly buffer CellStart { uint cellStart[]; };
+layout(std430, binding = 2) readonly buffer CellItems { uint cellItems[]; };
+layout(std430, binding = 3) buffer Stats { uint stats[]; };
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+uniform vec3 uGridMin;
+uniform float uCellSize;
+uniform float uScale;
+
+#if HISTOGRAM
+shared uint sHist[HIST_BINS];
+shared uint sTotals[4];
+#endif
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+#if HISTOGRAM
+    uint lid = gl_LocalInvocationIndex;
+    if (lid < HIST_BINS)
+        sHist[lid] = 0u;
+    if (lid < 4u)
+        sTotals[lid] = 0u;
+    barrier();
+#endif
+
+    uint tests = 0u;
+    uint evals = 0u;
+    uint steps = 0u;
+    uint flagged = 0u;
+    float acc = 0.0;
+    bool inside = false;
+
+    if (all(lessThan(pix, uRes)))
+    {
+        vec3 rd = cameraRay(pix, vec2(0.5));
+        vec2 th = sphIntersect(uEye, rd, vec3(0.0), GLOBE_R2I);
+        if (th.y > 0.0)
+        {
+            inside = true;
+            float tEntry = max(th.x, 0.0);
+            vec3 ro = uEye + tEntry * rd;   // re-based origin (see common.glsl, Precision)
+            float tEnd = th.y - tEntry;
+
+            // Amanatides & Woo set-up
+            vec3 g = (ro - uGridMin) / uCellSize;
+            ivec3 cell = clamp(ivec3(floor(g)), ivec3(0), ivec3(GRID_N - 1));
+            ivec3 stp = ivec3(sign(rd));
+            vec3 invDir = 1.0 / rd;   // +-inf on zero components is handled by the max() below
+            vec3 tDelta = abs(uCellSize * invDir);
+            vec3 nextBoundary = uGridMin + (vec3(cell) + max(vec3(stp), vec3(0.0))) * uCellSize;
+            vec3 tMax = (nextBoundary - ro) * invDir;
+            tMax = mix(tMax, vec3(1e30), equal(stp, ivec3(0)));
+
+            uint mailbox[MAILBOX];
+            for (int i = 0; i < MAILBOX; ++i)
+                mailbox[i] = 0xffffffffu;
+            int mbHead = 0;
+
+            float t = 0.0;
+            while (steps < uint(MAX_STEPS))
+            {
+                uint ci = uint((cell.z * GRID_N + cell.y) * GRID_N + cell.x);
+                uint begin = cellStart[ci];
+                uint end = cellStart[ci + 1u];
+                for (uint j = begin; j < end; ++j)
+                {
+                    uint id = cellItems[j];
+                    ++tests;
+                    bool seen = false;
+                    for (int m = 0; m < MAILBOX; ++m)
+                        seen = seen || (mailbox[m] == id);
+                    if (seen)
+                        continue;
+                    mailbox[mbHead] = id;
+                    mbHead = (mbHead + 1) & (MAILBOX - 1);
+#if EVAL
+                    Segment s = segs[id];
+                    float eps2 = s.p0e.w * s.p0e.w;
+                    acc += s.p1w.w * eps2 * capsuleEmission3(ro, rd, 0.0, tEnd, s.p0e.xyz, s.p1w.xyz, eps2);
+#else
+                    acc += float(id & 1u);
+#endif
+                    ++evals;
+                    if (evals >= uint(CAND_CAP))
+                    {
+                        flagged = 1u;
+                        break;
+                    }
+                }
+                if (flagged != 0u)
+                    break;
+
+                // advance to the next cell
+                ++steps;
+                if (tMax.x < tMax.y && tMax.x < tMax.z)
+                {
+                    t = tMax.x; cell.x += stp.x; tMax.x += tDelta.x;
+                    if (cell.x < 0 || cell.x >= GRID_N) break;
+                }
+                else if (tMax.y < tMax.z)
+                {
+                    t = tMax.y; cell.y += stp.y; tMax.y += tDelta.y;
+                    if (cell.y < 0 || cell.y >= GRID_N) break;
+                }
+                else
+                {
+                    t = tMax.z; cell.z += stp.z; tMax.z += tDelta.z;
+                    if (cell.z < 0 || cell.z >= GRID_N) break;
+                }
+                if (t >= tEnd)
+                    break;
+            }
+        }
+        imageStore(uOut, pix, vec4(float(evals), float(steps), float(tests), acc * uScale));
+    }
+
+#if HISTOGRAM
+    if (inside)
+    {
+        atomicAdd(sHist[min(evals / HIST_BIN_WIDTH, uint(HIST_BINS - 1))], 1u);
+        atomicAdd(sTotals[0], 1u);
+        atomicAdd(sTotals[1], tests);
+        atomicAdd(sTotals[2], evals);
+        atomicAdd(sTotals[3], flagged);
+    }
+    barrier();
+    if (lid < HIST_BINS && sHist[lid] != 0u)
+        atomicAdd(stats[4u + lid], sHist[lid]);
+    if (lid < 4u && sTotals[lid] != 0u)
+        atomicAdd(stats[lid], sTotals[lid]);
+#endif
+}

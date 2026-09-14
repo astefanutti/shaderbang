@@ -1,0 +1,156 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// Temporal upscale (internal resolution -> display resolution, 2x per axis) with per-layer
+// motion vectors. Built from the documented formulas of Karis 2014 (neighbourhood clamping,
+// reversible tone mapping), the FSR2 documentation (Halton jitter, sample reconstruction,
+// history rejection) and the Q2RTX blend rule (history weight >= 0.9, wider clamp on
+// refracted pixels) -- reimplemented, no code copied.
+//
+// Layers written by trace.comp: 0 room/background, 1 glass first surface, 2 solid seen through
+// the glass (electrode, base), 3 filament volume. The motion vector of a pixel is already the
+// right one for its layer (analytic reprojection for 0/1, refracted-hit reprojection for 2,
+// argmax-emission segment previous position for 3), so this pass only has to keep motion-vector
+// dilation and history reuse WITHIN a layer.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D colorTex;     // internal res, linear HDR, jittered
+layout(binding = 1) uniform sampler2D mvTex;        // internal res, rg: curr - prev in internal pixels
+layout(binding = 2) uniform sampler2D layerTex;     // internal res, r: layer id (+0.5 = mixed Fresnel), g: hit distance
+layout(binding = 3) uniform sampler2D historyTex;   // display res, linear HDR of the previous resolve
+layout(binding = 4) uniform sampler2D historyLayerTex; // display res, r: layer id of the previous resolve
+layout(rgba16f, binding = 0) uniform writeonly image2D outColor;
+layout(r32f,    binding = 1) uniform writeonly image2D outLayer;
+
+uniform vec2  jitter;          // sub-pixel offset of this frame's samples, in internal pixels
+uniform float exposureRatio;   // exposure_now / exposure_prev (history is rescaled before the clamp)
+uniform int   firstFrame;
+uniform int   enabled;         // 0 -> plain bilinear upscale (reference / debug)
+uniform float clampGamma;      // 1.0 nominal; x2 on layers 2-3 and mixed-Fresnel pixels
+
+// --- helpers -----------------------------------------------------------------------------------
+vec3 rgbToYCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 yCoCgToRgb(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3 tonemapFwd(vec3 c) { return c / (1.0 + luma(c)); }           // Karis reversible tone map
+vec3 tonemapInv(vec3 c) { return c / max(1.0 - luma(c), 1e-4); }
+
+// Catmull-Rom bicubic with 5 bilinear taps (Karis 2014 / Jimenez)
+vec3 sampleCatmullRom(sampler2D tex, vec2 uv, vec2 texSize) {
+    vec2 samplePos = uv * texSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / w12;
+    vec2 texPos0 = (texPos1 - 1.0) / texSize;
+    vec2 texPos3 = (texPos1 + 2.0) / texSize;
+    vec2 texPos12 = (texPos1 + offset12) / texSize;
+    vec3 result = vec3(0.0);
+    result += textureLod(tex, vec2(texPos0.x,  texPos0.y),  0.0).rgb * w0.x  * w0.y;
+    result += textureLod(tex, vec2(texPos12.x, texPos0.y),  0.0).rgb * w12.x * w0.y;
+    result += textureLod(tex, vec2(texPos3.x,  texPos0.y),  0.0).rgb * w3.x  * w0.y;
+    result += textureLod(tex, vec2(texPos0.x,  texPos12.y), 0.0).rgb * w0.x  * w12.y;
+    result += textureLod(tex, vec2(texPos12.x, texPos12.y), 0.0).rgb * w12.x * w12.y;
+    result += textureLod(tex, vec2(texPos3.x,  texPos12.y), 0.0).rgb * w3.x  * w12.y;
+    result += textureLod(tex, vec2(texPos0.x,  texPos3.y),  0.0).rgb * w0.x  * w3.y;
+    result += textureLod(tex, vec2(texPos12.x, texPos3.y),  0.0).rgb * w12.x * w3.y;
+    result += textureLod(tex, vec2(texPos3.x,  texPos3.y),  0.0).rgb * w3.x  * w3.y;
+    return max(result, vec3(0.0));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(outColor);
+    if (p.x >= outSize.x || p.y >= outSize.y) return;
+    vec2 inSize = vec2(textureSize(colorTex, 0));
+    vec2 uv = (vec2(p) + 0.5) / vec2(outSize);
+
+    if (enabled == 0) {
+        vec3 c = textureLod(colorTex, uv, 0.0).rgb;
+        float l = textureLod(layerTex, uv, 0.0).r;
+        imageStore(outColor, p, vec4(c, 1.0));
+        imageStore(outLayer, p, vec4(l));
+        return;
+    }
+
+    // --- reconstruct the current frame at the output pixel from the jittered internal samples
+    // The internal sample (i, j) was taken at internal position (i + 0.5 + jitter).
+    vec2 posIn = uv * inSize;                 // output pixel centre in internal pixels
+    ivec2 c0 = ivec2(floor(posIn - 0.5 - jitter));
+    vec3 sumC = vec3(0.0);
+    float sumW = 0.0;
+    vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+    float nCount = 0.0;
+    vec3 mvBest = vec3(0.0);                  // xy motion, z hit distance of the chosen sample
+    float layerC = 0.0;
+    float bestDist = 1e30;
+    // layer of the nearest sample decides the pixel's layer
+    ivec2 cn = ivec2(round(posIn - 0.5 - jitter));
+    cn = clamp(cn, ivec2(0), ivec2(inSize) - 1);
+    vec2 layerN = texelFetch(layerTex, cn, 0).rg;
+    layerC = layerN.r;
+    int layerId = int(floor(layerC + 0.25));
+    bool mixedFresnel = fract(layerC) > 0.4;
+    for (int j = -1; j <= 2; ++j) {
+        for (int i = -1; i <= 2; ++i) {
+            ivec2 q = clamp(c0 + ivec2(i, j), ivec2(0), ivec2(inSize) - 1);
+            vec2 samplePos = vec2(q) + 0.5 + jitter;
+            vec2 d = samplePos - posIn;
+            float r2 = dot(d, d);
+            float w = exp(-2.0 * r2);        // Gaussian reconstruction, sigma = 0.5 internal pixel
+            vec3 c = tonemapFwd(textureLod(colorTex, (vec2(q) + 0.5) / inSize, 0.0).rgb);
+            vec2 ls = texelFetch(layerTex, q, 0).rg;
+            int lid = int(floor(ls.r + 0.25));
+            sumC += c * w;
+            sumW += w;
+            // neighbourhood statistics for the clamp (3x3 around the nearest sample)
+            if (abs(i) <= 1 && abs(j) <= 1) {
+                vec3 y = rgbToYCoCg(c);
+                m1 += y; m2 += y * y; nCount += 1.0;
+            }
+            // motion vector: nearest hit within the pixel's own layer (dilation within a layer only)
+            if (lid == layerId && ls.g < bestDist) {
+                bestDist = ls.g;
+                mvBest = vec3(texelFetch(mvTex, q, 0).rg, ls.g);
+            }
+        }
+    }
+    vec3 current = sumC / max(sumW, 1e-4);
+    vec3 mean = m1 / nCount;
+    vec3 var = max(m2 / nCount - mean * mean, vec3(0.0));
+    vec3 sigma = sqrt(var);
+
+    // --- reproject the history through the layer's motion vector
+    vec2 prevUv = uv - mvBest.xy / inSize;
+    bool valid = firstFrame == 0 && all(greaterThanEqual(prevUv, vec2(0.0))) && all(lessThanEqual(prevUv, vec2(1.0)));
+    float prevLayer = textureLod(historyLayerTex, prevUv, 0.0).r;
+    if (int(floor(prevLayer + 0.25)) != layerId) valid = false;
+
+    vec3 result;
+    if (!valid) {
+        result = current;
+    } else {
+        vec3 hist = sampleCatmullRom(historyTex, prevUv, vec2(outSize)) * exposureRatio;
+        vec3 histT = tonemapFwd(hist);
+        // neighbourhood clamp in YCoCg, wider on refracted / mixed-Fresnel pixels
+        float g = clampGamma * ((layerId >= 2 || mixedFresnel) ? 2.0 : 1.0);
+        vec3 lo = mean - g * sigma;
+        vec3 hi = mean + g * sigma;
+        vec3 hy = clamp(rgbToYCoCg(histT), lo, hi);
+        histT = max(yCoCgToRgb(hy), vec3(0.0));
+        // blend: history weight >= 0.9 (Q2RTX rule), a little less under fast motion
+        float motionPx = length(mvBest.xy) * 2.0;             // in output pixels
+        float motionW = clamp(motionPx / 8.0, 0.0, 1.0);
+        float sampleW = clamp(sumW, 0.0, 1.0);                 // ~1 when a sample landed on this pixel
+        float alpha = clamp(max(motionW, sampleW) * 0.1, 0.02, 1.0);
+        result = mix(histT, current, alpha);
+    }
+    imageStore(outColor, p, vec4(tonemapInv(result), 1.0));
+    imageStore(outLayer, p, vec4(layerC));
+}

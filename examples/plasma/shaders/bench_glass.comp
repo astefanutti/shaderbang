@@ -1,0 +1,182 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// M1 micro-benchmark 3: the deterministic glass split of plan 5.2 with no filaments.
+//   A  outer reflection, weight F_o, to the procedural environment;
+//   B  refract outer -> refract inner, weight (1 - F_o)(1 - F_i), interior path: electrode hit, or far inner
+//      wall -> refract back through the shell -> exit refraction -> environment;
+//   C  inner-surface reflection incl. TIR at the entry (weight (1 - F_o) F_i), back through the shell and out;
+//      and (FAR_WALL_REFLECTION) the far-wall reflection of the interior path, a second interior path that
+//      hits the electrode or exits through the shell.
+// Exact pbrt/GLSL-PathTracer DielectricFresnel at every interface, Beer-Lambert over every glass path length,
+// and pbrt's radiance-transport scaling on every transmission followed along the camera ray: the radiance
+// gathered beyond an interface is multiplied by (n_i / n_t)^2 (pbrt 4ed 9.5, `ft /= Sqr(etap)` with
+// etap = n_t / n_i; L / n^2 is the invariant), i.e. by 1 / IOR^2 where the camera ray enters the glass and by
+// IOR^2 where it leaves it.  Every path here ends in air or gas (n = 1), so the factors cancel pairwise; they
+// are kept so that a path terminating inside the shell would be scaled correctly.
+// Defines: FAR_WALL_REFLECTION (1).
+
+#include "common.glsl"
+
+#ifndef FAR_WALL_REFLECTION
+#define FAR_WALL_REFLECTION 1
+#endif
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+const float ETA_IN = 1.0 / GLASS_IOR;     // air/gas -> glass
+const float ETA_OUT = GLASS_IOR;          // glass -> air/gas
+const float SCALE_IN = 1.0 / (GLASS_IOR * GLASS_IOR);   // radiance gathered past an air/gas -> glass entry
+const float SCALE_OUT = GLASS_IOR * GLASS_IOR;          // radiance gathered past a glass -> air/gas exit
+const vec3 GLASS_ABSORPTION = vec3(9.0, 3.0, 12.0);   // soda-lime, per metre (green edge tint)
+const float FLOOR_Y = -0.115;
+
+vec3 beer(float pathLength)
+{
+    return exp(-GLASS_ABSORPTION * pathLength);
+}
+
+// Small analytic room: sky gradient, a soft rectangular "window" light, a checkered floor plane.
+vec3 envRadiance(vec3 ro, vec3 rd)
+{
+    vec3 sky = mix(vec3(0.16, 0.18, 0.22), vec3(0.45, 0.55, 0.75), clamp(rd.y * 0.5 + 0.5, 0.0, 1.0));
+    vec3 windowDir = normalize(vec3(-0.6, 0.7, 0.4));
+    float w = smoothstep(0.90, 0.985, dot(rd, windowDir));
+    vec3 col = sky + w * vec3(6.0, 5.6, 5.0);
+    if (rd.y < -1e-4)
+    {
+        float t = (FLOOR_Y - ro.y) / rd.y;
+        vec3 p = ro + t * rd;
+        float checker = mod(floor(p.x * 10.0) + floor(p.z * 10.0), 2.0);
+        vec3 albedo = mix(vec3(0.18), vec3(0.32), checker);
+        float falloff = exp(-0.5 * dot(p.xz, p.xz) / (0.5 * 0.5));
+        col = albedo * (0.35 + 0.9 * falloff) * vec3(1.0, 0.97, 0.92);
+    }
+    return col;
+}
+
+// Dark metal ball: tiny diffuse term plus a Schlick-weighted environment reflection.
+vec3 shadeElectrode(vec3 p, vec3 v)
+{
+    vec3 n = normalize(p);
+    float cosT = clamp(dot(n, -v), 0.0, 1.0);
+    float F = 0.04 + 0.96 * pow(1.0 - cosT, 5.0);
+    vec3 diffuse = vec3(0.025) * (0.5 + 0.5 * n.y);
+    return diffuse + F * envRadiance(p, reflect(v, n));
+}
+
+// Ray inside the shell at p travelling along d: reach the outer surface, refract out (glass -> air) with Beer over
+// the traversed glass length; the reflected part at the exit is dropped (deterministic split, no RR).
+vec3 exitShell(vec3 p, vec3 d, float glassSoFar)
+{
+    float te = sphIntersect(p, d, vec3(0.0), GLOBE_R2O).y;
+    vec3 pe = p + te * d;
+    vec3 ne = pe / GLOBE_R2O;
+    float cosE = clamp(dot(d, ne), 0.0, 1.0);
+    float Fe = DielectricFresnel(cosE, ETA_OUT);
+    if (Fe >= 1.0)
+        return vec3(0.0);
+    vec3 rdOut = refract(d, -ne, ETA_OUT);
+    return (1.0 - Fe) * SCALE_OUT * beer(glassSoFar + te) * envRadiance(pe, rdOut);
+}
+
+// Ray in the gas at p along d (unit): electrode hit, else the far inner wall where it splits into the transmitted
+// path through the shell (always) and, optionally, one reflected second interior path.
+vec3 interiorPath(vec3 p, vec3 d, float glassSoFar, bool allowReflection)
+{
+    vec2 te = sphIntersect(p, d, vec3(0.0), GLOBE_R1);
+    if (te.x > 0.0)
+    {
+        vec3 ph = p + te.x * d;
+        return shadeElectrode(ph, d) * beer(glassSoFar);
+    }
+    float tf = sphIntersect(p, d, vec3(0.0), GLOBE_R2I).y;
+    vec3 pf = p + tf * d;
+    vec3 nf = pf / GLOBE_R2I;
+    float cosF = clamp(dot(d, nf), 0.0, 1.0);
+    float Ff = DielectricFresnel(cosF, ETA_IN);
+    vec3 col = vec3(0.0);
+    // transmitted into the shell (never TIR going into the denser medium)
+    vec3 dg = refract(d, -nf, ETA_IN);
+    col += (1.0 - Ff) * SCALE_IN * exitShell(pf, dg, glassSoFar);
+#if FAR_WALL_REFLECTION
+    if (allowReflection)
+    {
+        vec3 dr = reflect(d, nf);
+        vec2 te2 = sphIntersect(pf, dr, vec3(0.0), GLOBE_R1);
+        if (te2.x > 0.0)
+        {
+            vec3 ph = pf + te2.x * dr;
+            col += Ff * shadeElectrode(ph, dr) * beer(glassSoFar);
+        }
+        else
+        {
+            float tf2 = sphIntersect(pf, dr, vec3(0.0), GLOBE_R2I).y;
+            vec3 pf2 = pf + tf2 * dr;
+            vec3 nf2 = pf2 / GLOBE_R2I;
+            float cosF2 = clamp(dot(dr, nf2), 0.0, 1.0);
+            float Ff2 = DielectricFresnel(cosF2, ETA_IN);
+            vec3 dg2 = refract(dr, -nf2, ETA_IN);
+            col += Ff * (1.0 - Ff2) * SCALE_IN * exitShell(pf2, dg2, glassSoFar);
+        }
+    }
+#endif
+    return col;
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pix, uRes)))
+        return;
+
+    vec3 rd = cameraRay(pix, vec2(0.5));
+    vec3 ro = uEye;
+
+    vec2 to = sphIntersect(ro, rd, vec3(0.0), GLOBE_R2O);
+    if (to.x <= 0.0)
+    {
+        imageStore(uOut, pix, vec4(envRadiance(ro, rd), 1.0));
+        return;
+    }
+
+    vec3 p0 = ro + to.x * rd;
+    vec3 n0 = p0 / GLOBE_R2O;
+    float cosO = clamp(-dot(rd, n0), 0.0, 1.0);
+    float Fo = DielectricFresnel(cosO, ETA_IN);
+
+    // A: outer reflection
+    vec3 col = Fo * envRadiance(p0, reflect(rd, n0));
+
+    // into the glass
+    vec3 dg = refract(rd, n0, ETA_IN);
+    float wB = (1.0 - Fo) * SCALE_IN;
+    vec2 ti = sphIntersect(p0, dg, vec3(0.0), GLOBE_R2I);
+    if (ti.x <= 0.0)
+    {
+        // grazing chord that never reaches the inner surface: straight through the shell
+        col += wB * exitShell(p0, dg, 0.0);
+        imageStore(uOut, pix, vec4(col, 1.0));
+        return;
+    }
+    float glass1 = ti.x;
+    vec3 p1 = p0 + ti.x * dg;
+    vec3 n1 = p1 / GLOBE_R2I;
+    float cosI = clamp(-dot(dg, n1), 0.0, 1.0);
+    float Fi = DielectricFresnel(cosI, ETA_OUT);   // 1.0 under TIR (grazing rim)
+
+    // C: inner-surface reflection at the entry, back through the shell and out
+    col += wB * Fi * exitShell(p1, reflect(dg, n1), glass1);
+
+    // B: into the gas
+    if (Fi < 1.0)
+    {
+        vec3 din = refract(dg, n1, ETA_OUT);
+        col += wB * (1.0 - Fi) * SCALE_OUT * interiorPath(p1, din, glass1, true);
+    }
+
+    imageStore(uOut, pix, vec4(col, 1.0));
+}

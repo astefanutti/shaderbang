@@ -1,0 +1,56 @@
+#version 460
+// Copyright (C) 2025 Antonin Stefanutti <antonin.stefanutti@gmail.com>
+// SPDX-License-Identifier: MIT
+//
+// Glow pyramid, downsample step (Jimenez 2014 "Next Generation Post Processing in Call of Duty"
+// 13-tap filter; the first level uses the Karis average to tame fireflies). The pyramid is
+// shaped into the Kim-Lin / Narasimhan-Nayar APSF radial profile by the per-level weights
+// applied in glow_up.comp (fitted at start-up by plasma/apsf.py).
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D srcTex;                    // previous level (bilinear, clamp)
+layout(rgba16f, binding = 0) uniform writeonly image2D dstImg;   // this level
+uniform int firstLevel;                                          // 1 -> Karis-weighted average
+
+vec3 fetch(vec2 uv) { return textureLod(srcTex, uv, 0.0).rgb; }
+
+float karis(vec3 c) { return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dstSize = imageSize(dstImg);
+    if (dst.x >= dstSize.x || dst.y >= dstSize.y) return;
+    vec2 srcSize = vec2(textureSize(srcTex, 0));
+    vec2 texel = 1.0 / srcSize;
+    vec2 uv = (vec2(dst) + 0.5) / vec2(dstSize);
+
+    // 13 taps: 4 at +-1 texel (inner square), 9 at +-2 texels (outer square + centre)
+    vec3 a = fetch(uv + texel * vec2(-2.0,  2.0));
+    vec3 b = fetch(uv + texel * vec2( 0.0,  2.0));
+    vec3 c = fetch(uv + texel * vec2( 2.0,  2.0));
+    vec3 d = fetch(uv + texel * vec2(-2.0,  0.0));
+    vec3 e = fetch(uv);
+    vec3 f = fetch(uv + texel * vec2( 2.0,  0.0));
+    vec3 g = fetch(uv + texel * vec2(-2.0, -2.0));
+    vec3 h = fetch(uv + texel * vec2( 0.0, -2.0));
+    vec3 i = fetch(uv + texel * vec2( 2.0, -2.0));
+    vec3 j = fetch(uv + texel * vec2(-1.0,  1.0));
+    vec3 k = fetch(uv + texel * vec2( 1.0,  1.0));
+    vec3 l = fetch(uv + texel * vec2(-1.0, -1.0));
+    vec3 m = fetch(uv + texel * vec2( 1.0, -1.0));
+
+    vec3 result;
+    if (firstLevel == 1) {
+        // partial averages weighted by Karis luma
+        vec3 g0 = (a + b + d + e) * 0.25, g1 = (b + c + e + f) * 0.25;
+        vec3 g2 = (d + e + g + h) * 0.25, g3 = (e + f + h + i) * 0.25;
+        vec3 g4 = (j + k + l + m) * 0.25;
+        float w0 = karis(g0), w1 = karis(g1), w2 = karis(g2), w3 = karis(g3), w4 = karis(g4);
+        result = (g0 * w0 * 0.125 + g1 * w1 * 0.125 + g2 * w2 * 0.125 + g3 * w3 * 0.125 + g4 * w4 * 0.5)
+               / (0.125 * (w0 + w1 + w2 + w3) + 0.5 * w4);
+    } else {
+        result = e * 0.125 + (a + c + g + i) * 0.03125 + (b + d + f + h) * 0.0625 + (j + k + l + m) * 0.125;
+    }
+    imageStore(dstImg, dst, vec4(result, 1.0));
+}
