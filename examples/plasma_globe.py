@@ -74,8 +74,8 @@ Keyboard Controls
                             8 surface charge, 9 native reference)
     B                       Print per-pass timings and simulation counters
     Ctrl+S                  Dump the simulation state for the headless validator
-    (any other key)         Logged as '[keys] unbound <evdev name>' so a layout mismatch shows up
-    Every change prints '[keys] <setting> <new value>'.
+    Every press prints '[keys] press <evdev name>' (a layout that sends other scancodes shows up
+    there) and every change prints '[keys] <setting> <new value>'.
 
 Mouse Controls
 --------------
@@ -385,6 +385,9 @@ class Fingers:
         return list(self.dirs.values())
 
 
+DRAG_SENSITIVITY = 0.5   # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
+
+
 class Mouse(shaderbang.input.Mouse):
 
     def __init__(self):
@@ -401,9 +404,9 @@ class Mouse(shaderbang.input.Mouse):
             if self.finger:
                 fingers.move(Fingers.MOUSE_SLOT, camera.pick_globe(self.mouseX, self.mouseY))
             elif self.button == EV_KEY.BTN_LEFT:
-                camera.orbit(self.deltaX, self.deltaY, 0.5 / self.resolution[1])
+                camera.orbit(self.deltaX, self.deltaY, DRAG_SENSITIVITY * 0.5 / self.resolution[1])
             elif self.button == EV_KEY.BTN_RIGHT:
-                camera.track(self.deltaX, self.deltaY, gain=0.001)
+                camera.track(self.deltaX, self.deltaY, gain=DRAG_SENSITIVITY * 0.001)
         elif self.finger:
             fingers.release(Fingers.MOUSE_SLOT)
             self.finger = False
@@ -451,7 +454,7 @@ class Touchscreen(shaderbang.input.MultiTouch[FingerSlot]):
             vec1 = wp.quat_rotate(quat, self.holroyd_trackball(slot.prevX, slot.prevY))
             vec2 = wp.quat_rotate(quat, self.holroyd_trackball(slot.touchX, slot.touchY))
             theta = wp.atan2(wp.dot(wp.cross(vec2, vec1), camera.UP), wp.dot(vec2, vec1))
-            camera.rotate(wp.PI * theta, - wp.TAU * slot.deltaY * 0.5 / self.resolution[1])
+            camera.rotate(DRAG_SENSITIVITY * wp.PI * theta, - DRAG_SENSITIVITY * wp.TAU * slot.deltaY * 0.5 / self.resolution[1])
         elif n > 1:
             cx = cy = dx = dy = 0.0
             for slot in slots:
@@ -467,7 +470,7 @@ class Touchscreen(shaderbang.input.MultiTouch[FingerSlot]):
                 slot.prevX += dx
                 slot.prevY += dy
             scale, theta, tx, ty = homothety_and_rotation(slots, center=(cx, cy))
-            camera.track(dx, dy)
+            camera.track(dx, dy, gain=DRAG_SENSITIVITY * 0.001)
             camera.dolly_scale(scale)
             camera.rotate(wp.sign(camera.pos[1]) * theta, 0.0)
 
@@ -497,9 +500,9 @@ class Trackpad(shaderbang.input.MultiTouch[TouchSlot]):
             slot.prevY += dy
         scale, theta, tx, ty = homothety_and_rotation(slots, center=(cx, cy))
         if n == 2:
-            camera.orbit(dx, dy, 1.0 / self.resolution[1])
+            camera.orbit(dx, dy, DRAG_SENSITIVITY * 1.0 / self.resolution[1])
         else:
-            camera.track(dx, dy, gain=0.002)
+            camera.track(dx, dy, gain=DRAG_SENSITIVITY * 0.002)
         camera.dolly_scale(scale)
         camera.rotate(wp.sign(camera.pos[1]) * theta, 0.0)
 
@@ -525,9 +528,11 @@ class KeyboardDevice(shaderbang.input.AsciiKeyboard):
     dropped silently), so pressing anything always prints something."""
 
     def event(self, ev, **kwargs):
-        if ev.matches(EV_KEY) and ev.value == 1 and ev.code not in BOUND_KEYS:
+        if ev.matches(EV_KEY) and ev.value == 1:
             mapped = shaderbang.keycodes.keycodes.get(ev.code, -1) >= 0
-            print(f"[keys] unbound {ev.code.name} (scancode {ev.code.value}{'' if mapped else ', not in shaderbang.keycodes'})", flush=True)
+            bound = ev.code in BOUND_KEYS
+            print(f"[keys] press {ev.code.name} (scancode {ev.code.value})"
+                  f"{'' if bound else ' - no binding'}{'' if mapped else ' - not in shaderbang.keycodes'}", flush=True)
         return super().event(ev, **kwargs)
 
 
