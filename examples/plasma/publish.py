@@ -49,9 +49,9 @@ SEG_STRIDE = 7               # vec4 per segment record (see k_segments)
 ROOT_R = 0.011                # electrode radius (plasma.params.R1)
 ROOT_FLARE = 2.5              # extra brightness at the root (x3.5 at the bulb surface)
 ROOT_FLARE_LEN = 2.5e-3       # m: e-folding length of the root flare
-ROOT_WIDEN = 1.5              # extra core radius at the bulb surface (x2.5), e-folding ROOT_WIDEN_LEN
-ROOT_WIDEN_LEN = 3.0e-3       # m
-ROOT_FUNNEL_LEN = 4.0e-3      # m: e-folding length of the sheath funnel at the root (tracer FUNNEL_*)
+ROOT_WIDEN = 2.0              # extra core radius at the bulb surface (x3 at the mouth of the bell)
+ROOT_WIDEN_LEN = 1.5e-3       # m: s0 of the core bell
+ROOT_FUNNEL_LEN = 1.5e-3      # m: s0 of the sheath bell (s0 / (s + s0))^2 at the root (tracer FUNNEL_*)
 GRID_N = 96
 GRID_CELLS = GRID_N * GRID_N * GRID_N
 GRID_EXTENT = R2I            # grid covers [-R2I, R2I]^3
@@ -252,7 +252,8 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
         p0 = xp / wp.max(wp.length(xp), 1.0e-6) * (ROOT_R + 0.0002)
         q0 = qp / wp.max(wp.length(qp), 1.0e-6) * (ROOT_R + 0.0002)
     # the base of a channel widens into the bulb's glow layer (the footage: roots like a tree's)
-    radius = radius * (1.0 + ROOT_WIDEN * wp.exp(-(wp.length(p0) - ROOT_R) / ROOT_WIDEN_LEN))
+    bell0 = ROOT_WIDEN_LEN / (wp.max(wp.length(p0) - ROOT_R, 0.0) + ROOT_WIDEN_LEN)
+    radius = radius * (1.0 + ROOT_WIDEN * bell0 * bell0)          # the core flares like the bell too
     # mitre planes: bisectors between this span and its neighbours (flat cut where there is none)
     u = p1 - p0
     u = u / wp.max(wp.length(u), 1.0e-9)
@@ -289,7 +290,9 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
     # root funnel factor (1 at the bulb, e-fold ROOT_FUNNEL_LEN): the tracer widens and brightens
     # the sheath of these spans; their CSR footprint is dilated 2 more cells to hold the wider skirt
     mid_r = wp.length(0.5 * (p0 + p1))
-    root_f = wp.exp(-(mid_r - ROOT_R) / ROOT_FUNNEL_LEN)
+    # a trumpet bell: (s0 / (s + s0))^2 flares abruptly at the mouth (1 at the bulb, 1/4 at s0, 1/16 at 3 s0)
+    bell = ROOT_FUNNEL_LEN / (wp.max(mid_r - ROOT_R, 0.0) + ROOT_FUNNEL_LEN)
+    root_f = bell * bell
     dil = float(DILATION)
     if root_f > 0.3:
         dil = float(DILATION + 2)

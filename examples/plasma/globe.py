@@ -74,6 +74,7 @@ E_CH_GLOBE = V_CH / 0.06      # V/m along a channel: the sustaining drop V_CH ov
 E_PROP_FACTOR = 0.05          # propagation / strike threshold ratio (CHOSEN): a started channel keeps
                               # propagating through the field screened by the attached channels (the
                               # plan's 0.25 starved every tree seeded next to attached ones)
+FOOT_PIN_LEN = 8.0e-3         # m: the channel does not ride the gas within this distance of the glass
 ROOT_SAMPLE_OFFSET = 2.0      # x h: roots ride the flow sampled this far above the electrode (the
                               # channel's attachment follows its hot column out of the no-slip layer)
 FOLLOW_LEN = 0.02             # m: the last 2 cm of a channel under a finger follow the finger (the foot
@@ -244,6 +245,11 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
                 x = x + (best * rr - x) * rate
     r0 = wp.max(wp.length(x), 1.0e-6)
     drift = wp.pow(wp.min(r0 / R2I, 1.0), DRIFT_EXPONENT)
+    # the foot is held by its surface-charge footprint: no sliding within FOOT_PIN_LEN of the glass
+    # (the return flow along the cold wall dragged the feet down while the channel rose; in the
+    # recordings the channel rises, breaks and re-strikes with the foot higher up)
+    tp = wp.clamp((R2I - r0) / FOOT_PIN_LEN, 0.0, 1.0)
+    drift = drift * tp * tp * (3.0 - 2.0 * tp)
     if (f & NODE_ROOT) != 0:
         xs = x * ((R1 + ROOT_SAMPLE_OFFSET * NODE_SPACING) / r0)
         x = x + gas.velocity(gas_u, gas_n, gas_origin, gas_inv_dx, xs) * (drift * p.dt)

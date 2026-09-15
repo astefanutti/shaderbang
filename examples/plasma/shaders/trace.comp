@@ -31,7 +31,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const float SHEATH_SCALE    = 3.0;        // sheath radius = SHEATH_SCALE x core radius (both grow with the current)
 const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core colour (a tint made the hue depend on the core/sheath mix per pixel: blue-purple patches along a filament)
-const float FUNNEL_WIDEN    = 2.5;        // ~3 mm wide soft bases (screenshot: broad flares where the filaments leave the bulb)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
+const float FUNNEL_WIDEN    = 4.0;        // sheath x5 at the mouth of the bell (~7 mm wide skirt on the bulb)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
                                           // soft skirt several mm wide at the bulb narrowing within a bulb radius)
 const float FUNNEL_LIGHT    = 3.0;        // sheath light x(1 + FUNNEL_LIGHT * rootF) at the root (screenshot: the
                                           // funnels saturate within a bulb radius, the haze between them stays dim)
@@ -40,6 +40,8 @@ const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the s
 const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
 const vec3  ELECTRODE_RGB   = vec3(0.52, 0.20, 1.00); // glow discharge covering the electrode: magenta-violet (screenshot face (125,82,168) sRGB)
 const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
+const float POOL_SIGMA      = 0.0018 / 0.011;         // rad: the glow pool a root casts on the anode (1.8 mm)
+const float POOL_GAIN       = 0.008;                  // its peak per (I / 50 uA), before radScale
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
 const vec3  FOOT_RGB        = vec3(1.00, 0.34, 0.72); // surface discharge at a foot: magenta
@@ -559,9 +561,11 @@ vec4 rootGlow(vec3 n) {                                              // rgb: spo
         // the halo is a strong-root effect only (~I^3): thirty ordinary roots leave the ball's face
         // dark (footage (33,13,41)), one touched root lights the whole ball pink
         float ih = min(iRel, 20.0);
-        // both ~I^3: thirty ordinary roots leave no dots on the ball (their flares are on the
-        // filaments themselves), a touched root is a white blob with a pink halo
-        sum += ROOT_RGB * ((0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
+        // the roots light the anode: a soft pool of glow (sigma ~2.5 mm) around every root, ~I, so
+        // the sphere is lit unevenly (bright where filaments attach, dim between); the ~I^3 terms
+        // make a touched root a white blob with a wide pink halo
+        float pool = exp(-0.5 * theta * theta / (POOL_SIGMA * POOL_SIGMA));
+        sum += ROOT_RGB * (POOL_GAIN * iRel * pool + (0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
         gain += ih * ih * sqrt(ih);
     }
     return vec4(sum, gain);
@@ -859,7 +863,7 @@ void main() {
                     // photos show the electrode as a pink ring around a dark ball)
                     // a luminous face with a modest limb (screenshot: the ring 1 mm inside the edge is only ~1.5x
                     // the face; the bright collar around the bulb is the root funnels, not the rim)
-                    float grazing = 0.40 + 0.25 * (1.0 - mu) + 10.0 * pow(1.0 - mu, 8.0);   // face 0.4, a thin bright edge line
+                    float grazing = 0.05 + 0.25 * (1.0 - mu) + 10.0 * pow(1.0 - mu, 8.0);   // dim face (the roots light it), a thin bright edge line
                     // the glow discharge over the bulb intensifies with the strongest attached channel
                     // (footage: the ball turns bright pink all over under a touch while I_tot barely
                     // moves): sheath gain = sum of (I_k / 50 uA)^2.5 over the roots, 1 for ~30 x 40 uA

@@ -534,3 +534,23 @@ haze stays dim, a luminous face (125,82,168) and root flares covering ~40 % of t
   half-width ∝ 1/ramp near the electrode with brightness ∝ ramp, i.e. the flare *is* the halo, no
   separate additive term — the same construction as the funnels above. Kim & Lin 2004: the
   apparent thickness is HDR bleaching of the APSF glow.
+
+### Fourteenth pass — trumpet roots, root-lit anode, feet that re-strike upward (2026-09-15)
+
+* **Roots.** The root factor is now a bell, `(s0 / (s + s0))²` with s0 = 1.5 mm (1 at the bulb, ¼
+  at 1.5 mm, 1/16 at 4.5 mm): the sheath flares ×5 and the core ×3 at the mouth and the flare
+  closes within a few millimetres, like the end of a trumpet (`publish.k_segments`, tracer
+  `FUNNEL_WIDEN` 4). The anode is lit by its roots: each root casts a soft pool of glow on the
+  sphere (σ 1.8 mm, ∝ I, `POOL_GAIN` 0.008, `rootGlow`) over a dim uniform face (limb law
+  `0.05 + 0.25(1−μ) + 10(1−μ)⁸`), so the sphere is bright where filaments attach and dark between.
+  Face mean 0.53 of the filament-core level (screenshot 0.49), face p10/p50/p90 0.32/0.49/0.82
+  (was 0.70/0.83/1.05 uniform with wider, brighter pools).
+* **Feet.** Measured over 4 s at frame 500: roots drift up at +1.6 mm/s (1 % down) but the feet
+  on the glass drifted down at −1.8 mm/s (100 % down) — the return flow along the cold wall,
+  while the channel's middle rose: the arch the user saw. In the recordings the whole channel
+  rises, breaks and re-strikes with its foot higher. The channel no longer rides the gas within
+  8 mm of the glass (`FOOT_PIN_LEN`, smooth ramp): the foot is held by its surface-charge
+  footprint, the rising middle stretches the channel, the re-route regrows it along the risen hot
+  channel. After: foot drift −0.02 mm/s, and the feet's re-strike jumps (254 in 4 s) are upward
+  57 % of the time with a median of +4.8 mm. Population 28, re-routes 2.9 per filament per
+  second (was 3.5), tortuosity p90 1.17.
