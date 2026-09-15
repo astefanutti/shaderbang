@@ -374,8 +374,8 @@ float segDist(vec3 p, vec3 a, vec3 b) {
 // cost: only rays within Rb of a root). BELL_GAIN is dimensionless: light per unit length =
 // BELL_GAIN * pi/3 x this record's power (FAN_POWER ordinary segments).
 const int   BELL_STEPS = 12;
-const float BELL_R     = 3.0e-3;        // base radius at the reference core radius (0.45 mm), ~ I^0.3
-const float BELL_GAIN  = 4.0;
+const float BELL_R     = 4.5e-3;        // base radius at the reference core radius (0.45 mm), ~ I^0.3
+const float BELL_GAIN  = 2.0;
 float bellEmission(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b, float rc) {
     vec3 ab = b - a;
     float L = length(ab);

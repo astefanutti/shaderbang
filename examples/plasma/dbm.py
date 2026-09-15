@@ -147,7 +147,7 @@ REROUTE_MEAN = 0.25         # s: mean of the Poisson re-route timer (the footage
 FORK_LO, FORK_HI = 0.10, 0.60   # fork arc fraction range: most of the channel regrows (a whole-path jump)
                             # it: a fresh strike then lands where the electrode is least screened, so
                             # roots keep spreading instead of collecting where the gas carries them
-STRETCH_TRIGGER = 1.3       # re-route when the main channel has stretched to this multiple of its arc length
+STRETCH_TRIGGER = 1.5       # re-route when the main channel has stretched to this multiple of its arc length
                             # at attachment (CHOSEN; the channel voltage grows with its length and the
                             # supply cannot follow it far: 2 kV of 5 kV at 6 cm; 1.5 re-struck every ~1.5 s
                             # at the drift the footage shows)

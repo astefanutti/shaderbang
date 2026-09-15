@@ -76,6 +76,8 @@ E_PROP_FACTOR = 0.05          # propagation / strike threshold ratio (CHOSEN): a
                               # plan's 0.25 starved every tree seeded next to attached ones)
 FOOT_PIN_LEN = 4.0e-3         # m: the channel does not ride the gas within this distance of the glass
 PLUME_MIN_RISE = 1.0e-3       # m/s: a channel never sinks; its own plume gives it at least this rise (before the drift weight)
+FOOT_CREEP = 0.5              # drift kept inside FOOT_PIN_LEN: the recording's feet creep up ~0.6 mm/s (57 % of crossings up)
+ROOT_DRIFT_GAIN = 1.8         # roots ride the plume over the bulb faster than the drift weight alone gives (recording ~2 mm/s)
 ROOT_SAMPLE_OFFSET = 2.0      # x h: roots ride the flow sampled this far above the electrode (the
                               # channel's attachment follows its hot column out of the no-slip layer)
 FOLLOW_LEN = 0.02             # m: the last 2 cm of a channel under a finger follow the finger (the foot
@@ -250,10 +252,13 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
     # (the return flow along the cold wall dragged the feet down while the channel rose; in the
     # recordings the channel rises, breaks and re-strikes with the foot higher up)
     tp = wp.clamp((R2I - r0) / FOOT_PIN_LEN, 0.0, 1.0)
-    drift = drift * tp * tp * (3.0 - 2.0 * tp)
+    drift = drift * (FOOT_CREEP + (1.0 - FOOT_CREEP) * tp * tp * (3.0 - 2.0 * tp))   # the foot creeps, it does not slide
     if (f & NODE_ROOT) != 0:
+        # the roots walk up the anode (recording: ~2 mm/s, 70 % of crossings upward)
         xs = x * ((R1 + ROOT_SAMPLE_OFFSET * NODE_SPACING) / r0)
-        x = x + gas.velocity(gas_u, gas_n, gas_origin, gas_inv_dx, xs) * (drift * p.dt)
+        vr = gas.velocity(gas_u, gas_n, gas_origin, gas_inv_dx, xs)
+        vr = wp.vec3(vr[0], wp.max(vr[1] * p.g_sign, PLUME_MIN_RISE) * p.g_sign, vr[2])
+        x = x + vr * (ROOT_DRIFT_GAIN * drift * p.dt)
         node_pos[i] = x * ((R1 + NODE_SPACING) / wp.max(wp.length(x), 1.0e-6))
         return
     v = stencil_velocity(gas_u, gas_n, gas_origin, gas_inv_dx, x)

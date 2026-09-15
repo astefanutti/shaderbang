@@ -611,3 +611,27 @@ the root's first link is one of the cone directions), half buried in the ball an
 the fillet radius is now a function of the height above the sphere, |x| − R1, so the mouth hugs
 the ball whatever the tilt; the mouth radius is clamped to the record's 4-cell CSR reach. Face
 0.61 of the core level, p10/p90 0.36/1.02.
+
+### Seventeenth pass — the rolling motion, measured against a third recording (2026-09-15)
+
+Reference: `Screencast from 2026-09-15 10-42-29.webm` (1162×1045, 10 s, 11 distinct frames per
+second). A ring tracker (`/tmp/plasma_dbg/track_ring.py`: intensity vs angle on a ring, peaks,
+nearest-neighbour tracks; vertical velocity in mm/s from the frame spacing) was run on rings
+around the anode (4.3 and 7.6 mm out) and 5 mm inside the glass, on the recording and on 5 s of
+the simulation rendered at 30 fps, with the same code:
+
+| ring | recording | sim before | sim after |
+|---|---|---|---|
+| anode +4.3 mm: median v_y, fraction up | +1.65 mm/s, 0.69 | +0.88, 0.70 | +1.05, 0.77 |
+| anode +7.6 mm | +2.2 mm/s, 0.72 | +1.47, 0.78 | +1.5 to +1.95, 0.79 |
+| anode track lifetime | 0.45–0.55 s | 0.33–0.37 s | 0.40–0.43 s |
+| glass: median v_y | +0.57 mm/s, 0.57 up | 0.00 (pinned) | creep +0.1 (array), jumps 59 % up, +5.5 mm |
+
+So the recording's "rolling" is a coherent upward walk of the roots over the anode at ~2 mm/s
+(70 % of crossings up, births and deaths balanced top/bottom: a walk, not a conveyor) with the
+feet creeping slowly and jumping up on re-strike. The sim had the walk at ~60 % of the speed and
+the feet pinned. Changes: roots ride the plume over the bulb with `ROOT_DRIFT_GAIN` 1.8 and the
+same plume floor as the channel; the foot pin becomes a creep (`FOOT_CREEP` 0.5 of the drift
+inside 4 mm of the glass); `STRETCH_TRIGGER` 1.3 → 1.5 because the faster walk stretched the
+channels sooner (population had slipped 28 → 23; back to 28, re-routes 2.5 per filament per
+second). Bells: base radius 3 → 4.5 mm, gain 4 → 2 (wider, dimmer mouths).
