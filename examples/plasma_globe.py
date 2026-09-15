@@ -135,6 +135,33 @@ from libevdev import Device, EV_ABS, EV_KEY, EV_REL, INPUT_PROP_DIRECT, INPUT_PR
 
 import shaderbang.input
 import shaderbang.keycodes
+
+# --- keycode completion begin
+# The Keyboard input drops any key missing from shaderbang's key table, and installed copies of
+# the package older than 2026-09-15 lack the punctuation, navigation and keypad keys; complete the
+# table in-process (the dict is the one shaderbang.input reads) so the bindings work regardless of
+# which shaderbang the interpreter picked up. The attach line prints that package's path.
+_EXTRA_KEYCODES = {EV_KEY.KEY_MINUS: 189, EV_KEY.KEY_EQUAL: 187, EV_KEY.KEY_LEFTBRACE: 219, EV_KEY.KEY_RIGHTBRACE: 221,
+                   EV_KEY.KEY_COMMA: 188, EV_KEY.KEY_DOT: 190, EV_KEY.KEY_SEMICOLON: 186, EV_KEY.KEY_APOSTROPHE: 222,
+                   EV_KEY.KEY_GRAVE: 192, EV_KEY.KEY_BACKSLASH: 220, EV_KEY.KEY_PAGEUP: 33, EV_KEY.KEY_PAGEDOWN: 34,
+                   EV_KEY.KEY_HOME: 36, EV_KEY.KEY_END: 35, EV_KEY.KEY_INSERT: 45, EV_KEY.KEY_DELETE: 46,
+                   EV_KEY.KEY_KPMINUS: 109, EV_KEY.KEY_KPPLUS: 107, EV_KEY.KEY_KPASTERISK: 106, EV_KEY.KEY_KPSLASH: 111,
+                   EV_KEY.KEY_KPDOT: 110, EV_KEY.KEY_KPENTER: 13}
+
+
+def _complete_keycodes():
+    """Add the missing entries to the table shaderbang.input reads; returns the names added."""
+    added = []
+    for k, v in _EXTRA_KEYCODES.items():
+        if k not in shaderbang.keycodes.keycodes:
+            shaderbang.keycodes.keycodes[k] = v
+            added.append(k.name)
+    return added
+
+
+_KEYCODES_ADDED = _complete_keycodes()
+# --- keycode completion end
+
 from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
 from shaderbang.input import Input, TouchSlot
 from shaderbang.gesture import homothety_and_rotation
@@ -384,7 +411,7 @@ class Fingers:
         return list(self.dirs.values())
 
 
-DRAG_SENSITIVITY = 0.25  # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
+DRAG_SENSITIVITY = 0.15  # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
 
 
 class Mouse(shaderbang.input.Mouse):
@@ -636,6 +663,8 @@ def input_from_device(dev: Device):
         KeyboardDevice(dev.name, dev, keyboard)
         print(f"[keys] keyboard '{dev.name}' attached ({len(shaderbang.keycodes.keycodes)} mapped keys, "
               f"shaderbang from {os.path.dirname(shaderbang.__file__)})", flush=True)
+        if _KEYCODES_ADDED:
+            print(f"[keys] completed the installed key table with {_KEYCODES_ADDED}", flush=True)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
         shaderbang.input.Touchscreen(dev.name, dev, touchscreen)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
