@@ -50,30 +50,32 @@ Operating point (MEASURED = PPPL-4485; DERIVED = neon at 740 Torr / 300 K; CHOSE
 
 Keyboard Controls
 -----------------
-    P               Pause / resume the simulation
-    Space / Right   Advance one frame (works while paused)
-    R               Reset the simulation
-    G               Invert gravity (filaments must still rise in the world frame)
-    I               Toggle an ice cap on top of the globe (filaments bend away from it)
-    - / =           Drive voltage -/+ 250 V  (2-8 kV: the filament count law)  (also V / Shift+V)
-    [ / ]           Drive frequency -/+ 2 kHz (10-40 kHz)           (also N / Shift+N)
-    E / Shift+E     Growth exponent eta x0.8 / x1.25 (120: smooth ropes, 3: lightning trees)
-    Y / Shift+Y     Thermal memory exponent gamma -/+ 0.5
-    F / Shift+F     Finger charge -/+ 0.01
-    T               Cycle the gas preset (Ne+Xe / Ne / Ar / Kr)
-    X               Toggle quincunx surface-charge mode
-    H               Toggle the hybrid re-strike model (off = persistent channels only)
-    L / A           Toggle line lights / glow
-    Up / Down       Glow width -/+
-    , / .           Exposure bias -/+ 0.5 EV  (also O / Shift+O)
-    U               Toggle the temporal upscale (off = native full-resolution reference path)
-    W               Toggle the tree wireframe overlay
-    M               Toggle the nimitz look (plasma_globe.glsl shading driven by the simulated filaments)
-    0-9             Debug views (0 beauty, 1 emissive, 2 layer id, 3 motion vectors, 4 history
-                    weight, 5 candidates per ray, 6 grid occupancy, 7 temperature slice,
-                    8 surface charge, 9 native reference)
-    B               Print per-pass timings and simulation counters
-    Ctrl+S          Dump the simulation state for the headless validator
+    P                       Pause / resume the simulation
+    Space / Right           Advance one frame (works while paused)
+    R                       Reset the simulation
+    G                       Invert gravity (filaments must still rise in the world frame)
+    I                       Toggle an ice cap on top of the globe (filaments bend away from it)
+    - / =  or V / Shift+V   Drive voltage -/+ 250 V (2-8 kV: the filament count law)
+    [ / ]  or N / Shift+N   Drive frequency -/+ 2 kHz (10-40 kHz)
+    E / Shift+E             Growth exponent eta x0.8 / x1.25 (120: smooth ropes, 3: lightning trees)
+    Y / Shift+Y             Thermal memory exponent gamma -/+ 0.5
+    F / Shift+F             Finger charge -/+ 0.01
+    T                       Cycle the gas preset (video / Ne+Xe / Ne / Ar / Kr)
+    X                       Toggle quincunx surface-charge mode
+    H                       Toggle the hybrid re-strike model (off = persistent channels only)
+    L / A                   Toggle line lights / glow
+    Up / Down               Glow width x1.25 / x0.8
+    , / .  or O / Shift+O   Exposure bias -/+ 0.5 EV
+    U                       Toggle the temporal upscale (off = native full-resolution reference path)
+    W                       Toggle the tree wireframe overlay
+    M                       Toggle the nimitz look (plasma_globe.glsl shading driven by the simulated filaments)
+    0-9                     Debug views (0 beauty, 1 emissive, 2 layer id, 3 motion vectors, 4 history
+                            weight, 5 candidates per ray, 6 grid occupancy, 7 temperature slice,
+                            8 surface charge, 9 native reference)
+    B                       Print per-pass timings and simulation counters
+    Ctrl+S                  Dump the simulation state for the headless validator
+    (any other key)         Logged as '[keys] unbound <evdev name>' so a layout mismatch shows up
+    Every change prints '[keys] <setting> <new value>'.
 
 Mouse Controls
 --------------
