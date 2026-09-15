@@ -74,7 +74,8 @@ E_CH_GLOBE = V_CH / 0.06      # V/m along a channel: the sustaining drop V_CH ov
 E_PROP_FACTOR = 0.05          # propagation / strike threshold ratio (CHOSEN): a started channel keeps
                               # propagating through the field screened by the attached channels (the
                               # plan's 0.25 starved every tree seeded next to attached ones)
-FOOT_PIN_LEN = 8.0e-3         # m: the channel does not ride the gas within this distance of the glass
+FOOT_PIN_LEN = 4.0e-3         # m: the channel does not ride the gas within this distance of the glass
+PLUME_MIN_RISE = 1.0e-3       # m/s: a channel never sinks; its own plume gives it at least this rise (before the drift weight)
 ROOT_SAMPLE_OFFSET = 2.0      # x h: roots ride the flow sampled this far above the electrode (the
                               # channel's attachment follows its hot column out of the no-slip layer)
 FOLLOW_LEN = 0.02             # m: the last 2 cm of a channel under a finger follow the finger (the foot
@@ -255,7 +256,12 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
         x = x + gas.velocity(gas_u, gas_n, gas_origin, gas_inv_dx, xs) * (drift * p.dt)
         node_pos[i] = x * ((R1 + NODE_SPACING) / wp.max(wp.length(x), 1.0e-6))
         return
-    x = x + stencil_velocity(gas_u, gas_n, gas_origin, gas_inv_dx, x) * (drift * p.dt)
+    v = stencil_velocity(gas_u, gas_n, gas_origin, gas_inv_dx, x)
+    # a channel sits inside its own buoyant plume (dT ~ 100 K over ~1 mm: it rises at cm/s relative
+    # to the ambient) which the 2.5 mm gas grid cannot resolve; the grid's return flow along the
+    # cold glass (-1 cm/s) must not drag it down: its vertical drift is at least PLUME_MIN_RISE
+    v = wp.vec3(v[0], wp.max(v[1] * p.g_sign, PLUME_MIN_RISE) * p.g_sign, v[2])
+    x = x + v * (drift * p.dt)
     r = wp.length(x)
     if (f & NODE_FOOT) != 0:
         x = x * ((R2I - CHARGE_RADIUS) / wp.max(r, 1.0e-6))

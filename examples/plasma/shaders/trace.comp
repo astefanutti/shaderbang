@@ -31,9 +31,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const float SHEATH_SCALE    = 3.0;        // sheath radius = SHEATH_SCALE x core radius (both grow with the current)
 const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core colour (a tint made the hue depend on the core/sheath mix per pixel: blue-purple patches along a filament)
-const float FUNNEL_WIDEN    = 4.0;        // sheath x5 at the mouth of the bell (~7 mm wide skirt on the bulb)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
+const float FUNNEL_WIDEN    = 2.0;        // sheath x3 at the mouth of the bell (the root fan carries the flare)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
                                           // soft skirt several mm wide at the bulb narrowing within a bulb radius)
-const float FUNNEL_LIGHT    = 3.0;        // sheath light x(1 + FUNNEL_LIGHT * rootF) at the root (screenshot: the
+const float FUNNEL_LIGHT    = 1.5;        // sheath light x(1 + FUNNEL_LIGHT * rootF) at the root (screenshot: the
                                           // funnels saturate within a bulb radius, the haze between them stays dim)
 const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
                                           // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
@@ -41,7 +41,7 @@ const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / sca
 const vec3  ELECTRODE_RGB   = vec3(0.52, 0.20, 1.00); // glow discharge covering the electrode: magenta-violet (screenshot face (125,82,168) sRGB)
 const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
 const float POOL_SIGMA      = 0.0018 / 0.011;         // rad: the glow pool a root casts on the anode (1.8 mm)
-const float POOL_GAIN       = 0.008;                  // its peak per (I / 50 uA), before radScale
+const float POOL_GAIN       = 0.005;                  // its peak per (I / 50 uA), before radScale
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
 const vec3  FOOT_RGB        = vec3(1.00, 0.34, 0.72); // surface discharge at a foot: magenta

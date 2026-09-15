@@ -554,3 +554,31 @@ haze stays dim, a luminous face (125,82,168) and root flares covering ~40 % of t
   channel. After: foot drift −0.02 mm/s, and the feet's re-strike jumps (254 in 4 s) are upward
   57 % of the time with a median of +4.8 mm. Population 28, re-routes 2.9 per filament per
   second (was 3.5), tortuosity p90 1.17.
+
+### Fifteenth pass — root fans, channels never sink (2026-09-15)
+
+* **How the root was drawn until now** ("artistic"): one constant radius per 1.5 mm segment
+  scaled by a bell factor, so the flare was a fatter first cylinder, not a fillet. **Now**: a
+  time-integrated model of the attachment. Within a frame (~900 half-cycles) the streamer's
+  attachment point wanders over the root's footprint on the electrode (Wikipedia: each tendril
+  has a footprint on the orb; PPPL-4485: roots slide on the conductive paint), so what a camera
+  integrates is a bundle of sub-channels fanning out of the channel onto the surface. `k_root_fans`
+  writes, per attached tree, `FAN_K` = 6 sub-channels from points spread over a footprint of radius
+  2 mm·(I/40 µA)^0.3 (fixed per root node: they change only when the channel re-strikes), each
+  leaving the surface perpendicularly for 0.8 mm (PPPL: filaments emerge normal to the bulb) and
+  merging into the channel 1 mm beyond the root node; two segments each, wide soft tubes (1.5× the
+  core radius, so they overlap into one bell), root colour, 1.5 ordinary segments' worth of light
+  shared between them; `SEG_MAX` = N_MAX + 384 fan slots, CSR dilation +2. The per-segment bell
+  is kept small (core ×1.8, sheath ×3 at the mouth). Root pools on the anode `POOL_GAIN` 0.005.
+  Face 0.68 of the core level, p10/p90 0.42/1.02. Trace 2.85 → 3.5 ms (the fan slots). What a
+  fully physical model would need (the sheath and glow layer of the attachment at µm scales) is
+  out of reach in real time; the fan is the integrated appearance of the physics.
+* **Feet.** Pinning the foot node was not enough: measured per band of distance to the glass, the
+  channel 5–20 mm from the glass still sank at 6–10 mm/s (the convection cell's return flow along
+  the cold wall on the 2.5 mm gas grid) while the middle rose at 8 mm/s, so the end drooped into
+  a hook. A real channel sits inside its own buoyant plume (ΔT ~100 K over ~1 mm: cm/s relative to
+  the ambient) that the grid cannot resolve, so it never sinks: the vertical component of a
+  channel node's drift is now at least `PLUME_MIN_RISE` (1 mm/s, before the drift weight;
+  gravity-sign aware), and the foot pin is 4 mm. After: no band sinks (0–2 mm +0.05, 2–20 mm
+  +0.8 to +0.9, 20–50 mm +4 to +8 mm/s), the channel stretches and re-strikes with the foot higher
+  (as measured in the previous pass). Population 27, re-routes 3.0 per filament per second.
