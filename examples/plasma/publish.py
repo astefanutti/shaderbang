@@ -391,7 +391,7 @@ def k_root_bells(tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype
     segments[base + 3] = wp.vec4(a[0], a[1], a[2], float(t))
     segments[base + 4] = wp.vec4(b[0], b[1], b[2], flags)
     segments[base + 5] = wp.vec4(uu[0], uu[1], uu[2], 1.0)
-    segments[base + 6] = wp.vec4(uu[0], uu[1], uu[2], float(DILATION + 2))
+    segments[base + 6] = wp.vec4(uu[0], uu[1], uu[2], float(DILATION + 3))   # the bell's mouth reaches ~7 mm
 
 
 @wp.kernel

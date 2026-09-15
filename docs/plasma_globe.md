@@ -635,3 +635,23 @@ same plume floor as the channel; the foot pin becomes a creep (`FOOT_CREEP` 0.5 
 inside 4 mm of the glass); `STRETCH_TRIGGER` 1.3 → 1.5 because the faster walk stretched the
 channels sooner (population had slipped 28 → 23; back to 28, re-routes 2.5 per filament per
 second). Bells: base radius 3 → 4.5 mm, gain 4 → 2 (wider, dimmer mouths).
+
+### Eighteenth pass — feet that walk, key logging, wider bells (2026-09-15)
+
+* **Feet.** The creep was invisible (+0.1 mm/s in the arrays, 0 in the image tracker) and an
+  attempt to make the foot follow the extrapolated tilt of the channel's last two centimetres
+  walked the feet *down* (−1.1 mm/s, 69 % down: with the middle risen and the end lagging, the
+  last centimetres point downward, so their extrapolation meets the glass below the foot).
+  Dropped. What the recording shows is the whole channel rising, foot included (feet: median
+  +0.6, upper quartile +5.9 mm/s; roots ~+2 mm/s), i.e. the channel rides its own plume all the
+  way to the wall. `PLUME_MIN_RISE` 1 → 4 mm/s (the floor applies to every node, roots
+  included) and the foot pin is gone (`FOOT_CREEP` 1). Measured over 4 s: feet +2.5 mm/s while
+  attached (92 % up, was 0), re-strike jumps 59 % up with a median of +7.6 mm, roots +2.9 mm/s;
+  population 26, re-routes 2.3 and retracts 1.4 per filament per second (the channels break more
+  often because the ends now walk).
+* **Keys.** Every key that changes a setting prints `[keys] <setting> <new value>` (`log_key` in
+  `plasma_globe.py`): pause/run, reset, gravity, ice, voltage, frequency, η, γ, finger charge,
+  gas preset, quincunx, hybrid, lights, glow on/off and width, exposure bias, temporal upscale,
+  wireframe, look, debug view, state dump.
+* **Look.** Bell base radius 4.5 → 6 mm (the record's CSR dilation +3 cells, mouth clamped to 7 mm);
+  default glow width 24 → 32 internal px.

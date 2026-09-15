@@ -75,8 +75,9 @@ E_PROP_FACTOR = 0.05          # propagation / strike threshold ratio (CHOSEN): a
                               # propagating through the field screened by the attached channels (the
                               # plan's 0.25 starved every tree seeded next to attached ones)
 FOOT_PIN_LEN = 4.0e-3         # m: the channel does not ride the gas within this distance of the glass
-PLUME_MIN_RISE = 1.0e-3       # m/s: a channel never sinks; its own plume gives it at least this rise (before the drift weight)
-FOOT_CREEP = 0.5              # drift kept inside FOOT_PIN_LEN: the recording's feet creep up ~0.6 mm/s (57 % of crossings up)
+PLUME_MIN_RISE = 4.0e-3       # m/s: a channel never sinks; its own plume gives it at least this rise (before the drift
+                              # weight): the recording's feet walk up the glass at up to ~6 mm/s (median 0.6)
+FOOT_CREEP = 1.0              # drift kept inside FOOT_PIN_LEN (1 = the foot walks with the channel; 0 = pinned)
 ROOT_DRIFT_GAIN = 1.8         # roots ride the plume over the bulb faster than the drift weight alone gives (recording ~2 mm/s)
 ROOT_SAMPLE_OFFSET = 2.0      # x h: roots ride the flow sampled this far above the electrode (the
                               # channel's attachment follows its hot column out of the no-slip layer)
@@ -216,12 +217,18 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
                    node_pos: wp.array(dtype=wp.vec3),
                    node_flags: wp.array(dtype=wp.int32),
                    node_tree: wp.array(dtype=wp.int32),
+                   node_parent: wp.array(dtype=wp.int32),
                    tree_state: wp.array(dtype=wp.int32),
                    tree_targets: wp.array(dtype=wp.vec3)):
     """Persistent channels ride the gas: x += u(x) dt; roots slide on the electrode (driven by
-    the flow just above the no-slip layer), feet slide on the glass, everything stays inside the
+    the flow just above the no-slip layer), feet walk on the glass, everything stays inside the
     annulus. Under a finger the foot and the last FOLLOW_LEN of the channel are pulled towards
-    the finger (time constant FOLLOW_TAU), so the filament follows a moving finger."""
+    the finger (time constant FOLLOW_TAU), so the filament follows a moving finger.
+
+    The whole channel, foot included, rises with its own buoyant plume (the gas grid cannot
+    resolve it): the vertical drift is floored at PLUME_MIN_RISE everywhere, so the feet walk up
+    the glass at a few mm/s (recording: median +0.6, upper quartile +6 mm/s) while the middle
+    rises faster and the channel eventually breaks and re-strikes higher."""
     i = wp.tid()
     p = params[0]
     f = node_flags[i]
@@ -539,7 +546,7 @@ class Globe(Input):
                           cs.sig_alive, cs.finger_served, e.cand_s, e.cand_T], device=d)
         e.step()                                      # prev_pos <- pos, growth, lifecycle, conductor solve
         wp.launch(k_advect_nodes, dim=n, inputs=[params, s0.u, s0.grid.n, s0.grid.origin, s0.grid.inv_dx, e.pos, e.flags,
-                                                 e.tree, e.t_state, cs.tree_targets], device=d)
+                                                 e.tree, e.parent, e.t_state, cs.tree_targets], device=d)
         wp.launch(k_tree_frame_geometry, dim=F_MAX,
                   inputs=[e.t_state, e.t_foot, e.t_tip, e.t_root, e.t_L, e.pos, e.parent,
                           e.t_foot_dir, e.t_root_dir, e.t_chord, e.t_stretch, e.t_foot2, self.tree_foot2_dir], device=d)

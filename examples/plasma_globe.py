@@ -501,6 +501,11 @@ class Trackpad(shaderbang.input.MultiTouch[TouchSlot]):
         camera.rotate(wp.sign(camera.pos[1]) * theta, 0.0)
 
 
+def log_key(msg):
+    """Every key that changes a setting prints its new value (the effect is otherwise hard to see)."""
+    print(f"[keys] {msg}", flush=True)
+
+
 class Keyboard(shaderbang.input.Keyboard):
 
     def __init__(self):
@@ -512,61 +517,86 @@ class Keyboard(shaderbang.input.Keyboard):
         ctrl = self.down(any, EV_KEY.KEY_LEFTCTRL, EV_KEY.KEY_RIGHTCTRL)
         if self.pressed(EV_KEY.KEY_P):
             state ^= State.RUN
+            log_key("run" if state & State.RUN else "paused")
         if self.down(any, EV_KEY.KEY_RIGHT, EV_KEY.KEY_SPACE):
             state |= State.STEP
         if self.pressed(EV_KEY.KEY_R):
             globe.request_reset()
+            log_key("reset")
         if self.pressed(EV_KEY.KEY_G):
             state ^= State.INVERT
+            log_key(f"gravity {'inverted' if state & State.INVERT else 'normal'}")
         if self.pressed(EV_KEY.KEY_I):
             state ^= State.ICE
+            log_key(f"ice cap {'on' if state & State.ICE else 'off'}")
         if self.pressed(EV_KEY.KEY_MINUS):
             globe.knobs["voltage"] = max(2000.0, globe.knobs["voltage"] - 250.0)
+            log_key(f"voltage {globe.knobs['voltage']:.0f} V")
         if self.pressed(EV_KEY.KEY_EQUAL):
             globe.knobs["voltage"] = min(8000.0, globe.knobs["voltage"] + 250.0)
+            log_key(f"voltage {globe.knobs['voltage']:.0f} V")
         if self.pressed(EV_KEY.KEY_LEFTBRACE):
             globe.knobs["frequency"] = max(10.0e3, globe.knobs["frequency"] - 2.0e3)
+            log_key(f"frequency {globe.knobs['frequency'] / 1e3:.0f} kHz")
         if self.pressed(EV_KEY.KEY_RIGHTBRACE):
             globe.knobs["frequency"] = min(40.0e3, globe.knobs["frequency"] + 2.0e3)
+            log_key(f"frequency {globe.knobs['frequency'] / 1e3:.0f} kHz")
         if self.pressed(EV_KEY.KEY_E):
             globe.knobs["eta"] = max(1.0, min(1000.0, globe.knobs["eta"] * (1.25 if shift else 0.8)))
+            log_key(f"eta {globe.knobs['eta']:.1f}")
         if self.pressed(EV_KEY.KEY_Y):
             globe.knobs["gamma"] = max(0.0, min(6.0, globe.knobs["gamma"] + (0.5 if shift else -0.5)))
+            log_key(f"gamma {globe.knobs['gamma']:.1f}")
         if self.pressed(EV_KEY.KEY_F):
             globe.knobs["q_finger"] = max(0.0, min(1.0, globe.knobs["q_finger"] + (0.01 if shift else -0.01)))
+            log_key(f"finger charge {globe.knobs['q_finger']:.2f}")
         if self.pressed(EV_KEY.KEY_T):
             globe.cycle_preset()
+            log_key(f"gas preset {globe.presets[globe.preset_index]}")
         if self.pressed(EV_KEY.KEY_X):
             state ^= State.QUINCUNX
+            log_key(f"quincunx sigma {'on' if state & State.QUINCUNX else 'off'}")
         if self.pressed(EV_KEY.KEY_H):
             state ^= State.HYBRID
+            log_key(f"hybrid re-strikes {'on' if state & State.HYBRID else 'off (persistent only)'}")
         if self.pressed(EV_KEY.KEY_L):
             state ^= State.LIGHTS
+            log_key(f"line lights {'on' if state & State.LIGHTS else 'off'}")
         if self.pressed(EV_KEY.KEY_A):
             state ^= State.GLOW
+            log_key(f"glow {'on' if state & State.GLOW else 'off'}")
         if self.pressed(EV_KEY.KEY_UP):
             renderer.set_glow_width(renderer.knobs["glow_width"] * 1.25)
+            log_key(f"glow width {renderer.knobs['glow_width']:.0f} px")
         if self.pressed(EV_KEY.KEY_DOWN):
             renderer.set_glow_width(renderer.knobs["glow_width"] / 1.25)
+            log_key(f"glow width {renderer.knobs['glow_width']:.0f} px")
         if self.pressed(EV_KEY.KEY_COMMA):
             renderer.knobs["exposure_bias"] -= 0.5
+            log_key(f"exposure bias {renderer.knobs['exposure_bias']:+.1f} EV")
         if self.pressed(EV_KEY.KEY_DOT):
             renderer.knobs["exposure_bias"] += 0.5
+            log_key(f"exposure bias {renderer.knobs['exposure_bias']:+.1f} EV")
         if self.pressed(EV_KEY.KEY_U):
             state ^= State.TAAU
+            log_key(f"temporal upscale {'on' if state & State.TAAU else 'off (native)'}")
         if self.pressed(EV_KEY.KEY_W):
             state ^= State.WIREFRAME
+            log_key(f"wireframe {'on' if state & State.WIREFRAME else 'off'}")
         if self.pressed(EV_KEY.KEY_M):
             renderer.knobs["look"] = 0.0 if renderer.knobs["look"] else 1.0
+            log_key(f"look {'nimitz' if renderer.knobs['look'] else 'physical'}")
         for i, key in enumerate((EV_KEY.KEY_0, EV_KEY.KEY_1, EV_KEY.KEY_2, EV_KEY.KEY_3, EV_KEY.KEY_4,
                                  EV_KEY.KEY_5, EV_KEY.KEY_6, EV_KEY.KEY_7, EV_KEY.KEY_8, EV_KEY.KEY_9)):
             if self.pressed(key):
                 debug_view = i
+                log_key(f"debug view {i}")
         if self.pressed(EV_KEY.KEY_B):
             renderer.print_timings()
             globe.print_counters()
         if ctrl and self.pressed(EV_KEY.KEY_S):
             globe.dump_state()
+            log_key("state dumped")
 
     def post_render(self, **kwargs):
         global state
