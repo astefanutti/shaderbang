@@ -26,7 +26,9 @@ const float GLOBE_FRACTION = 0.094;   // L_p = the luminance exceeded by this fr
                                       // globe's own area keeps the exposure independent of zoom; a touched filament
                                       // (~5 % of the globe) only pushes L_p up the ordinary population, so it saturates
                                       // white while the others dim ~2x, as in the footage
-const float TARGET_LUM = 0.06;        // display-linear luminance of L_p (ordinary cores then peak at B ~ 240, R/B kept)
+const float TARGET_LUM = 0.17;        // display-linear value of L_p, metered on the brightest CHANNEL (a sensor clips per
+                                      // channel): the video preset's cores then peak at B ~ 240 as before, and a blue-heavy
+                                      // gas (argon: B >> luminance) no longer burns to white
 const float L_FLOOR = 2e-4;           // no filaments yet (startup): do not expose the electrode halo to white
 
 layout(std430, binding = 3) buffer ExposureBuf {
@@ -60,7 +62,7 @@ void main() {
     ivec2 size = imageSize(hdrImg);
     if (p.x < size.x && p.y < size.y) {
         vec3 c = imageLoad(hdrImg, p).rgb;
-        float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        float lum = max(c.r, max(c.g, c.b));                   // brightest channel (per-channel clipping is what matters)
         atomicAdd(tileCount, 1);
         if (lum > 0.0) {
             float l = log2(lum);

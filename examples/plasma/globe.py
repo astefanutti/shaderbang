@@ -515,6 +515,8 @@ class Globe(Input):
                 neutral, ion = (2.884, 0.541, 0.0), (1.167, 0.809, 2.404)
         self.color_neutral.fill_(wp.vec3(*[float(c) for c in neutral]))
         self.color_ion.fill_(wp.vec3(*[float(c) for c in ion]))
+        self.preset_name = name
+        self.preset_rgb = (tuple(float(c) for c in neutral), tuple(float(c) for c in ion))
 
     def cycle_preset(self):
         self.preset_index = (self.preset_index + 1) % len(self.presets)

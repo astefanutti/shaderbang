@@ -35,6 +35,11 @@ from plasma.circuit import SIG_MAX, F_MAX
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+PARAMS_BYTES = 320                               # Params UBO: 16 vec4 (camera, matrices, knobs) + 4 preset colours
+VIDEO_ANODE_COLOURS = ((0.52, 0.20, 1.00),        # electrode glow discharge (footage face (125,82,168) sRGB)
+                       (0.20, 0.08, 1.00),        # far haze around the bulb (deep violet)
+                       (0.55, 0.12, 1.00),        # near haze / sheath layer (violet-magenta)
+                       (1.00, 0.34, 0.72))        # feet and root pools (magenta)
 GLOW_LEVELS = 6
 GLOW_TABLE_PX = (24, 32, 48, 64, 96, 128, 192)   # glow kernels fitted once; interpolated with the zoom
 R2O_M = 0.0775                                   # plasma.params.R2O: the globe's outer radius (m)
@@ -233,7 +238,7 @@ class Renderer(Input):
         # exposure SSBO (8 x 4 bytes header + 64 int bins), params UBO (256 bytes), histogram SSBO
         self.ubo = int(glGenBuffers(1))
         glBindBuffer(GL_UNIFORM_BUFFER, self.ubo)
-        glBufferData(GL_UNIFORM_BUFFER, 256, None, GL_DYNAMIC_DRAW)
+        glBufferData(GL_UNIFORM_BUFFER, PARAMS_BYTES, None, GL_DYNAMIC_DRAW)
         self.ssbo_exposure = int(glGenBuffers(1))
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, self.ssbo_exposure)
         glBufferData(GL_SHADER_STORAGE_BUFFER, (8 + 64) * 4, np.zeros(8 + 64, np.float32), GL_DYNAMIC_DRAW)   # header + 64 histogram bins
@@ -317,7 +322,7 @@ class Renderer(Input):
         cam = self.camera
         eye, cu, cv, cw = cam.basis()
         # the tracer's camera basis is built for the INTERNAL aspect (same as display)
-        blob = np.zeros(64, np.float32)
+        blob = np.zeros(PARAMS_BYTES // 4, np.float32)
         blob[0:3] = eye; blob[4:7] = cu; blob[8:11] = cv; blob[12:15] = cw
         blob[16:32] = cam.vp.T.reshape(-1)
         blob[32:48] = cam.vp_prev.T.reshape(-1)
@@ -330,7 +335,22 @@ class Renderer(Input):
         counters = getattr(self.globe, "counters_now", None)
         i_tot_ma = float(counters()["i_tot"]) * 1e3 if counters is not None else 1.0
         blob[60:64] = (i_tot_ma, 0.0, 0.0, -1.0 if flags.invert else 1.0)
+        # the electrode glow, the haze around it, the sheath layer and the foot / root-pool colours
+        # follow the gas preset (the 'video' preset keeps the values calibrated on the footage)
+        for k, c in enumerate(self._preset_colours()):
+            blob[64 + 4 * k:67 + 4 * k] = c
         return blob
+
+    def _preset_colours(self):
+        """(electrode, halo far, halo near / sheath, foot) linear rgb for the current gas preset."""
+        name = getattr(self.globe, "preset_name", "video")
+        if name == "video" or not hasattr(self.globe, "preset_rgb"):
+            return VIDEO_ANODE_COLOURS
+        neutral, ion = (np.asarray(c, np.float64) for c in self.globe.preset_rgb)
+        def unit(c):
+            c = np.maximum(c, 0.0); return c / max(float(c.max()), 1e-6)
+        n, i = unit(neutral), unit(ion)
+        return (unit(0.35 * n + 0.65 * i), i, unit(0.5 * n + 0.5 * i), n)
 
     def upload(self):
         """P0b: publish-stage arrays -> GL buffers / 3D texture (device-to-device)."""

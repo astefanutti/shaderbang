@@ -38,13 +38,11 @@ const float FUNNEL_LIGHT    = 1.5;        // sheath light x(1 + FUNNEL_LIGHT * r
 const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
                                           // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
 const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
-const vec3  ELECTRODE_RGB   = vec3(0.52, 0.20, 1.00); // glow discharge covering the electrode: magenta-violet (screenshot face (125,82,168) sRGB)
-const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
+// the electrode / haze / sheath / foot colours come from the Params UBO (per gas preset; renderer.VIDEO_ANODE_COLOURS)
 const float POOL_SIGMA      = 0.0018 / 0.011;         // rad: the glow pool a root casts on the anode (1.8 mm)
 const float POOL_GAIN       = 0.002;                  // its peak per (I / 50 uA), before radScale (the bells light the base)
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
-const vec3  FOOT_RGB        = vec3(1.00, 0.34, 0.72); // surface discharge at a foot: magenta
 
 layout(rgba16f, binding = 0) uniform writeonly image2D outHdr;
 layout(rgba16f, binding = 1) uniform writeonly image2D outEmissive;
@@ -64,6 +62,10 @@ layout(std140, binding = 0) uniform Params {
     vec4 knobs;          // x radiance scale, y ambient volume gain (radiance per (kW/m^3 * m)), z time, w unused
     ivec4 flags;         // x debug view, y lights on, z frame, w volume on
     vec4 gas;            // xyz unused, w gravity sign (heat shimmer direction)
+    vec4 colElectrode;   // preset colours: the glow discharge over the electrode,
+    vec4 colHalo;        //   the far haze around it,
+    vec4 colHaloNear;    //   the near haze and the sheath layer,
+    vec4 colFoot;        //   the feet and the root pools (linear rgb, max 1)
 };
 
 layout(std430, binding = 1) readonly buffer Segments { vec4 seg[]; };          // SEGS vec4 per segment
@@ -604,7 +606,7 @@ vec3 footGlow(vec3 n) {
         // no negative light: the old "dark annulus" term subtracted a grey ring from whatever lay in
         // front of the far wall, which clipped the red and green of dim filament pixels to zero and
         // left pure-blue patches along the filaments (the blue/purple striping)
-        sum += disc * FOOT_RGB * (0.08 * iRel);
+        sum += disc * colFoot.rgb * (0.08 * iRel);
     }
     return sum;
 }
@@ -631,7 +633,8 @@ vec4 rootGlow(vec3 n) {                                              // rgb: spo
         // the sphere is lit unevenly (bright where filaments attach, dim between); the ~I^3 terms
         // make a touched root a white blob with a wide pink halo
         float pool = exp(-0.5 * theta * theta / (POOL_SIGMA * POOL_SIGMA));
-        sum += ROOT_RGB * (POOL_GAIN * iRel * pool + (0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
+        vec3 rootRgb = mix(colFoot.rgb, vec3(1.0), 0.35);            // the pools and the touched blob: the foot colour, whitened
+        sum += rootRgb * (POOL_GAIN * iRel * pool + (0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
         gain += ih * ih * sqrt(ih);
     }
     return vec4(sum, gain);
@@ -657,9 +660,6 @@ float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
 // 1/r^4 tail is integrated over the ray's overlap with r < R1 + HALO_REACH by 16 samples split at
 // the closest approach (denser near the electrode).
 const float HALO_REACH = 0.030;
-const vec3  HALO_RGB   = vec3(0.20, 0.08, 1.0);      // the diffuse glow around the bulb: deep violet (footage (77,52,172) sRGB at 3 mm)
-const vec3  SHEATH_RGB = vec3(0.45, 0.10, 1.00);     // the glow layer hugging the electrode: violet-magenta (footage (85,45,167) at 1 mm)
-const vec3  HALO_NEAR_RGB = vec3(0.60, 0.15, 1.00);  // the haze between the roots within a few mm: violet-magenta (screenshots: (22,16,48) to (60,29,60))
 vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
     vec2 reach = sphereRoots(ro, rd, R1 + HALO_REACH);
     if (reach.y <= t0) return vec3(0.0);
@@ -687,8 +687,8 @@ vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
             float sheath = exp(-(r - R1) / 0.0012);                      // electrode sheath, ~1 mm
             // the haze is the bulb's magenta within a few mm and violet beyond (screenshot: (60,29,60) sRGB
             // between the roots at 2-4 mm, (26,17,40) at 10 mm)
-            vec3 haloCol = mix(HALO_RGB, HALO_NEAR_RGB, exp(-(r - R1) / 0.004));
-            sum += (halo * haloCol * 0.05 + sheath * SHEATH_RGB * 0.6) * dt;   // the funnels carry the light; the haze is dim (screenshot p25 B 70-80)
+            vec3 haloCol = mix(colHalo.rgb, colHaloNear.rgb, exp(-(r - R1) / 0.004));
+            sum += (halo * haloCol * 0.05 + sheath * colHaloNear.rgb * 0.6) * dt;   // the funnels carry the light; the haze is dim (screenshot p25 B 70-80)
         }
     }
     return sum * iTot;
@@ -935,7 +935,7 @@ void main() {
                     // moves): sheath gain = sum of (I_k / 50 uA)^2.5 over the roots, 1 for ~30 x 40 uA
                     vec4 roots = rootGlow(nE);
                     float sheathGain = clamp(roots.w / 20.0, 0.5, 12.0);
-                    vec3 glow = (ELECTRODE_RGB * (0.012 * gas.x * grazing * sheathGain) + roots.rgb) * radScale;   // rim bright, not clipped (footage (118,71,157))
+                    vec3 glow = (colElectrode.rgb * (0.012 * gas.x * grazing * sheathGain) + roots.rgb) * radScale;   // rim bright, not clipped (footage (118,71,157))
                     hdr += wGas * tint * (lit + glow);
                     emissive += wGas * tint * glow;
                     if (bestLumAll < 0.02) { layer = 2.0; hitDist = tO + glassPath + tEnd; mvPointCur = pEnd; mvPointPrev = pEnd; }

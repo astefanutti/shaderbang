@@ -655,3 +655,21 @@ second). Bells: base radius 3 → 4.5 mm, gain 4 → 2 (wider, dimmer mouths).
   wireframe, look, debug view, state dump.
 * **Look.** Bell base radius 4.5 → 6 mm (the record's CSR dilation +3 cells, mouth clamped to 7 mm);
   default glow width 24 → 32 internal px.
+
+### Nineteenth pass — dead keys, preset colours for the anode, per-channel metering (2026-09-15)
+
+* **Keys.** `-`/`=`, `[`/`]` and `,`/`.` never worked: `shaderbang.input.Keyboard` drops any evdev
+  key absent from `shaderbang/keycodes.py`, and the punctuation keys were not in the table.
+  Added (with their JavaScript keyCodes, which the Shadertoy keyboard texture indexes), plus
+  navigation and keypad keys — a core-table fix, committed on its own.
+* **Anode colour per gas.** The electrode glow, the haze, the sheath layer, the feet and the root
+  pools were shader constants tuned on the footage, so they stayed pink-purple under every gas
+  preset. They now travel in the Params UBO (four vec4 after `gas`, 320 bytes): the `video`
+  preset keeps the calibrated values (`renderer.VIDEO_ANODE_COLOURS`), the spectral presets
+  derive them from their neutral/ion line colours (electrode 0.35 n + 0.65 i, far haze = ion,
+  near haze/sheath 0.5 n + 0.5 i, feet = neutral, each normalised to max 1). Argon: face
+  (35,10,117), halo (24,8,136), shafts (27,7,154) — deep blue; video unchanged.
+* **Meter.** Argon's first render burned to white: the meter placed the 9.4 % percentile of
+  *luminance* at 0.06, and a blue-heavy colour (B ≫ luminance) then clips its blue channel. The
+  meter now uses the brightest channel (a sensor clips per channel), target 0.17, which leaves
+  the video preset where it was (shaft B p99.5 202 before and after) and argon unclipped.
