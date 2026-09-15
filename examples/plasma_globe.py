@@ -55,8 +55,8 @@ Keyboard Controls
     R               Reset the simulation
     G               Invert gravity (filaments must still rise in the world frame)
     I               Toggle an ice cap on top of the globe (filaments bend away from it)
-    - / =           Drive voltage -/+ 250 V  (2-8 kV: the filament count law)
-    [ / ]           Drive frequency -/+ 2 kHz (10-40 kHz)
+    - / =           Drive voltage -/+ 250 V  (2-8 kV: the filament count law)  (also V / Shift+V)
+    [ / ]           Drive frequency -/+ 2 kHz (10-40 kHz)           (also N / Shift+N)
     E / Shift+E     Growth exponent eta x0.8 / x1.25 (120: smooth ropes, 3: lightning trees)
     Y / Shift+Y     Thermal memory exponent gamma -/+ 0.5
     F / Shift+F     Finger charge -/+ 0.01
@@ -65,7 +65,7 @@ Keyboard Controls
     H               Toggle the hybrid re-strike model (off = persistent channels only)
     L / A           Toggle line lights / glow
     Up / Down       Glow width -/+
-    , / .           Exposure bias -/+ 0.5 EV
+    , / .           Exposure bias -/+ 0.5 EV  (also O / Shift+O)
     U               Toggle the temporal upscale (off = native full-resolution reference path)
     W               Toggle the tree wireframe overlay
     M               Toggle the nimitz look (plasma_globe.glsl shading driven by the simulated filaments)
@@ -133,6 +133,7 @@ from threading import main_thread, Thread
 from libevdev import Device, EV_ABS, EV_KEY, EV_REL, INPUT_PROP_DIRECT, INPUT_PROP_POINTER
 
 import shaderbang.input
+import shaderbang.keycodes
 from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
 from shaderbang.input import Input, TouchSlot
 from shaderbang.gesture import homothety_and_rotation
@@ -506,6 +507,28 @@ def log_key(msg):
     print(f"[keys] {msg}", flush=True)
 
 
+BOUND_KEYS = {EV_KEY.KEY_P, EV_KEY.KEY_RIGHT, EV_KEY.KEY_SPACE, EV_KEY.KEY_R, EV_KEY.KEY_G, EV_KEY.KEY_I,
+              EV_KEY.KEY_MINUS, EV_KEY.KEY_EQUAL, EV_KEY.KEY_LEFTBRACE, EV_KEY.KEY_RIGHTBRACE, EV_KEY.KEY_E,
+              EV_KEY.KEY_Y, EV_KEY.KEY_F, EV_KEY.KEY_T, EV_KEY.KEY_X, EV_KEY.KEY_H, EV_KEY.KEY_L, EV_KEY.KEY_A,
+              EV_KEY.KEY_UP, EV_KEY.KEY_DOWN, EV_KEY.KEY_COMMA, EV_KEY.KEY_DOT, EV_KEY.KEY_U, EV_KEY.KEY_W,
+              EV_KEY.KEY_M, EV_KEY.KEY_B, EV_KEY.KEY_S, EV_KEY.KEY_V, EV_KEY.KEY_N, EV_KEY.KEY_O,
+              EV_KEY.KEY_0, EV_KEY.KEY_1, EV_KEY.KEY_2, EV_KEY.KEY_3, EV_KEY.KEY_4, EV_KEY.KEY_5, EV_KEY.KEY_6,
+              EV_KEY.KEY_7, EV_KEY.KEY_8, EV_KEY.KEY_9, EV_KEY.KEY_LEFTSHIFT, EV_KEY.KEY_RIGHTSHIFT,
+              EV_KEY.KEY_LEFTCTRL, EV_KEY.KEY_RIGHTCTRL, EV_KEY.KEY_LEFTALT, EV_KEY.KEY_RIGHTALT}
+
+
+class KeyboardDevice(shaderbang.input.AsciiKeyboard):
+    """The evdev keyboard wrapper, plus a log line for every press the app has no binding for (an
+    unexpected layout sends other scancodes; a key missing from shaderbang.keycodes would be
+    dropped silently), so pressing anything always prints something."""
+
+    def event(self, ev, **kwargs):
+        if ev.matches(EV_KEY) and ev.value == 1 and ev.code not in BOUND_KEYS:
+            mapped = shaderbang.keycodes.keycodes.get(ev.code, -1) >= 0
+            print(f"[keys] unbound {ev.code.name} (scancode {ev.code.value}{'' if mapped else ', not in shaderbang.keycodes'})", flush=True)
+        return super().event(ev, **kwargs)
+
+
 class Keyboard(shaderbang.input.Keyboard):
 
     def __init__(self):
@@ -529,16 +552,16 @@ class Keyboard(shaderbang.input.Keyboard):
         if self.pressed(EV_KEY.KEY_I):
             state ^= State.ICE
             log_key(f"ice cap {'on' if state & State.ICE else 'off'}")
-        if self.pressed(EV_KEY.KEY_MINUS):
+        if self.pressed(EV_KEY.KEY_MINUS) or (self.pressed(EV_KEY.KEY_V) and not shift):
             globe.knobs["voltage"] = max(2000.0, globe.knobs["voltage"] - 250.0)
             log_key(f"voltage {globe.knobs['voltage']:.0f} V")
-        if self.pressed(EV_KEY.KEY_EQUAL):
+        if self.pressed(EV_KEY.KEY_EQUAL) or (self.pressed(EV_KEY.KEY_V) and shift):
             globe.knobs["voltage"] = min(8000.0, globe.knobs["voltage"] + 250.0)
             log_key(f"voltage {globe.knobs['voltage']:.0f} V")
-        if self.pressed(EV_KEY.KEY_LEFTBRACE):
+        if self.pressed(EV_KEY.KEY_LEFTBRACE) or (self.pressed(EV_KEY.KEY_N) and not shift):
             globe.knobs["frequency"] = max(10.0e3, globe.knobs["frequency"] - 2.0e3)
             log_key(f"frequency {globe.knobs['frequency'] / 1e3:.0f} kHz")
-        if self.pressed(EV_KEY.KEY_RIGHTBRACE):
+        if self.pressed(EV_KEY.KEY_RIGHTBRACE) or (self.pressed(EV_KEY.KEY_N) and shift):
             globe.knobs["frequency"] = min(40.0e3, globe.knobs["frequency"] + 2.0e3)
             log_key(f"frequency {globe.knobs['frequency'] / 1e3:.0f} kHz")
         if self.pressed(EV_KEY.KEY_E):
@@ -571,10 +594,10 @@ class Keyboard(shaderbang.input.Keyboard):
         if self.pressed(EV_KEY.KEY_DOWN):
             renderer.set_glow_width(renderer.knobs["glow_width"] / 1.25)
             log_key(f"glow width {renderer.knobs['glow_width']:.0f} px")
-        if self.pressed(EV_KEY.KEY_COMMA):
+        if self.pressed(EV_KEY.KEY_COMMA) or (self.pressed(EV_KEY.KEY_O) and not shift):
             renderer.knobs["exposure_bias"] -= 0.5
             log_key(f"exposure bias {renderer.knobs['exposure_bias']:+.1f} EV")
-        if self.pressed(EV_KEY.KEY_DOT):
+        if self.pressed(EV_KEY.KEY_DOT) or (self.pressed(EV_KEY.KEY_O) and shift):
             renderer.knobs["exposure_bias"] += 0.5
             log_key(f"exposure bias {renderer.knobs['exposure_bias']:+.1f} EV")
         if self.pressed(EV_KEY.KEY_U):
@@ -607,7 +630,9 @@ def input_from_device(dev: Device):
     if dev.has(EV_REL) and dev.has(EV_KEY.BTN_LEFT):
         shaderbang.input.ButtonMouse(dev.name, dev, mouse)
     elif dev.has(EV_KEY) and dev.has(EV_KEY.KEY_A):
-        shaderbang.input.AsciiKeyboard(dev.name, dev, keyboard)
+        KeyboardDevice(dev.name, dev, keyboard)
+        print(f"[keys] keyboard '{dev.name}' attached ({len(shaderbang.keycodes.keycodes)} mapped keys, "
+              f"shaderbang from {os.path.dirname(shaderbang.__file__)})", flush=True)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
         shaderbang.input.Touchscreen(dev.name, dev, touchscreen)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):

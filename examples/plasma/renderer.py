@@ -190,10 +190,10 @@ class Renderer(Input):
         self.debug_fn = debug_fn
         self.args = args
         self._glow_table = None
-        self._glow_kernel_now = 32.0
+        self._glow_kernel_now = 40.0
         self._glow_gain_scale = 1.0
         self.ref_area = 1.0
-        self.knobs = {"glow_width": 32.0, "exposure_bias": 0.0, "glow_gain": 0.4, "rad_scale": 60.0,
+        self.knobs = {"glow_width": 40.0, "exposure_bias": 0.0, "glow_gain": 0.4, "rad_scale": 60.0,
                       "ambient_gain": 0.0, "look": 0.0, "tonemap": 1.0, "exposure": 0.0}
         # look 1 = nimitz shading; tonemap 1 = camera clip (0 = AgX); exposure > 0 = fixed (0 = metered)   # glow: a tight camera PSF; the halo is the physical sheath   # glow width = APSF kernel radius (internal px); ambient = volume glow gain
         self.timers = {}
