@@ -673,3 +673,17 @@ second). Bells: base radius 3 → 4.5 mm, gain 4 → 2 (wider, dimmer mouths).
   *luminance* at 0.06, and a blue-heavy colour (B ≫ luminance) then clips its blue channel. The
   meter now uses the brightest channel (a sensor clips per channel), target 0.17, which leaves
   the video preset where it was (shaft B p99.5 202 before and after) and argon unclipped.
+
+### Twentieth pass — key diagnostics, drag sensitivity, nimitz look removed (2026-09-15)
+
+* **Keys.** Every press now logs `[keys] press <evdev name> (scancode)` with a note when the key
+  has no binding or is missing from `shaderbang/keycodes.py`; the keyboard attach line reports the
+  table size and the shaderbang package in use. The user's keyboard sends the standard codes for
+  `[ ] , . - =` (26, 27, 51, 52, 12, 13), and a simulated press of each through
+  `AsciiKeyboard.event` → `Keyboard.pressed` returns True, so the earlier dead keys were the
+  missing table entries fixed in the previous pass. `V`/`N`/`O` (+Shift) remain as alternates.
+* **Drag.** `DRAG_SENSITIVITY` 0.5 → 0.25 on every orbit/track drag (mouse, touchscreen, trackpad).
+* **Nimitz look removed.** The experiment that drove `plasma_globe.glsl`'s shading from the
+  simulated filaments (tracer branch on `knobs.w`, `nimitzInterior`/`nzFlow`/`nzNoise`, the
+  present pass's `passthrough`, the `look` knob, `--nimitz`, key `M`) is gone; the physical path
+  is the only renderer. The reference shader file `examples/plasma_globe.glsl` stays.

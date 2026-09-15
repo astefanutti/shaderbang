@@ -16,7 +16,6 @@ layout(std430, binding = 3) readonly buffer ExposureBuf {
 } ex;
 uniform float glowGain;        // 0 disables the glow
 uniform int   debugView;       // 1 = emissive/glow only
-uniform int   passthrough;     // 1 = the tracer wrote display-referred colour (nimitz look): clamp only
 uniform int   tonemapMode;     // 0 AgX, 1 camera (clip + sRGB OETF, like the reference video)
 uniform float fixedExposure;   // > 0 overrides the metered exposure
 
@@ -44,10 +43,6 @@ void main() {
     vec3 hdr = textureLod(resolvedTex, vUv, 0.0).rgb;
     ivec2 np = ivec2(gl_FragCoord.xy) & 63;
     float noise = texelFetch(noiseTex, np, 0).r - 0.5;
-    if (passthrough == 1) {
-        fragColor = vec4(clamp(hdr, 0.0, 1.0) + noise / 255.0, 1.0);
-        return;
-    }
     vec3 glow = textureLod(glowTex, vUv, 0.0).rgb * glowGain;
     float exposure = fixedExposure > 0.0 ? fixedExposure : ex.exposure;
     vec3 c = (debugView == 1 ? glow : hdr + glow) * exposure;

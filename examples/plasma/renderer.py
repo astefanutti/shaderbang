@@ -194,8 +194,8 @@ class Renderer(Input):
         self._glow_gain_scale = 1.0
         self.ref_area = 1.0
         self.knobs = {"glow_width": 40.0, "exposure_bias": 0.0, "glow_gain": 0.4, "rad_scale": 60.0,
-                      "ambient_gain": 0.0, "look": 0.0, "tonemap": 1.0, "exposure": 0.0}
-        # look 1 = nimitz shading; tonemap 1 = camera clip (0 = AgX); exposure > 0 = fixed (0 = metered)   # glow: a tight camera PSF; the halo is the physical sheath   # glow width = APSF kernel radius (internal px); ambient = volume glow gain
+                      "ambient_gain": 0.0, "tonemap": 1.0, "exposure": 0.0}
+        # tonemap 1 = camera clip (0 = AgX); exposure > 0 = fixed (0 = metered)   # glow: a tight camera PSF; the halo is the physical sheath   # glow width = APSF kernel radius (internal px); ambient = volume glow gain
         self.timers = {}
         self.frame = 0
         self.first_frame = True
@@ -328,7 +328,7 @@ class Renderer(Input):
         blob[32:48] = cam.vp_prev.T.reshape(-1)
         blob[48:52] = (jitter[0], jitter[1], self.iw, self.ih)
         flags = self.state_fn()
-        blob[52:56] = (self.knobs["rad_scale"], self.knobs["ambient_gain"], time.time() % 1000.0, float(self.knobs["look"]))
+        blob[52:56] = (self.knobs["rad_scale"], self.knobs["ambient_gain"], time.time() % 1000.0, 0.0)
         blob[56:60] = np.array([self.debug_fn(), 1 if flags.lights else 0, self.frame, 1 if flags.volume else 0], np.int32).view(np.float32)
         # gas: x total current (mA, previous frame's counters; drives the electrode halo and the
         # background discharge), w gravity sign
@@ -495,7 +495,6 @@ class Renderer(Input):
         glUniform1f(glGetUniformLocation(self.prog_present, "glowGain"),
                     float(self.knobs["glow_gain"]) * self._glow_gain_scale if flags.glow else 0.0)
         glUniform1i(glGetUniformLocation(self.prog_present, "debugView"), 1 if self.debug_fn() == 1 else 0)
-        glUniform1i(glGetUniformLocation(self.prog_present, "passthrough"), 1 if int(self.knobs["look"]) == 1 else 0)
         glUniform1i(glGetUniformLocation(self.prog_present, "tonemapMode"), int(self.knobs["tonemap"]))
         glUniform1f(glGetUniformLocation(self.prog_present, "fixedExposure"), float(self.knobs["exposure"]))
         glBindVertexArray(self.vao)

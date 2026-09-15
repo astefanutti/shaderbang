@@ -694,81 +694,6 @@ vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
     return sum * iTot;
 }
 
-// ---- experiment: the look of examples/plasma_globe.glsl (nimitz) driven by the simulated filaments
-// His 13 procedural rays become the simulated segments (found through the CSR grid); the rest is
-// his recipe: tubes whose radius flares at the electrode and at the glass (map()'s ins*outs
-// scaling), a soft interior (smoothstep over ~1 mm inside the tube), a position palette, noise
-// flicker, max over rays at a point, sum along the ray, no tonemapping, flow-noise reflections on
-// the sphere. Display-referred output: the present pass passes it through (knobs.w == 1).
-float nzHash(float n) { return fract(sin(n) * 43758.5453); }
-float nzNoise(vec3 p) {
-    vec3 ip = floor(p), fp = fract(p);
-    fp = fp * fp * (3.0 - 2.0 * fp);
-    float n = dot(ip, vec3(1.0, 57.0, 113.0));
-    float a = mix(mix(nzHash(n), nzHash(n + 1.0), fp.x), mix(nzHash(n + 57.0), nzHash(n + 58.0), fp.x), fp.y);
-    float b = mix(mix(nzHash(n + 113.0), nzHash(n + 114.0), fp.x), mix(nzHash(n + 170.0), nzHash(n + 171.0), fp.x), fp.y);
-    return mix(a, b, fp.z);
-}
-const mat3 NZ_M3 = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
-float nzFlow(vec3 p, float t) {
-    float z = 2.0, rz = 0.0;
-    vec3 bp = p;
-    for (int i = 1; i < 5; ++i) {
-        p += t * 0.1;
-        rz += (sin(nzNoise(p + t * 0.8) * 6.0) * 0.5 + 0.5) / z;
-        p = mix(bp, p, 0.6);
-        z *= 2.0;
-        p *= 2.01;
-        p *= NZ_M3;
-    }
-    return rz;
-}
-
-vec3 nimitzInterior(vec3 ro, vec3 rd, float t0, float t1, float time) {
-    const float STEP = 0.00075;
-    vec3 sum = vec3(0.0);
-    float distScale = 1.0 / (log(max(length(ro) / R2I - 2.0, 1.05)) + 0.75);   // his 1/(log(d-2)+.75), camera at 5 units
-    float stepScale = STEP / (0.03 * R2I);                                      // his step was 0.03 sphere radii
-    float rIn = R1 / R2I;
-    int iters = 0;
-    for (float t = t0 + 0.5 * STEP; t < t1 && iters < 320; t += STEP, ++iters) {
-        vec3 p = ro + rd * t;
-        ivec3 c = cellOf(p);
-        if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(GRID_N)))) continue;
-        int ci = cellIndex(c);
-        int start = cellStart[ci], count = cellCount[ci];
-        if (count == 0) continue;
-        float lp = length(p) / R2I;
-        float ins = smoothstep(rIn, 0.5, lp);                          // his smoothstep(.11, .46, lp)
-        float outs = 0.15 + smoothstep(0.0, 0.15, abs(lp - 1.0));
-        float s = max(ins * outs, 0.08);
-        vec3 best = vec3(0.0);
-        float bestLum = 0.0;
-        for (int k = 0; k < count && k < 24; ++k) {
-            int si = cellItems[start + k];
-            vec4 a = seg[SEGS * si], b = seg[SEGS * si + 1];
-            if (a.w <= 0.0) continue;
-            float d = 0.5 * segDist(p, a.xyz, b.xyz);                  // his segm() returns half the distance
-            float radius = min(2.0 * a.w / s, 0.5 * VIS_RADIUS);       // his 0.011 / (ins * outs)
-            float inside = smoothstep(0.0, 0.0011, radius - d);        // his smoothstep(0, .015, -r.x)
-            if (inside <= 0.0) continue;
-            float tree = floor(b.w);
-            float alpha = fract(b.w * 10.0) * 10.0;                    // pack: tree + 0.1 class + 0.001 alpha
-            vec3 col = sin(vec3(1.05, 2.5, 1.52) * 3.94 + s) * 0.85 + 0.4;   // his palette on ins * outs
-            col *= inside;
-            col *= smoothstep(0.04, 0.2, abs(lp - 1.1));
-            col *= smoothstep(rIn - 0.1, rIn + 0.14, lp);              // his smoothstep(.1, .34, lp)
-            float bright = clamp(pow(a.w / 0.45e-3, 1.25), 0.35, 3.0); // ~sqrt(I / 50 uA) from the core radius
-            float flick = 1.2 - nzNoise(vec3(lp * 2.0 + tree * 13.0 + time * 5.0, tree, 0.5)) * 1.1;
-            vec3 contrib = abs(col) * 5.0 * flick * bright * max(alpha, 0.2);
-            float lum = dot(contrib, vec3(0.3333));
-            if (lum > bestLum) { bestLum = lum; best = contrib; }
-        }
-        sum += best * stepScale * distScale * 2.0;
-    }
-    return sum;
-}
-
 vec2 project(mat4 m, vec3 p) {
     vec4 c = m * vec4(p, 1.0);
     vec2 ndc = c.xy / max(c.w, 1e-6);
@@ -801,43 +726,6 @@ void main() {
     vec3 nBase;
     float tBase = baseHit(ro, rd, nBase);
     if (tBase > 0.0 && outer.x > 0.0 && tBase < outer.x) outer = vec2(-1.0);        // the base in front of the glass
-
-    if (int(knobs.w) == 1) {
-        // ---- nimitz look: straight rays through the sphere, his colours, no tonemapping
-        float time = knobs.z * 1.1;
-        vec3 col = vec3(0.0125, 0.0, 0.025);
-        vec2 mvN = vec2(0.0);
-        float layerN = 0.0, hitN = 1e4;
-        if (outer.x > 0.0) {
-            vec2 inner = sphereRoots(ro, rd, R2I);
-            vec2 el = sphereRoots(ro, rd, R1);
-            float tEnd = inner.y;
-            bool hitEl = el.x > 0.0 && el.x < tEnd;
-            if (hitEl) tEnd = el.x;
-            if (inner.y > 0.0) col = max(col, nimitzInterior(ro, rd, max(inner.x, 0.0), tEnd, time));
-            // the electrode: his rays flare into a pink blob at the centre; here a luminous ball
-            float dmin = length(ro + rd * clamp(-dot(ro, rd), 0.0, 1e4));
-            float blob = smoothstep(R1 + 0.012, R1 - 0.010, dmin);
-            float rim = smoothstep(R1 - 0.008, R1, dmin) * smoothstep(R1 + 0.012, R1 + 0.002, dmin);
-            float speck = 0.5 + 0.5 * nzNoise((ro + rd * clamp(-dot(ro, rd), 0.0, 1e4)) * 400.0 + time);
-            col = max(col, vec3(1.0, 0.30, 0.65) * (0.45 * blob * speck + 0.6 * rim) * (1.0 + 0.2 * nzNoise(vec3(time * 3.0, 1.0, 2.0))));
-            // his sphere reflections (flow noise on the outer and inner hit normals)
-            vec3 pO = ro + rd * outer.x;
-            vec3 n1 = pO / R2O;
-            vec3 n2 = (ro + rd * outer.y) / R2O;
-            float nz = -log(abs(nzFlow(reflect(rd, n1) * 1.2, time) - 0.01));
-            float nz2 = -log(abs(nzFlow(reflect(rd, n2) * 1.2, -time) - 0.01));
-            col += (0.1 * nz * nz * vec3(0.12, 0.12, 0.5) + 0.05 * nz2 * nz2 * vec3(0.55, 0.2, 0.55)) * 0.8;
-            layerN = 1.0; hitN = outer.x;
-            mvN = project(vp, pO) - project(vpPrev, pO);
-        }
-        col *= 1.3;
-        imageStore(outHdr, pix, vec4(max(col, vec3(0.0)), 1.0));
-        imageStore(outEmissive, pix, vec4(0.0, 0.0, 0.0, 1.0));
-        imageStore(outMotion, pix, vec4(mvN, 0.0, 0.0));
-        imageStore(outLayer, pix, vec4(layerN, hitN, 0.0, 0.0));
-        return;
-    }
 
     if (outer.x > 0.0) {
         // ---- primary hit on the outer glass

@@ -386,7 +386,6 @@ def run_sim(args):
     globe.init(dw, dh)
     renderer.init(dw, dh)
     renderer.knobs["rad_scale"] = args.rad_scale
-    renderer.knobs["look"] = 1.0 if args.nimitz else 0.0
     print(f"init {time.perf_counter() - t0:.1f} s")
     globe.knobs["voltage"] = args.voltage
     snaps = set(int(v) for v in args.snapshots.split(",")) if args.snapshots else set()
@@ -523,7 +522,6 @@ if __name__ == "__main__" and "--sim" in sys.argv:
     ap.add_argument("--no-glow", action="store_true")
     ap.add_argument("--no-lights", action="store_true")
     ap.add_argument("--no-hybrid", action="store_true")
-    ap.add_argument("--nimitz", action="store_true", help="render with the plasma_globe.glsl look on the simulated filaments")
     ap.add_argument("--invert", action="store_true", help="globe upside down (gravity flipped in globe space)")
     ap.add_argument("--ice", action="store_true", help="ice cap on top of the globe")
     ap.add_argument("--log-every", type=int, default=60)

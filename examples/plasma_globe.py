@@ -68,7 +68,6 @@ Keyboard Controls
     , / .  or O / Shift+O   Exposure bias -/+ 0.5 EV
     U                       Toggle the temporal upscale (off = native full-resolution reference path)
     W                       Toggle the tree wireframe overlay
-    M                       Toggle the nimitz look (plasma_globe.glsl shading driven by the simulated filaments)
     0-9                     Debug views (0 beauty, 1 emissive, 2 layer id, 3 motion vectors, 4 history
                             weight, 5 candidates per ray, 6 grid occupancy, 7 temperature slice,
                             8 surface charge, 9 native reference)
@@ -385,7 +384,7 @@ class Fingers:
         return list(self.dirs.values())
 
 
-DRAG_SENSITIVITY = 0.5   # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
+DRAG_SENSITIVITY = 0.25  # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
 
 
 class Mouse(shaderbang.input.Mouse):
@@ -516,7 +515,7 @@ BOUND_KEYS = {EV_KEY.KEY_P, EV_KEY.KEY_RIGHT, EV_KEY.KEY_SPACE, EV_KEY.KEY_R, EV
               EV_KEY.KEY_MINUS, EV_KEY.KEY_EQUAL, EV_KEY.KEY_LEFTBRACE, EV_KEY.KEY_RIGHTBRACE, EV_KEY.KEY_E,
               EV_KEY.KEY_Y, EV_KEY.KEY_F, EV_KEY.KEY_T, EV_KEY.KEY_X, EV_KEY.KEY_H, EV_KEY.KEY_L, EV_KEY.KEY_A,
               EV_KEY.KEY_UP, EV_KEY.KEY_DOWN, EV_KEY.KEY_COMMA, EV_KEY.KEY_DOT, EV_KEY.KEY_U, EV_KEY.KEY_W,
-              EV_KEY.KEY_M, EV_KEY.KEY_B, EV_KEY.KEY_S, EV_KEY.KEY_V, EV_KEY.KEY_N, EV_KEY.KEY_O,
+              EV_KEY.KEY_B, EV_KEY.KEY_S, EV_KEY.KEY_V, EV_KEY.KEY_N, EV_KEY.KEY_O,
               EV_KEY.KEY_0, EV_KEY.KEY_1, EV_KEY.KEY_2, EV_KEY.KEY_3, EV_KEY.KEY_4, EV_KEY.KEY_5, EV_KEY.KEY_6,
               EV_KEY.KEY_7, EV_KEY.KEY_8, EV_KEY.KEY_9, EV_KEY.KEY_LEFTSHIFT, EV_KEY.KEY_RIGHTSHIFT,
               EV_KEY.KEY_LEFTCTRL, EV_KEY.KEY_RIGHTCTRL, EV_KEY.KEY_LEFTALT, EV_KEY.KEY_RIGHTALT}
@@ -613,9 +612,6 @@ class Keyboard(shaderbang.input.Keyboard):
         if self.pressed(EV_KEY.KEY_W):
             state ^= State.WIREFRAME
             log_key(f"wireframe {'on' if state & State.WIREFRAME else 'off'}")
-        if self.pressed(EV_KEY.KEY_M):
-            renderer.knobs["look"] = 0.0 if renderer.knobs["look"] else 1.0
-            log_key(f"look {'nimitz' if renderer.knobs['look'] else 'physical'}")
         for i, key in enumerate((EV_KEY.KEY_0, EV_KEY.KEY_1, EV_KEY.KEY_2, EV_KEY.KEY_3, EV_KEY.KEY_4,
                                  EV_KEY.KEY_5, EV_KEY.KEY_6, EV_KEY.KEY_7, EV_KEY.KEY_8, EV_KEY.KEY_9)):
             if self.pressed(key):
