@@ -39,6 +39,8 @@ P_GAS_NOMINAL = 0.7           # W total at 1 mA (CHOSEN top-down; gas lab: 0.6-1
 I_TOT_NOMINAL = 1.0e-3
 VIDEO_NEUTRAL = (1.00, 0.30, 0.62)   # 'video' preset: pink (feet, electrode)               CHOSEN (footage)
 VIDEO_ION = (0.22, 0.17, 0.75)       # 'video' preset: violet-blue shaft                    CHOSEN (footage)
+X_ION_SHAFT_REF = 0.9                # ionised fraction of a typical shaft (for the preset scale below)
+SHAFT_MAX_REF = 0.74                 # the video preset's shaft brightest channel: every preset is scaled to it
 X_ION_FOOT = 0.45             # ionised-line fraction at the glass foot: pink (the footage shows magenta
                               # feet and branches under a hand, not the pure Ne I orange)
 X_ION_ROOT = 0.35            # ionised-line fraction at the bulb (pink-white root flares)
@@ -513,6 +515,13 @@ class Globe(Input):
                 neutral, ion = pr["neutral_rgb"], pr["ion_rgb"]
             except Exception:
                 neutral, ion = (2.884, 0.541, 0.0), (1.167, 0.809, 2.404)
+            # the spectral colours carry an arbitrary line-intensity scale (argon's shaft is 16x the
+            # video preset's brightest channel): normalise every preset to the same emitted scale, so
+            # the metered exposure - and with it the room's brightness - does not change with the gas
+            shaft = [n * (1.0 - X_ION_SHAFT_REF) + i * X_ION_SHAFT_REF for n, i in zip(neutral, ion)]
+            k = SHAFT_MAX_REF / max(max(shaft), 1.0e-6)
+            neutral = tuple(c * k for c in neutral)
+            ion = tuple(c * k for c in ion)
         self.color_neutral.fill_(wp.vec3(*[float(c) for c in neutral]))
         self.color_ion.fill_(wp.vec3(*[float(c) for c in ion]))
         self.preset_name = name
@@ -642,11 +651,13 @@ class Globe(Input):
               f"(attached {c['attached']}), I_tot {c['i_tot']*1e3:.2f} mA, V {self.knobs['voltage']:.0f} V, "
               f"f {self.knobs['frequency']/1e3:.0f} kHz")
 
-    def dump_state(self, path=None):
+    def dump_state(self, path=None, **extra):
+        """Dump the simulation arrays (plus any extra arrays, e.g. the camera pose) to an .npz."""
         wp.synchronize()
         path = path or f"/tmp/plasma_state_{self.frame:06d}.npz"
         e = self.engine
         np.savez(path, pos=e.pos.numpy(), prev_pos=e.prev_pos.numpy(), parent=e.parent.numpy(), tree=e.tree.numpy(),
                  flags=e.flags.numpy(), s_arc=e.s_arc.numpy(), tree_state=e.t_state.numpy(), tree_foot=e.t_foot.numpy(),
-                 tree_tip=e.t_tip.numpy(), tree_root=e.t_root.numpy(), tree_current=self.circuit.tree_current.numpy())
+                 tree_tip=e.t_tip.numpy(), tree_root=e.t_root.numpy(), tree_current=self.circuit.tree_current.numpy(),
+                 **extra)
         print(f"[globe] state dumped to {path}")

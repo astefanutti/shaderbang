@@ -131,41 +131,54 @@ float rand(inout uvec4 seed) { pcg4d(seed); return float(seed.x) / float(0xfffff
 vec3 lineLightDiffuse(vec3 p, vec3 n);                     // defined with the line lights below
 vec3 lineLightSpecular(vec3 p, vec3 n, vec3 v, float roughness);
 
-// ---- the room: a dark gradient plus three rectangular panel lights (key, fill, rim) that show
-// up as reflections in the glass, light the table and cast the globe's shadow on it, so the
-// scene reads while the camera moves. Panels: centre, half-axes (m), radiance (linear).
-const int   NRECT = 3;
-const vec3  RECT_C[3] = vec3[3](vec3(-0.55, 0.50, 0.45), vec3(0.65, 0.25, 0.30), vec3(0.15, 0.65, -0.60));
-const vec3  RECT_U[3] = vec3[3](vec3(0.22, 0.0, -0.16), vec3(0.16, 0.0, 0.18), vec3(0.30, 0.0, 0.0));
-const vec3  RECT_V[3] = vec3[3](vec3(0.0, 0.16, 0.0), vec3(0.0, 0.12, 0.0), vec3(0.0, 0.10, 0.0));
-const vec3  RECT_L[3] = vec3[3](vec3(2.4, 2.2, 2.0), vec3(0.85, 0.95, 1.4), vec3(1.2, 1.0, 1.5));
+// ---- the room: four rectangular panels at the corners of the scene, 45 deg above the globe and
+// aimed at it (a studio softbox set: warm key front left, cooler fill front right, two dimmer
+// rims behind), a dark glossy table and a dark back wall. The panels show up as reflections in the
+// glass and the table, light the table and the wall with the globe's soft shadow, and the
+// filaments splash their own light on both, so the scene reads while the camera moves.
+const int   NRECT = 4;
+const float PANEL_D = 0.55;                                 // horizontal offset of a panel from the globe (m)
+const float PANEL_H = 0.55;                                 // height above the globe's centre: 45 deg elevation
+const vec3  RECT_C[4] = vec3[4](vec3(-0.75, 0.45, 0.20),          // left strip: long, low, slightly in front of the globe
+                                vec3( 0.75, 0.45, 0.20),          // right strip
+                                vec3( 0.00, 1.10, 0.10),          // large soft overhead panel
+                                vec3( 0.00, 0.60, -0.85));        // back rim strip, above the wall
+const vec2  RECT_HALF[4] = vec2[4](vec2(0.60, 0.06), vec2(0.60, 0.06), vec2(0.45, 0.45), vec2(0.60, 0.05));   // half width (horizontal), half height
+const vec3  RECT_L[4] = vec3[4](vec3(16.0, 15.0, 13.5), vec3(9.0, 9.5, 12.5), vec3(3.0, 3.0, 3.4), vec3(7.0, 6.5, 8.0));
 const float TABLE_GLOSS = 0.10;          // tan of the table's glossy cone half angle
 const float BASE_R = 0.05, BASE_H = 0.03; // the dark base the globe sits on
+const float WALL_Z = -0.9;               // the back wall (the default camera looks towards -z)
+const vec3  WALL_ALBEDO = vec3(0.16, 0.16, 0.18);
 
 vec3 roomBase(vec3 d) {
     float up = d.y * 0.5 + 0.5;
     return mix(vec3(0.007, 0.0056, 0.005), vec3(0.0035, 0.0042, 0.0063), up);       // the footage: a dark room
 }
 
-vec3 rectNormal(int i) {
-    vec3 n = normalize(cross(RECT_U[i], RECT_V[i]));
-    return dot(n, RECT_C[i]) > 0.0 ? -n : n;                                         // faces the globe
+// a panel's frame: n aims at the globe's centre, u along the horizontal edge, v along the tilted one
+void rectFrame(int i, out vec3 n, out vec3 u, out vec3 v) {
+    n = normalize(-RECT_C[i]);
+    vec3 side = normalize(cross(vec3(0.0, 1.0, 0.0), n));
+    u = side * RECT_HALF[i].x;
+    v = cross(n, side) * RECT_HALF[i].y;
 }
 
 // radiance of the panels along a ray (blur = tan of the cone half angle for glossy lookups)
 vec3 rectRadiance(vec3 p, vec3 d, float blur) {
     vec3 sum = vec3(0.0);
     for (int i = 0; i < NRECT; ++i) {
-        vec3 n = rectNormal(i);
+        vec3 n, u, v;
+        rectFrame(i, n, u, v);
         float dn = dot(d, n);
-        if (dn >= 0.0) continue;
+        if (dn >= 0.0) continue;                                                     // the panel emits towards the globe
         float t = dot(RECT_C[i] - p, n) / dn;
         if (t <= 0.0) continue;
         vec3 q = p + d * t - RECT_C[i];
-        float su = dot(q, RECT_U[i]) / dot(RECT_U[i], RECT_U[i]);
-        float sv = dot(q, RECT_V[i]) / dot(RECT_V[i], RECT_V[i]);
-        float eu = max(blur * t / length(RECT_U[i]), 0.02), ev = max(blur * t / length(RECT_V[i]), 0.02);
+        float su = dot(q, u) / dot(u, u);
+        float sv = dot(q, v) / dot(v, v);
+        float eu = max(blur * t / length(u), 0.02), ev = max(blur * t / length(v), 0.02);
         float w = (1.0 - smoothstep(1.0 - eu, 1.0 + eu, abs(su))) * (1.0 - smoothstep(1.0 - ev, 1.0 + ev, abs(sv)));
+        w *= 1.0 - 0.25 * clamp(su * su + sv * sv, 0.0, 1.0);                          // a softbox is a little brighter at its centre
         sum += RECT_L[i] * w;
     }
     return sum;
@@ -177,10 +190,11 @@ const int SHADOW_SAMPLES = 4;            // jittered points per panel per frame 
 vec3 rectIrradiance(vec3 p, vec3 n, inout uvec4 seed) {
     vec3 sum = vec3(0.0);
     for (int i = 0; i < NRECT; ++i) {
-      vec3 nl = rectNormal(i);
-      float A = 4.0 * length(RECT_U[i]) * length(RECT_V[i]);
+      vec3 nl, u, v;
+      rectFrame(i, nl, u, v);
+      float A = 4.0 * length(u) * length(v);
       for (int k = 0; k < SHADOW_SAMPLES; ++k) {
-        vec3 q = RECT_C[i] + (2.0 * rand(seed) - 1.0) * RECT_U[i] + (2.0 * rand(seed) - 1.0) * RECT_V[i];
+        vec3 q = RECT_C[i] + (2.0 * rand(seed) - 1.0) * u + (2.0 * rand(seed) - 1.0) * v;
         vec3 L = q - p;
         float d2 = dot(L, L);
         float dist = sqrt(d2);
@@ -208,8 +222,48 @@ vec3 rectIrradiance(vec3 p, vec3 n, inout uvec4 seed) {
     return sum;
 }
 
+// the back wall: distance along the ray, or -1
+float wallHit(vec3 ro, vec3 rd) {
+    if (rd.z >= -1e-6) return -1.0;
+    float t = (WALL_Z - ro.z) / rd.z;
+    return (t > 0.0 && ro.y + rd.y * t > TABLE_Y) ? t : -1.0;                        // the table meets the wall
+}
+
+// a dark matte wall lit by the panels (with the globe's shadow) and by the filaments. `full` (primary
+// hits) takes the jittered panel samples and the 256 line lights; the cheap version used for the
+// wall seen in reflections and through the globe takes the panel centres only (the line-light loop
+// re-reads the whole light buffer per evaluation, and a globe pixel can look at the wall 3-4 times)
+vec3 panelIrradianceCentres(vec3 p, vec3 n) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < NRECT; ++i) {
+        vec3 nl, u, v;
+        rectFrame(i, nl, u, v);
+        vec3 L = RECT_C[i] - p;
+        float d2 = dot(L, L), dist = sqrt(d2);
+        L /= dist;
+        float A = 4.0 * length(u) * length(v);
+        float ff = A * max(dot(n, L), 0.0) * max(dot(nl, -L), 0.0) / (d2 + 0.05 * A);
+        vec2 g = sphereRoots(p, L, R2O);
+        float vis = (g.x > 0.0 && g.x < dist) ? 0.55 : 1.0;
+        sum += RECT_L[i] * ff * vis;
+    }
+    return sum;
+}
+vec3 wallShade(vec3 p, inout uvec4 seed, bool full) {
+    vec3 n = vec3(0.0, 0.0, 1.0);
+    if (full)
+        return WALL_ALBEDO / PI * (rectIrradiance(p, n, seed) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n));
+    return WALL_ALBEDO / PI * (panelIrradianceCentres(p, n) + roomBase(n));
+}
+
+// what a ray sees of the room: the wall where it hits it, else the gradient and the panels
 vec3 roomRadiance(vec3 p, vec3 d) {
-    return roomBase(d) + rectRadiance(p, d, 0.0);
+    float tw = wallHit(p, d);
+    if (tw > 0.0) {
+        uvec4 seed = uvec4(0u);
+        return wallShade(p + d * tw, seed, false);
+    }
+    return roomBase(d) + rectRadiance(p, d, 0.0);                                    // panels with crisp edges
 }
 
 // the base under the globe: a dark cylinder from the table up BASE_H; returns t (or -1) and n
@@ -243,7 +297,7 @@ float baseHit(vec3 ro, vec3 rd, out vec3 n) {
 // filaments, plus a Fresnel-weighted gloss: blurred panels, the filaments as glossy line-light
 // reflections (their mirror image in the table), the globe's dark body where it blocks the panels
 vec3 tableShade(vec3 p, vec3 n, vec3 rd, inout uvec4 seed) {
-    vec3 albedo = vec3(0.16, 0.15, 0.14);
+    vec3 albedo = vec3(0.09, 0.085, 0.08);
     vec3 diff = albedo / PI * (rectIrradiance(p, n, seed) + (flags.y == 1 ? lineLightDiffuse(p, n) : vec3(0.0)) + roomBase(n) * 1.0);
     vec3 r = reflect(rd, n);
     float cosT = max(dot(n, -rd), 0.0);
@@ -251,7 +305,9 @@ vec3 tableShade(vec3 p, vec3 n, vec3 rd, inout uvec4 seed) {
     vec3 panels = rectRadiance(p, r, TABLE_GLOSS);
     vec2 g = sphereRoots(p, r, R2O);
     if (g.x > 0.0) panels *= 0.12;                                                    // the globe's body in the reflection
-    vec3 spec = panels + roomBase(r) + (flags.y == 1 ? 0.85 * lineLightSpecular(p, n, -rd, 0.20) : vec3(0.0));
+    float tw = wallHit(p, r);
+    vec3 env = tw > 0.0 ? wallShade(p + r * tw, seed, false) : roomBase(r);
+    vec3 spec = panels + env + (flags.y == 1 ? 0.85 * lineLightSpecular(p, n, -rd, 0.20) : vec3(0.0));
     return diff + F * spec;
 }
 
@@ -725,6 +781,7 @@ void main() {
     float tTable = (rd.y < -1e-6) ? (TABLE_Y - ro.y) / rd.y : -1.0;
     vec3 nBase;
     float tBase = baseHit(ro, rd, nBase);
+    float tWall = wallHit(ro, rd);
     if (tBase > 0.0 && outer.x > 0.0 && tBase < outer.x) outer = vec2(-1.0);        // the base in front of the glass
 
     if (outer.x > 0.0) {
@@ -848,6 +905,8 @@ void main() {
                         if (dot(rdOut, rdOut) > 0.0) {
                             float Fx = fresnelDielectric(dot(rdG2, nX), 1.0 / IOR);
                             float tT = (rdOut.y < -1e-6) ? (TABLE_Y - pX.y) / rdOut.y : -1.0;
+                            float tW = wallHit(pX, rdOut);
+                            if (tW > 0.0 && (tT <= 0.0 || tW < tT)) tT = -1.0;         // the wall is nearer: roomRadiance draws it
                             if (tT > 0.0) {
                                 vec3 pT = pX + rdOut * tT;
                                 through = (1.0 - Fx) * tableShade(pT, vec3(0.0, 1.0, 0.0), rdOut, seed);
@@ -883,10 +942,14 @@ void main() {
         vec3 pB = ro + rd * tBase;
         hdr = baseShade(pB, nBase, rd, seed);
         layer = 0.0; hitDist = tBase; mvPointCur = pB; mvPointPrev = pB; haveMv = true;
-    } else if (tTable > 0.0) {
+    } else if (tTable > 0.0 && !(tWall > 0.0 && tWall < tTable)) {
         vec3 pT = ro + rd * tTable;
         hdr = tableShade(pT, vec3(0.0, 1.0, 0.0), rd, seed);
         layer = 0.0; hitDist = tTable; mvPointCur = pT; mvPointPrev = pT; haveMv = true;
+    } else if (tWall > 0.0) {
+        vec3 pW = ro + rd * tWall;
+        hdr = wallShade(pW, seed, true);
+        layer = 0.0; hitDist = tWall; mvPointCur = pW; mvPointPrev = pW; haveMv = true;
     } else {
         hdr = roomRadiance(ro, rd);
         layer = 0.0; hitDist = 1e4;

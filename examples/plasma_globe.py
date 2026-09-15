@@ -62,7 +62,8 @@ Keyboard Controls
     F / Shift+F             Finger charge -/+ 0.01
     T                       Cycle the gas preset (video / Ne+Xe / Ne / Ar / Kr)
     X                       Toggle quincunx surface-charge mode
-    H                       Toggle the hybrid re-strike model (off = persistent channels only)
+    H                       Print these keyboard controls
+    J                       Toggle the hybrid re-strike model (off = persistent channels only)
     L / A                   Toggle line lights / glow
     Up / Down               Glow width x1.25 / x0.8
     , / .  or O / Shift+O   Exposure bias -/+ 0.5 EV
@@ -73,8 +74,7 @@ Keyboard Controls
                             8 surface charge, 9 native reference)
     B                       Print per-pass timings and simulation counters
     Ctrl+S                  Dump the simulation state for the headless validator
-    Every press prints '[keys] press <evdev name>' (a layout that sends other scancodes shows up
-    there) and every change prints '[keys] <setting> <new value>'.
+    Every change prints '[keys] <setting> <new value>'.
 
 Mouse Controls
 --------------
@@ -134,7 +134,6 @@ from threading import main_thread, Thread
 from libevdev import Device, EV_ABS, EV_KEY, EV_REL, INPUT_PROP_DIRECT, INPUT_PROP_POINTER
 
 import shaderbang.input
-import shaderbang.keycodes
 from shaderbang.inotify import INotify, IN_CREATE, IN_ATTRIB
 from shaderbang.input import Input, TouchSlot
 from shaderbang.gesture import homothety_and_rotation
@@ -243,11 +242,15 @@ class Camera(Input):
     MIN_DISTANCE = 0.15
     MAX_DISTANCE = 3.0
     FOV_Y = 40.0
+    # starting pose (from a Ctrl+S dump of the view the user settled on, 2026-09-15): 29 cm from the
+    # globe, 30 deg to the right of the front, level with the bulb
+    DEFAULT_EYE = (0.1551, -0.0306, 0.2672)
+    DEFAULT_TARGET = (0.0105, -0.0219, 0.0202)
 
     def __init__(self):
         super().__init__("camera")
-        self.pos = wp.vec3(0.0, 0.06, 0.32)
-        self.target = wp.vec3(0.0, 0.03, 0.0)
+        self.pos = wp.vec3(*Camera.DEFAULT_EYE)
+        self.target = wp.vec3(*Camera.DEFAULT_TARGET)
         self.forward = wp.normalize(self.target - self.pos)
         self.right = wp.normalize(wp.cross(self.forward, Camera.UP))
         self.up = wp.normalize(wp.cross(self.right, self.forward))
@@ -384,7 +387,9 @@ class Fingers:
         return list(self.dirs.values())
 
 
-DRAG_SENSITIVITY = 0.15  # scales every orbit / track drag (mouse, touchscreen, trackpad); 1.0 = the cloth example's feel
+TRACK_SENSITIVITY = 0.15      # pan (track) drags: mouse right drag, 2-3 fingers on the touchscreen, 3 fingers on the trackpad
+TRACKPAD_ORBIT_GAIN = 0.25    # two-finger orbit on the trackpad: a full swipe turns a quarter circle (was a full circle; the
+                              # mouse turns a half circle over the screen); the rotations themselves are otherwise unchanged
 
 
 class Mouse(shaderbang.input.Mouse):
@@ -403,9 +408,9 @@ class Mouse(shaderbang.input.Mouse):
             if self.finger:
                 fingers.move(Fingers.MOUSE_SLOT, camera.pick_globe(self.mouseX, self.mouseY))
             elif self.button == EV_KEY.BTN_LEFT:
-                camera.orbit(self.deltaX, self.deltaY, DRAG_SENSITIVITY * 0.5 / self.resolution[1])
+                camera.orbit(self.deltaX, self.deltaY, 0.5 / self.resolution[1])
             elif self.button == EV_KEY.BTN_RIGHT:
-                camera.track(self.deltaX, self.deltaY, gain=DRAG_SENSITIVITY * 0.001)
+                camera.track(self.deltaX, self.deltaY, gain=TRACK_SENSITIVITY * 0.001)
         elif self.finger:
             fingers.release(Fingers.MOUSE_SLOT)
             self.finger = False
@@ -453,7 +458,7 @@ class Touchscreen(shaderbang.input.MultiTouch[FingerSlot]):
             vec1 = wp.quat_rotate(quat, self.holroyd_trackball(slot.prevX, slot.prevY))
             vec2 = wp.quat_rotate(quat, self.holroyd_trackball(slot.touchX, slot.touchY))
             theta = wp.atan2(wp.dot(wp.cross(vec2, vec1), camera.UP), wp.dot(vec2, vec1))
-            camera.rotate(DRAG_SENSITIVITY * wp.PI * theta, - DRAG_SENSITIVITY * wp.TAU * slot.deltaY * 0.5 / self.resolution[1])
+            camera.rotate(wp.PI * theta, - wp.TAU * slot.deltaY * 0.5 / self.resolution[1])
         elif n > 1:
             cx = cy = dx = dy = 0.0
             for slot in slots:
@@ -469,7 +474,7 @@ class Touchscreen(shaderbang.input.MultiTouch[FingerSlot]):
                 slot.prevX += dx
                 slot.prevY += dy
             scale, theta, tx, ty = homothety_and_rotation(slots, center=(cx, cy))
-            camera.track(dx, dy, gain=DRAG_SENSITIVITY * 0.001)
+            camera.track(dx, dy, gain=TRACK_SENSITIVITY * 0.001)
             camera.dolly_scale(scale)
             camera.rotate(wp.sign(camera.pos[1]) * theta, 0.0)
 
@@ -499,11 +504,16 @@ class Trackpad(shaderbang.input.MultiTouch[TouchSlot]):
             slot.prevY += dy
         scale, theta, tx, ty = homothety_and_rotation(slots, center=(cx, cy))
         if n == 2:
-            camera.orbit(dx, dy, DRAG_SENSITIVITY * 1.0 / self.resolution[1])
+            camera.orbit(dx, dy, TRACKPAD_ORBIT_GAIN / self.resolution[1])
         else:
-            camera.track(dx, dy, gain=DRAG_SENSITIVITY * 0.002)
+            camera.track(dx, dy, gain=TRACK_SENSITIVITY * 0.002)
         camera.dolly_scale(scale)
         camera.rotate(wp.sign(camera.pos[1]) * theta, 0.0)
+
+
+def camera_pose():
+    """(eye, target, up) of the current camera as plain tuples, for logs and dumps."""
+    return (tuple(float(v) for v in camera.pos), tuple(float(v) for v in camera.target), tuple(float(v) for v in camera.up))
 
 
 def log_key(msg):
@@ -511,28 +521,13 @@ def log_key(msg):
     print(f"[keys] {msg}", flush=True)
 
 
-BOUND_KEYS = {EV_KEY.KEY_P, EV_KEY.KEY_RIGHT, EV_KEY.KEY_SPACE, EV_KEY.KEY_R, EV_KEY.KEY_G, EV_KEY.KEY_I,
-              EV_KEY.KEY_MINUS, EV_KEY.KEY_EQUAL, EV_KEY.KEY_LEFTBRACE, EV_KEY.KEY_RIGHTBRACE, EV_KEY.KEY_E,
-              EV_KEY.KEY_Y, EV_KEY.KEY_F, EV_KEY.KEY_T, EV_KEY.KEY_X, EV_KEY.KEY_H, EV_KEY.KEY_L, EV_KEY.KEY_A,
-              EV_KEY.KEY_UP, EV_KEY.KEY_DOWN, EV_KEY.KEY_COMMA, EV_KEY.KEY_DOT, EV_KEY.KEY_U, EV_KEY.KEY_W,
-              EV_KEY.KEY_B, EV_KEY.KEY_S, EV_KEY.KEY_V, EV_KEY.KEY_N, EV_KEY.KEY_O,
-              EV_KEY.KEY_0, EV_KEY.KEY_1, EV_KEY.KEY_2, EV_KEY.KEY_3, EV_KEY.KEY_4, EV_KEY.KEY_5, EV_KEY.KEY_6,
-              EV_KEY.KEY_7, EV_KEY.KEY_8, EV_KEY.KEY_9, EV_KEY.KEY_LEFTSHIFT, EV_KEY.KEY_RIGHTSHIFT,
-              EV_KEY.KEY_LEFTCTRL, EV_KEY.KEY_RIGHTCTRL, EV_KEY.KEY_LEFTALT, EV_KEY.KEY_RIGHTALT}
-
-
-class KeyboardDevice(shaderbang.input.AsciiKeyboard):
-    """The evdev keyboard wrapper, plus a log line for every press the app has no binding for (an
-    unexpected layout sends other scancodes; a key missing from shaderbang.keycodes would be
-    dropped silently), so pressing anything always prints something."""
-
-    def event(self, ev, **kwargs):
-        if ev.matches(EV_KEY) and ev.value == 1:
-            mapped = shaderbang.keycodes.keycodes.get(ev.code, -1) >= 0
-            bound = ev.code in BOUND_KEYS
-            print(f"[keys] press {ev.code.name} (scancode {ev.code.value})"
-                  f"{'' if bound else ' - no binding'}{'' if mapped else ' - not in shaderbang.keycodes'}", flush=True)
-        return super().event(ev, **kwargs)
+def print_controls():
+    """Key H: print the Keyboard Controls section of the module docstring."""
+    doc = __doc__ or ""
+    start = doc.find("Keyboard Controls")
+    end = doc.find("Mouse Controls", start)
+    section = doc[start:end].rstrip() if start >= 0 else "(no docstring)"
+    print("\n" + section + "\n", flush=True)
 
 
 class Keyboard(shaderbang.input.Keyboard):
@@ -586,6 +581,8 @@ class Keyboard(shaderbang.input.Keyboard):
             state ^= State.QUINCUNX
             log_key(f"quincunx sigma {'on' if state & State.QUINCUNX else 'off'}")
         if self.pressed(EV_KEY.KEY_H):
+            print_controls()
+        if self.pressed(EV_KEY.KEY_J):
             state ^= State.HYBRID
             log_key(f"hybrid re-strikes {'on' if state & State.HYBRID else 'off (persistent only)'}")
         if self.pressed(EV_KEY.KEY_L):
@@ -621,8 +618,9 @@ class Keyboard(shaderbang.input.Keyboard):
             renderer.print_timings()
             globe.print_counters()
         if ctrl and self.pressed(EV_KEY.KEY_S):
-            globe.dump_state()
-            log_key("state dumped")
+            pose = camera_pose()
+            globe.dump_state(camera_pos=np.array(pose[0]), camera_target=np.array(pose[1]), camera_up=np.array(pose[2]))
+            log_key("state dumped; camera eye ({:.3f}, {:.3f}, {:.3f}) target ({:.3f}, {:.3f}, {:.3f}) up ({:.3f}, {:.3f}, {:.3f})".format(*pose[0], *pose[1], *pose[2]))
 
     def post_render(self, **kwargs):
         global state
@@ -633,9 +631,7 @@ def input_from_device(dev: Device):
     if dev.has(EV_REL) and dev.has(EV_KEY.BTN_LEFT):
         shaderbang.input.ButtonMouse(dev.name, dev, mouse)
     elif dev.has(EV_KEY) and dev.has(EV_KEY.KEY_A):
-        KeyboardDevice(dev.name, dev, keyboard)
-        print(f"[keys] keyboard '{dev.name}' attached ({len(shaderbang.keycodes.keycodes)} mapped keys, "
-              f"shaderbang from {os.path.dirname(shaderbang.__file__)})", flush=True)
+        shaderbang.input.AsciiKeyboard(dev.name, dev, keyboard)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
         shaderbang.input.Touchscreen(dev.name, dev, touchscreen)
     elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
