@@ -44,15 +44,11 @@ from plasma.params import (
 
 N_MAX = 8192                 # node capacity (must match plasma.dbm)
 F_MAX = 32
-FAN_K = 6                    # sub-channels per root: the attachment point wanders within its footprint on the
-                             # electrode during a frame, so the time-averaged root is a bundle fanning out of
-                             # the channel onto the surface (Wikipedia: each tendril has a footprint on the orb)
-FAN_SLOTS = 32 * FAN_K * 2   # F_MAX roots x K sub-channels x 2 segments, after the node segments
-SEG_MAX = N_MAX + FAN_SLOTS  # one segment per node + the root fans
-FAN_LEN = 1.0e-3             # m: the fan merges into the channel this far beyond the root node
-FAN_EMERGE = 0.8e-3          # m: each sub-channel leaves the surface perpendicularly for this length
-FAN_FOOTPRINT = 2.0e-3       # m: footprint radius at 40 uA (~I^0.3)
-FAN_POWER = 1.5              # total light of a fan relative to one ordinary segment of its channel
+FAN_K = 6                    # (slot layout) F_MAX x FAN_K x 2 root slots after the node segments; one per tree
+FAN_SLOTS = 32 * FAN_K * 2   # is used by k_root_bells
+SEG_MAX = N_MAX + FAN_SLOTS  # one segment per node + the root records
+FAN_LEN = 1.2e-3             # m: the bell's throat is this far beyond the root node (bell length ~2.9 mm)
+FAN_POWER = 1.5              # light of a bell relative to one ordinary segment of its channel (per unit length, constant)
 SEG_STRIDE = 7               # vec4 per segment record (see k_segments)
 ROOT_R = 0.011                # electrode radius (plasma.params.R1)
 ROOT_FLARE = 2.5              # extra brightness at the root (x3.5 at the bulb surface)
@@ -81,6 +77,7 @@ CLASS_SIDE = 0.02            # streamer branches of a strike are faint (Kim & Li
 BRUSH_R = R2I - 0.012        # off-main nodes beyond this radius are brush (see dbm.FOOT_BRUSH)
 SECONDARY_MIN_DESCENDANTS = 8
 NODE_MAIN = 128              # transient flag bit: node is on a main channel this frame
+NODE_BELL = 1024             # segment-record flag: a root bell (a fillet of revolution, see k_root_bells)
 NODE_BRUSH = 256             # transient flag bit: node is on a brush-foot chain (the channel's current is
                              # split between the trunk's foot and its brush feet)
 
@@ -340,27 +337,30 @@ def hash01(a: int, b: int) -> float:
 
 
 @wp.kernel
-def k_root_fans(tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype=wp.int32),
-                node_pos: wp.array(dtype=wp.vec3), node_next: wp.array(dtype=wp.int32),
-                node_flags: wp.array(dtype=wp.int32), node_xion: wp.array(dtype=wp.float32),
-                tree_current: wp.array(dtype=wp.float32), tree_radius: wp.array(dtype=wp.float32),
-                color_neutral: wp.array(dtype=wp.vec3), color_ion: wp.array(dtype=wp.vec3),
-                segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=wp.int32)):
-    """The root fan of an attached channel: FAN_K thin sub-channels from points spread over the
-    root's footprint on the electrode (radius ~I^0.3, fixed per root node so it only changes when
-    the channel re-strikes), each leaving the surface perpendicularly (PPPL-4485: filaments emerge
-    normal to the bulb) and merging into the channel FAN_LEN beyond the root node. Two segments
-    each, root colour, FAN_POWER of an ordinary segment's light shared between them."""
+def k_root_bells(tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype=wp.int32),
+                 node_pos: wp.array(dtype=wp.vec3), node_next: wp.array(dtype=wp.int32),
+                 node_flags: wp.array(dtype=wp.int32), node_xion: wp.array(dtype=wp.float32),
+                 tree_current: wp.array(dtype=wp.float32), tree_radius: wp.array(dtype=wp.float32),
+                 color_neutral: wp.array(dtype=wp.vec3), color_ion: wp.array(dtype=wp.vec3),
+                 segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=wp.int32)):
+    """The root bell of an attached channel: one record per tree (slot N_MAX + t), a segment from
+    the electrode surface to FAN_LEN beyond the root node flagged NODE_BELL. The tracer renders it
+    as a continuous fillet of revolution about that axis (tangent to the sphere at the base,
+    tangent to the channel at the throat) instead of a capsule: the time-integrated glow of an
+    attachment point that wanders over its footprint (radius ~ core radius ~ I^0.3), with the
+    light per unit length held constant so the wide mouth is softer than the throat."""
     t = wp.tid()
     base0 = N_MAX + t * FAN_K * 2
+    for k in range(1, FAN_K * 2):                              # only the first slot is used
+        seg_valid[base0 + k] = 0
+        segments[SEG_STRIDE * (base0 + k)] = wp.vec4(0.0)
     root = tree_root[t]
     ok = tree_state[t] == 3 and root >= 0
     if ok:
         ok = (node_flags[root] & NODE_ALIVE) != 0 and tree_current[t] > 0.0
     if not ok:
-        for k in range(FAN_K * 2):
-            seg_valid[base0 + k] = 0
-            segments[SEG_STRIDE * (base0 + k)] = wp.vec4(0.0)
+        seg_valid[base0] = 0
+        segments[SEG_STRIDE * base0] = wp.vec4(0.0)
         return
     xr = node_pos[root]
     nr = xr / wp.max(wp.length(xr), 1.0e-6)
@@ -372,48 +372,26 @@ def k_root_fans(tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype=
             u = v / wp.length(v)
             if wp.dot(u, nr) < 0.3:
                 u = nr
-    junction = xr + u * FAN_LEN
-    up = wp.vec3(0.0, 1.0, 0.0)
-    if wp.abs(nr[1]) > 0.9:
-        up = wp.vec3(1.0, 0.0, 0.0)
-    e1 = wp.normalize(wp.cross(nr, up))
-    e2 = wp.cross(nr, e1)
+    a = nr * (ROOT_R + 0.0002)
+    b = xr + u * FAN_LEN
+    uu = b - a
+    uu = uu / wp.max(wp.length(uu), 1.0e-9)
     cur = tree_current[t]
-    irel = cur / 4.0e-5
-    foot_r = FAN_FOOTPRINT * wp.pow(wp.max(irel, 0.05), 0.3)
-    radius = tree_radius[t] * 1.5                             # soft wide tubes that overlap into one bell
+    radius = tree_radius[t]
     x_ion = node_xion[root]
     col = color_neutral[t] * (1.0 - x_ion) + color_ion[t] * x_ion
-    power = FAN_POWER / float(FAN_K) * cur * wp.sqrt(wp.max(cur, 1.0e-9) / 5.0e-5)
+    power = FAN_POWER * cur * wp.sqrt(wp.max(cur, 1.0e-9) / 5.0e-5)
     pack = pack_tree_class_alpha(t, CLASS_MAIN, 1.0)
-    flags = float(NODE_ROOT | NODE_FOOT)                       # caps at both free ends
-    phase = 6.2831853 * hash01(root, 0)
-    for k in range(FAN_K):
-        phi = phase + 6.2831853 * float(k) / float(FAN_K)
-        rho = foot_r * (0.6 + 0.4 * hash01(root, k + 1))
-        alpha = rho / ROOT_R
-        d = nr * wp.cos(alpha) + (e1 * wp.cos(phi) + e2 * wp.sin(phi)) * wp.sin(alpha)
-        p0 = d * (ROOT_R + 0.0002)
-        p1 = d * (ROOT_R + 0.0002 + FAN_EMERGE)
-        p2 = junction
-        for j in range(2):
-            a = p0
-            b = p1
-            if j == 1:
-                a = p1
-                b = p2
-            uu = b - a
-            uu = uu / wp.max(wp.length(uu), 1.0e-9)
-            slot = base0 + 2 * k + j
-            base = SEG_STRIDE * slot
-            seg_valid[slot] = 1
-            segments[base] = wp.vec4(a[0], a[1], a[2], radius)
-            segments[base + 1] = wp.vec4(b[0], b[1], b[2], pack)
-            segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, x_ion)
-            segments[base + 3] = wp.vec4(a[0], a[1], a[2], float(t))
-            segments[base + 4] = wp.vec4(b[0], b[1], b[2], flags)
-            segments[base + 5] = wp.vec4(uu[0], uu[1], uu[2], 1.0)
-            segments[base + 6] = wp.vec4(uu[0], uu[1], uu[2], float(DILATION + 2))
+    flags = float(NODE_BELL)
+    base = SEG_STRIDE * base0
+    seg_valid[base0] = 1
+    segments[base] = wp.vec4(a[0], a[1], a[2], radius)
+    segments[base + 1] = wp.vec4(b[0], b[1], b[2], pack)
+    segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, x_ion)
+    segments[base + 3] = wp.vec4(a[0], a[1], a[2], float(t))
+    segments[base + 4] = wp.vec4(b[0], b[1], b[2], flags)
+    segments[base + 5] = wp.vec4(uu[0], uu[1], uu[2], 1.0)
+    segments[base + 6] = wp.vec4(uu[0], uu[1], uu[2], float(DILATION + 2))
 
 
 @wp.kernel
@@ -626,7 +604,7 @@ class Publisher:
                           nodes.alpha, self.node_desc, nodes.x_ion, trees.current, trees.radius, self.tree_nfeet,
                           trees.color_neutral, trees.color_ion,
                           self.segments, self.seg_valid, self.node_class], device=d)
-        wp.launch(k_root_fans, dim=F_MAX,
+        wp.launch(k_root_bells, dim=F_MAX,
                   inputs=[trees.state, trees.root, nodes.pos, self.node_next, nodes.flags, nodes.x_ion,
                           trees.current, trees.radius, trees.color_neutral, trees.color_ion,
                           self.segments, self.seg_valid], device=d)

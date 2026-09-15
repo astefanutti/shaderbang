@@ -41,7 +41,7 @@ const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / sca
 const vec3  ELECTRODE_RGB   = vec3(0.52, 0.20, 1.00); // glow discharge covering the electrode: magenta-violet (screenshot face (125,82,168) sRGB)
 const vec3  ROOT_RGB        = vec3(1.00, 0.55, 1.00); // the attachment spot of a channel on the electrode (pink-white "bulb")
 const float POOL_SIGMA      = 0.0018 / 0.011;         // rad: the glow pool a root casts on the anode (1.8 mm)
-const float POOL_GAIN       = 0.005;                  // its peak per (I / 50 uA), before radScale
+const float POOL_GAIN       = 0.002;                  // its peak per (I / 50 uA), before radScale (the bells light the base)
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
 const vec3  FOOT_RGB        = vec3(1.00, 0.34, 0.72); // surface discharge at a foot: magenta
@@ -361,6 +361,68 @@ float segDist(vec3 p, vec3 a, vec3 b) {
     return length(pa - ba * h);
 }
 
+// The root bell: a fillet between the electrode sphere and the channel. Axis a (on the surface)
+// -> b (the throat, in the channel); the fillet radius is a function of the HEIGHT above the
+// sphere h = |x| - R1 (not of the axial coordinate, so the mouth hugs the ball whatever the
+// axis tilt): rho(h) = rc + (Rb - rc) (1 - sqrt(1 - (1 - h/L)^2)), a quarter ellipse tangent to
+// the sphere at h = 0 (rho = Rb, vertical tangent) and to the channel at h = L (rho = rc, zero
+// slope). Density (1 - (d/rho)^2)^2 / rho^2 integrates over the cross-section to pi/3 whatever
+// rho, i.e. the light per unit length is constant (nimitz's width x 1/ramp, brightness x ramp):
+// the mouth is wide and soft, the throat narrow and bright; a fade over the last 30 % of the
+// height hands over to the channel's own capsule (no bead at the throat). Marched with
+// BELL_STEPS samples over the ray's overlap with the bounding cylinder about the axis (bounded
+// cost: only rays within Rb of a root). BELL_GAIN is dimensionless: light per unit length =
+// BELL_GAIN * pi/3 x this record's power (FAN_POWER ordinary segments).
+const int   BELL_STEPS = 12;
+const float BELL_R     = 3.0e-3;        // base radius at the reference core radius (0.45 mm), ~ I^0.3
+const float BELL_GAIN  = 4.0;
+float bellEmission(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b, float rc) {
+    vec3 ab = b - a;
+    float L = length(ab);
+    if (L < 1e-6 || rc <= 0.0) return 0.0;
+    vec3 u = ab / L;
+    float Rb = min(BELL_R * clamp(rc / 0.45e-3, 0.5, 3.0), 3.5 * CELL);   // within the record's 4-cell CSR reach
+    float Lh = length(b) - R1;                                  // the throat's height above the sphere
+    if (Lh < 1e-4) return 0.0;
+    // overlap of the ray with the infinite cylinder of radius Rb about the axis line
+    vec3 w0 = ro - a;
+    float ru = dot(rd, u), wu = dot(w0, u);
+    vec3 rp = rd - ru * u, wq = w0 - wu * u;
+    float A = dot(rp, rp), B = dot(rp, wq), C = dot(wq, wq) - Rb * Rb;
+    float ta = t0, tb = t1;
+    if (A > 1e-9) {
+        float h = B * B - A * C;
+        if (h < 0.0) return 0.0;
+        h = sqrt(h);
+        ta = max(ta, (-B - h) / A); tb = min(tb, (-B + h) / A);
+    } else if (C > 0.0) return 0.0;
+    // axial slab: from below the mouth plane (a tilted axis puts sphere surface there) to the throat
+    if (abs(ru) > 1e-6) {
+        float s0 = (-0.6 * Rb - wu) / ru, s1 = (L - wu) / ru;
+        ta = max(ta, min(s0, s1)); tb = min(tb, max(s0, s1));
+    } else if (wu < -0.6 * Rb || wu > L) return 0.0;
+    if (tb <= ta) return 0.0;
+    float dt = (tb - ta) / float(BELL_STEPS);
+    float sum = 0.0;
+    for (int i = 0; i < BELL_STEPS; ++i) {
+        float t = ta + (float(i) + 0.5) * dt;
+        vec3 xw = ro + rd * t;
+        float hgt = length(xw) - R1;                            // height above the electrode sphere
+        if (hgt < 0.0 || hgt > Lh) continue;
+        vec3 x = xw - a;
+        float d = length(x - dot(x, u) * u);                    // distance to the axis line
+        float q = 1.0 - hgt / Lh;
+        float rho = rc + (Rb - rc) * (1.0 - sqrt(max(1.0 - q * q, 0.0)));
+        float w = d / rho;
+        if (w < 1.0) {
+            float f = 1.0 - w * w;
+            float fade = smoothstep(Lh, 0.7 * Lh, hgt);          // hand over to the channel at the throat
+            sum += fade * f * f / (rho * rho) * dt;
+        }
+    }
+    return BELL_GAIN * sum;
+}
+
 // emission along ray [t0, t1] from a capsule a-b of radius eps: cap / body / cap closed forms.
 // Interior joints of a chain get NO caps: consecutive spans share their end points, so the next
 // span's body already covers the region past b (a cap there double-counts a sphere of radius eps
@@ -471,6 +533,10 @@ Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
             if (a.w <= 0.0) continue;
             float core = a.w;
             int nodeFlags = int(seg[SEGS * s + 4].w);
+            if ((nodeFlags & 1024) != 0) {                 // NODE_BELL: a root fillet, marched, no capsule
+                r.emission += pw * bellEmission(ro, rd, t0, t1, a.xyz, b.xyz, a.w);
+                continue;
+            }
             bool chainStart = (nodeFlags & 16) != 0;       // NODE_ROOT
             bool chainEnd = (nodeFlags & 8) != 0;          // NODE_FOOT: the span ends at the glass
             // core (5/2 profile, r_k) + the diffuse glow sheath of the channel (3/2 profile,

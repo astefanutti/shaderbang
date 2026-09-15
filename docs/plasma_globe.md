@@ -582,3 +582,32 @@ haze stays dim, a luminous face (125,82,168) and root flares covering ~40 % of t
   gravity-sign aware), and the foot pin is 4 mm. After: no band sinks (0–2 mm +0.05, 2–20 mm
   +0.8 to +0.9, 20–50 mm +4 to +8 mm/s), the channel stretches and re-strikes with the foot higher
   (as measured in the previous pass). Population 27, re-routes 3.0 per filament per second.
+
+### Sixteenth pass — continuous root bells (2026-09-15)
+
+The six-sub-channel fan read as dots. Replaced by one continuous fillet per root: `k_root_bells`
+writes a single record per attached tree (slot N_MAX + t·12, flag `NODE_BELL` = 1024) — a segment
+from the electrode surface to 1.2 mm beyond the root node — and the tracer renders that record
+with `bellEmission` instead of a capsule: a surface of revolution about the axis with radius
+ρ(s) = r_c + (R_b − r_c)(1 − √(1 − (1 − s/L)²)), a quarter ellipse tangent to the sphere at the
+base (ρ = R_b, vertical tangent) and to the channel at the throat (ρ = r_c, zero slope), density
+(1 − (d/ρ)²)²/ρ² so the light per unit length is constant (nimitz's width × 1/ramp, brightness ×
+ramp), marched with 12 midpoint samples over the ray's overlap with the bounding cylinder (only
+rays within R_b of a root). R_b = 3 mm at the reference core radius, ∝ r_c ∝ I^0.3. `BELL_GAIN`
+was calibrated by rendering (1.8e-6: the throat matches the channel; 1e-5 saturates the bulb
+region) because the analytic estimate against the capsule normalisation (≈1/ε⁴ on the axis)
+was off by ~10⁶. Root pools lowered to 0.002 (the bells light the base). Trace 3.5 → 2.7 ms (the
+fan's 12 records per tree are down to 1).
+
+An adversarial review (3 lenses, each finding verified by an independent refuter; 7 of 11
+findings confirmed) then found the 10⁶: the integrand (1 − (d/ρ)²)²/ρ² already integrates to π/3
+per unit length, so the extra `/ rc²` made the bell's brightness scale as 1/rc² across channels
+(thin channels ~5× too bright relative to their channel, the touched one ~6× too dim) and the
+"calibrated" gain silently carried m². Fixed: `BELL_GAIN` is dimensionless (4.0: light per unit
+length = 4.0·π/3 × the record's power at the base, fading to zero over the last 30 % of the
+height so the channel's own capsule takes over at the throat, no bead). The review also showed the
+mouth was a flat disc perpendicular to a possibly tilted axis (up to ~35° off the normal, since
+the root's first link is one of the cone directions), half buried in the ball and half floating:
+the fillet radius is now a function of the height above the sphere, |x| − R1, so the mouth hugs
+the ball whatever the tilt; the mouth radius is clamped to the record's 4-cell CSR reach. Face
+0.61 of the core level, p10/p90 0.36/1.02.
