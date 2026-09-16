@@ -909,3 +909,27 @@ on both spheres, and the gas around the electrode follows from its heat, no cap.
   projected globe (close-ups were bathed in it).
 * Not done: nitrogen / molecular bands and a mixture-design mode (the user's next wish: green
   globes use nitrogen; the corona model needs band spectra for that), the gallery (WP3).
+
+### Twenty-sixth pass — the channel base is field-aligned (2026-09-16)
+
+The user: the channel bases lay along the ball as the roots walked up. Cause: the first links sat in
+the shear of the boundary layer (the root moved at the layer speed at its own height, the nodes above
+it at the coarse grid's near-zero velocity plus the plume floor), and every re-route keeps the
+proximal 10 % of the channel, so the tilt accumulated across re-strikes. Physically the path next to
+the electrode is not a material line: E ~ 1/r² there is far too strong for the thermal memory to hold
+a path off the field lines (the argument `DRIFT_EXPONENT` already made), so every half-cycle the
+discharge re-bridges the region radially, from the envelope to the foot of the advected hot track.
+
+* `k_base_restrike`: each frame the main chain's nodes within `L_BASE` 15 mm of the electrode (root
+  included) are placed on the radial line under the first node beyond it, spaced as their arc lengths;
+  the attachment therefore walks at that node's tangential speed × R1 / (R1 + L_BASE) and creeps down
+  the envelope's surface-charge gradient. The channels leave the ball as straight spokes and bend
+  beyond, as in the close-ups.
+* `ball_boundary_layer` is applied to every channel node (a sub-grid model, unweighted by the
+  memory factor: the recordings' root walk needs the track at ~2 R1 to move with the gas): the laminar
+  profile up to its peak at η = 1/3, then the plume's peak speed out to `PLUME_REACH` 3 R1 (fading over
+  the outer half), the resolved grid beyond. The ball's balance gained radiation (ε 0.9) and neon's
+  normal cathode fall (`V_SHEATH` 150 V); `C_BL` 0.3 (laminar peak): at 1.1 mA the envelope runs 7 K
+  hot, U 21 mm/s, δ 15 mm.
+* Measured (tyrian, 5 kV, 180 frames): roots 8.6 mm/s median, 99 % up, p10–p90 +1.4 … +12.2
+  (recordings 7.3, 70 % up); feet 0.1 mm/s.

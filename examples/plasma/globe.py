@@ -117,8 +117,20 @@ FOOT_CREEP = 0.0              # the gas velocity is zero at a wall (no-slip): an
 # 7 mm/s at full power, 3 at low, 70 % upward), the outer glass sits within a kelvin of the gas.
 K_SIG = 4.5e-6                # m^2/s: creep mobility down the surface-charge gradient (sigma / sigma_sat per m -> m/s):
                               # ~3 mm/s at the edge of a saturated 1.5 mm footprint                            CHOSEN
-V_SHEATH = 300.0              # V: electrode sheath (fall) voltage; P_ball = I_tot V_SHEATH heats the envelope      CHOSEN
-C_BL = 0.4                    # boundary-layer velocity scale U = C_BL sqrt(g beta dT 2 R1) (laminar free convection) CHOSEN
+V_SHEATH = 150.0              # V: electrode sheath (fall) voltage, the normal cathode fall of neon (~130-150 V);
+                              # P_ball = I_tot V_SHEATH heats the envelope                                          CHOSEN
+EPS_GLASS = 0.9               # emissivity of the envelope (radiative loss alongside the convection)
+C_BL = 0.3                    # boundary-layer velocity scale U = C_BL sqrt(g beta dT 2 R1): the peak velocity of a
+                              # laminar free-convection layer is ~0.3 of the free-fall scale; with the attachment
+                              # following the track's foot ~6 mm up the layer this gives the recordings' ~7 mm/s
+                              # root walk at full power (1.1 mA: dT 7 K, U 21 mm/s)                          CHOSEN
+PLUME_REACH = 3.0 * R1        # m: the ball's plume carries the channels at the layer's peak speed out to here (fading
+                              # over its outer half); farther out the resolved gas grid takes over
+L_BASE = 15.0e-3              # m: the channel this close to the electrode re-forms along the radial field every
+                              # half-cycle (E ~ 1/r^2 there is too strong for the thermal memory to hold a path off
+                              # the field lines; the bridge from the envelope to the foot of the advected hot track
+                              # is radial), so the base never lies down in the shear of the boundary layer and the
+                              # attachment walks at the foot's tangential speed x R1 / (R1 + L_BASE): ~7 mm/s
 DELTA_BL = 5.0                # layer thickness delta = DELTA_BL R1 Gr^-1/4                                        CHOSEN
 SIGE_NLON, SIGE_NLAT = 64, 32 # the envelope's surface-charge grid (equirectangular, sigma / sigma_sat)
 SIGE_FOOT_R = 1.0e-3          # m: a root's charging footprint on the envelope (the close-ups' spot e-fold 0.55 mm)
@@ -330,6 +342,73 @@ def sigma_glass_gradient(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dty
     return g
 
 
+@wp.func
+def ball_boundary_layer(p: PlasmaParams, x: wp.vec3, y: float) -> wp.vec3:
+    """Velocity of the electrode's free-convection boundary layer at the point x (direction from the
+    ball's centre) and height y above its surface: u = U sin(theta) 6.75 eta (1 - eta)^2, eta = y / delta,
+    tangential towards the top (theta from the bottom stagnation point), zero beyond the layer."""
+    n = wp.normalize(x)
+    up = wp.vec3(0.0, p.g_sign, 0.0)
+    t_up = up - wp.dot(up, n) * n
+    sin_t = wp.length(t_up)
+    if sin_t < 1.0e-4:
+        return wp.vec3(0.0, 0.0, 0.0)
+    # the layer profile up to its peak (eta = 1/3), then the plume keeps the peak speed for a few
+    # radii above the sphere and hands over to the resolved gas beyond PLUME_REACH
+    eta = wp.clamp(y / wp.max(p.delta_bl, 1.0e-4), 0.0, 1.0)
+    prof = wp.where(eta < 1.0 / 3.0, 6.75 * eta * (1.0 - eta) * (1.0 - eta), 1.0)
+    prof = prof * wp.clamp((PLUME_REACH - y) / (0.5 * PLUME_REACH), 0.0, 1.0)
+    return (t_up / sin_t) * (p.u_bl * sin_t * prof)
+
+
+@wp.kernel
+def k_base_restrike(params: wp.array(dtype=PlasmaParams),
+                    tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype=wp.int32),
+                    tree_foot: wp.array(dtype=wp.int32), tree_tip: wp.array(dtype=wp.int32),
+                    node_pos: wp.array(dtype=wp.vec3), node_parent: wp.array(dtype=wp.int32),
+                    node_s_arc: wp.array(dtype=wp.float32), sig_e: wp.array(dtype=wp.float32)):
+    """The channel within L_BASE of the electrode is not a material line: every half-cycle the
+    discharge re-bridges the high-field region next to the electrode along the radial field, from the
+    envelope to the foot of the advected hot track. Each frame the main chain's nodes below L_BASE
+    (root included) are placed on the radial line under the first node beyond it, spaced as their
+    arc lengths; the attachment thus follows the track's foot and creeps down the envelope's
+    surface-charge gradient."""
+    t = wp.tid()
+    p = params[0]
+    if p.running == 0 or tree_state[t] == 0:
+        return
+    root = tree_root[t]
+    start = wp.where(tree_state[t] == 3, tree_foot[t], tree_tip[t])
+    if root < 0 or start < 0:
+        return
+    # the track's foot: the last main-chain node (from the far end) still beyond L_BASE
+    n = start
+    nb = int(-1)
+    steps = int(0)
+    while n >= 0 and steps < 4096:
+        if node_s_arc[n] > L_BASE:
+            nb = n
+        else:
+            break
+        n = node_parent[n]
+        steps += 1
+    if nb < 0:
+        return
+    r_nb = wp.length(node_pos[nb])
+    if r_nb <= R1 + NODE_SPACING + 1.0e-4:
+        return
+    d = node_pos[nb] / r_nb
+    d = wp.normalize(d - (K_SIG * p.dt / R1) * sigma_e_gradient(sig_e, d))
+    s_nb = wp.max(node_s_arc[nb], 1.0e-6)
+    n = node_parent[nb]
+    steps2 = int(0)
+    while n >= 0 and steps2 < 64:
+        frac = wp.clamp(node_s_arc[n] / s_nb, 0.0, 1.0)
+        node_pos[n] = d * (R1 + NODE_SPACING + (r_nb - R1 - NODE_SPACING) * frac)
+        n = node_parent[n]
+        steps2 += 1
+
+
 @wp.kernel
 def k_sigma_envelope(params: wp.array(dtype=PlasmaParams),
                      tree_state: wp.array(dtype=wp.int32), tree_root_dir: wp.array(dtype=wp.vec3),
@@ -432,17 +511,10 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
         # ball's free-convection boundary layer: u = U sin(theta) 6.75 eta (1 - eta)^2, eta = r_k / delta,
         # tangential towards the top (theta from the bottom stagnation point); the gas velocity at
         # the surface itself is zero
-        t = node_tree[i]
+        # the attachment re-ignites every half-cycle where the channel's hot track meets the
+        # envelope, so it follows the track's foot: the layer's velocity at the first node's height
         n = x / r0
-        up = wp.vec3(0.0, p.g_sign, 0.0)
-        t_up = up - wp.dot(up, n) * n
-        sin_t = wp.length(t_up)
-        vel = wp.vec3(0.0, 0.0, 0.0)
-        if sin_t > 1.0e-4:
-            t_up = t_up / sin_t
-            eta = wp.clamp(tree_radius[t] / wp.max(p.delta_bl, 1.0e-4), 0.0, 1.0)
-            vel = t_up * (p.u_bl * sin_t * 6.75 * eta * (1.0 - eta) * (1.0 - eta))
-        vel = vel - K_SIG * sigma_e_gradient(sig_e, n)
+        vel = ball_boundary_layer(p, x, NODE_SPACING) - K_SIG * sigma_e_gradient(sig_e, n)
         x = x + vel * p.dt
         node_pos[i] = x * ((R1 + NODE_SPACING) / wp.max(wp.length(x), 1.0e-6))
         return
@@ -452,6 +524,10 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
     # cold glass (-1 cm/s) must not drag it down: its vertical drift is at least PLUME_MIN_RISE
     v = wp.vec3(v[0], wp.max(v[1] * p.g_sign, PLUME_MIN_RISE) * p.g_sign, v[2])
     x = x + v * (drift * p.dt)
+    # the ball's free-convection boundary layer (sub-grid: the 2.5 mm cells hold the no-slip zero
+    # next to the ball) carries the first centimetres of every channel at its full velocity; the
+    # root follows its foot (k_base_restrike)
+    x = x + ball_boundary_layer(p, x, r0 - R1) * p.dt
     if (f & NODE_FOOT) != 0:
         # the foot is a surface discharge on the outer glass: pinned by its own footprint charge,
         # creeping down the gradient of the surface charge its neighbours and the old feet left
@@ -643,12 +719,13 @@ def electrode_thermal(i_tot):
     area = 4.0 * np.pi * R1 * R1
     beta = 1.0 / T0
     pr = gas.NU / gas.ALPHA
+    h_rad = 4.0 * EPS_GLASS * 5.670e-8 * T0 ** 3            # linearised radiation to the room (~5.5 W/m^2 K)
     dT = 10.0
     for _ in range(6):
         ra = max(gas.G * beta * dT * (2.0 * R1) ** 3 / (gas.NU * gas.ALPHA), 1e-6)
         nu = 2.0 + 0.589 * ra ** 0.25 / (1.0 + (0.469 / pr) ** (9.0 / 16.0)) ** (4.0 / 9.0)
         h_conv = nu * gas.K_GAS / (2.0 * R1)
-        dT = power / max(h_conv * area, 1e-9)
+        dT = power / max((h_conv + h_rad) * area, 1e-9)
     dT = float(min(dT, 400.0))
     gr = max(gas.G * beta * dT * R1 ** 3 / gas.NU ** 2, 1e-6)
     u_bl = C_BL * np.sqrt(gas.G * beta * dT * 2.0 * R1)
@@ -785,6 +862,8 @@ class Globe(Input):
         wp.launch(k_advect_nodes, dim=n, inputs=[params, s0.u, s0.grid.n, s0.grid.origin, s0.grid.inv_dx, e.pos, e.flags,
                                                  e.tree, e.parent, e.t_state, cs.tree_targets, self.tree_radius, self.sig_e,
                                                  cs.sig_dir, cs.sig_amp, cs.sig_alive], device=d)
+        wp.launch(k_base_restrike, dim=F_MAX,
+                  inputs=[params, e.t_state, e.t_root, e.t_foot, e.t_tip, e.pos, e.parent, e.s_arc, self.sig_e], device=d)
         wp.launch(k_tree_frame_geometry, dim=F_MAX,
                   inputs=[e.t_state, e.t_foot, e.t_tip, e.t_root, e.t_L, e.pos, e.parent,
                           e.t_foot_dir, e.t_root_dir, e.t_chord, e.t_stretch, e.t_foot2, self.tree_foot2_dir], device=d)
