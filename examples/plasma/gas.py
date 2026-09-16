@@ -160,6 +160,7 @@ CTRL_H_EXT = 3        # W/(m^2 K)
 CTRL_Q_SCALE = 4      # multiplier on every q' (heat only; the emission weight e is not scaled)
 CTRL_T_AMB = 5        # K, ambient outside the glass
 CTRL_ICE_DT = 6       # K
+CTRL_T_ELECTRODE = 7  # K above T0: the electrode is a heated sphere (its sheath power, globe.fill_params)
 CTRL_SIZE = 8
 
 # Reduction slots: divergence sum, then two rotating {red, black} pairs of pressure sums
@@ -423,6 +424,16 @@ def k_advect(gin: GasGrid, gout: GasGrid, src: wp.array3d(dtype=wp.int64),
     gout.u[i, j, k] = u
     T_rhs[i, j, k] = t
     u_rhs[i, j, k] = u
+
+
+@wp.kernel
+def k_electrode_temperature(g: GasGrid, ctrl: wp.array(dtype=float)):
+    """The electrode cells hold the Dirichlet value the diffusion sees: T0 + the surface excess the
+    electrode's dissipated sheath power sustains (a heated sphere: its plume and the thinner gas
+    around it are what the corona and the roots' boundary layer feel)."""
+    i, j, k = wp.tid()
+    if (g.cell[i, j, k] & ELECTRODE) != 0:
+        g.T[i, j, k] = T0 + ctrl[CTRL_T_ELECTRODE]
 
 
 @wp.kernel

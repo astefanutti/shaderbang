@@ -60,7 +60,7 @@ Keyboard Controls
     E / Shift+E             Growth exponent eta x0.8 / x1.25 (120: smooth ropes, 3: lightning trees)
     Y / Shift+Y             Thermal memory exponent gamma -/+ 0.5
     F / Shift+F             Finger charge -/+ 0.01
-    T                       Cycle the gas preset (video / Ne+Xe / Ne / Ar / Kr)
+    T                       Cycle the gas preset (tyrian / Ne+Xe / Ne / Ar / Kr / coral)
     X                       Toggle quincunx surface-charge mode
     H                       Print these keyboard controls
     J                       Toggle the hybrid re-strike model (off = persistent channels only)
@@ -173,8 +173,9 @@ parser.add_argument("--gas-res", metavar="N", type=int, default=64,
                     help="gas grid resolution (default 64)")
 parser.add_argument("--seed", metavar="SEED", type=int, default=1,
                     help="random seed of the discharge growth")
-parser.add_argument("--preset", metavar="GAS", type=str, default="video",
-                    help="gas preset: ne_xe, ne, ar, kr")
+parser.add_argument("--preset", metavar="GAS", type=str, default="tyrian",
+                    help="gas preset: tyrian (Ne/Kr/Xe, the pink globe of the recordings), ne_xe, ne, ar, kr, "
+                         "coral (the green forking globes); 'video' is an alias of tyrian")
 parser.add_argument("--profile", action="store_true",
                     help="print per-pass GPU timings every 120 frames")
 parser.add_argument("--test", action="store_true",
@@ -202,7 +203,7 @@ class State(Flag):
 
 state = State.RUN | State.TAAU | State.GLOW | State.LIGHTS | State.HYBRID
 debug_view = 0
-gas_presets = ["video", "ne_xe", "ne", "ar", "kr"]
+gas_presets = ["tyrian", "ne_xe", "ne", "ar", "kr", "coral"]
 
 
 def quat_from_unit_vectors(from_vec: wp.vec3, to_vec: wp.vec3) -> wp.quat:
@@ -726,6 +727,11 @@ class Test(Input):
 camera = Camera()
 fingers = Fingers()
 globe = Globe(camera, fingers, sim_flags, args)
+_preset = {"video": "tyrian"}.get(args.preset, args.preset)
+if _preset in globe.presets:
+    globe.preset_index = globe.presets.index(_preset)         # applied when the globe builds (init)
+else:
+    print(f"[globe] unknown preset {args.preset!r}, using {globe.presets[0]}")
 renderer = Renderer(camera, globe, render_flags, lambda: debug_view, args)
 test = Test() if args.test else None
 

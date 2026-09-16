@@ -264,16 +264,22 @@ if __name__ == "__main__" and "--full" not in sys.argv and "--sim" not in sys.ar
 # ---- full pipeline (renderer.py) on a fake globe -----------------------------------------------------
 
 class _FakeCamera:
-    def __init__(self, w, h):
+    def __init__(self, w, h, eye=None, target=None):
         self.width, self.height = w, h
         self.angle = 0.0
+        self.eye0 = tuple(eye) if eye is not None else None          # fixed pose (--eye/--target), else the orbit
+        self.target = tuple(target) if target is not None else (0.0, 0.03, 0.0)
         self.vp = np.eye(4, dtype=np.float32)
         self.vp_prev = np.eye(4, dtype=np.float32)
         self.update()
 
     def update(self):
-        eye = (0.32 * math.sin(self.angle), 0.06, 0.32 * math.cos(self.angle))
-        e, cu, cv, cw, vp = camera_basis(eye, (0.0, 0.03, 0.0), (0, 1, 0), 40.0, self.width / self.height)
+        if self.eye0 is not None:
+            c, s_ = math.cos(self.angle), math.sin(self.angle)
+            eye = (c * self.eye0[0] + s_ * self.eye0[2], self.eye0[1], -s_ * self.eye0[0] + c * self.eye0[2])
+        else:
+            eye = (0.32 * math.sin(self.angle), 0.06, 0.32 * math.cos(self.angle))
+        e, cu, cv, cw, vp = camera_basis(eye, self.target, (0, 1, 0), 40.0, self.width / self.height)
         self._basis = (e, cu, cv, cw)
         self.vp_prev = self.vp
         self.vp = vp.astype(np.float32)
@@ -374,7 +380,8 @@ def run_sim(args):
     make_context()
     wp.init()
     sargs = types.SimpleNamespace(seed=args.seed, gas_res=args.gas_res, internal_scale=2, profile=False)
-    cam = _FakeCamera(dw, dh)
+    vec = lambda spec: tuple(float(v) for v in spec.split(",")) if spec else None
+    cam = _FakeCamera(dw, dh, vec(args.eye), vec(args.target))
     fingers = _NoFingers()
     simflags = SimFlags(hybrid=not args.no_hybrid, invert=args.invert, ice=args.ice)
     rflags = RenderFlags(taau=not args.no_taau, glow=not args.no_glow, lights=not args.no_lights)
@@ -388,9 +395,13 @@ def run_sim(args):
     renderer.knobs["rad_scale"] = args.rad_scale
     print(f"init {time.perf_counter() - t0:.1f} s")
     globe.knobs["voltage"] = args.voltage
+    if args.preset:
+        globe.preset_index = globe.presets.index(args.preset)
+        globe.apply_preset()
     snaps = set(int(v) for v in args.snapshots.split(",")) if args.snapshots else set()
     sim_ms, frame_ms = [], []
     track_err = []
+    root_track = []          # (--track-roots) per frame: root / foot directions and states, for the drift statistics
     from PIL import Image
     for f in range(args.frames):
         if args.touch_frame >= 0 and f == args.touch_frame:
@@ -419,6 +430,10 @@ def run_sim(args):
         ta = time.perf_counter()
         globe.pre_render()
         wp.synchronize()
+        if args.track_roots and f >= args.track_roots:
+            e_ = globe.engine
+            root_track.append((e_.t_root_dir.numpy().copy(), e_.t_foot_dir.numpy().copy(), e_.t_state.numpy().copy(),
+                               e_.t_birth.numpy().copy()))
         tb = time.perf_counter()
         renderer.render()
         renderer.post_render()
@@ -446,6 +461,8 @@ def run_sim(args):
                         c += 1; n = par[n]
                     main.append(f"{c}/{nn[t]}")
                 rg = e.t_regrow.numpy()
+                print(f"        brush {np.bincount(e.t_brush.numpy(), minlength=3).tolist()}  brush_req {np.bincount(e.t_brush_req.numpy(), minlength=3).tolist()}  "
+                      f"foot2 {int((e.t_foot2.numpy() >= 0).sum())}  coral {int(((fl & 512) != 0).sum())}  cs_brush_req {np.bincount(globe.circuit.tree_brush_req.numpy(), minlength=3).tolist()}")
                 print(f"        states {np.bincount(st, minlength=7).tolist()}  regrow {np.bincount(rg, minlength=3).tolist()}  "
                       f"stretch(att) {np.round(stretch[att], 2).tolist()[:12]}")
                 print(f"        main/total(att) {main}  growing: nodes {nn[grow][:10].tolist()} tip r/R2 {tipr}  "
@@ -467,6 +484,24 @@ def run_sim(args):
     print(f"final: {c}; NaN positions {nan}")
     e = globe.engine; fl = e.flags.numpy(); alive = (fl & 1) != 0
     pos = e.pos.numpy()[alive]
+    if len(root_track) > 1:
+        # drift of the roots on the electrode and of the feet on the glass (attached trees, same tree
+        # both frames, no re-strike in between): vertical speed in mm/s, + up
+        vr, vf = [], []
+        for (r0, f0, s0_, b0), (r1, f1, s1_, b1) in zip(root_track, root_track[1:]):
+            same = (s0_ == 3) & (s1_ == 3) & (b0 == b1)
+            vr.extend(((r1[same, 1] - r0[same, 1]) * 0.011 * 60.0 * 1e3).tolist())
+            moved = same & (np.linalg.norm(f1 - f0, axis=1) < 0.05)           # a foot jump (re-route) is not a walk
+            vf.extend(((f1[moved, 1] - f0[moved, 1]) * 0.075 * 60.0 * 1e3).tolist())
+        vr, vf = np.array(vr), np.array(vf)
+        for name, v in (("roots", vr), ("feet", vf)):
+            if v.size:
+                print(f"drift {name}: n {v.size}, |v| median {np.median(np.abs(v)):.1f} mm/s, mean v {v.mean():+.1f} mm/s, "
+                      f"fraction up {(v > 0).mean():.2f}, p10 {np.percentile(v, 10):+.1f} p90 {np.percentile(v, 90):+.1f}")
+    st = e.t_state.numpy(); f2 = e.t_foot2.numpy().reshape(-1, 4)
+    print(f"morphology: attached {int((st == 3).sum())}, secondary feet {int((f2 >= 0).sum())} on "
+          f"{int(((f2 >= 0).any(axis=1)).sum())} trees, coral nodes {int((alive & ((fl & 512) != 0)).sum())}, "
+          f"stalled {int(e.t_stalled.numpy().sum())}")
     s0 = globe.gas_state[0]
     T = getattr(s0, "T", None)
     line = f"orientation: mean node y {pos[:, 1].mean() * 100:+.2f} cm (n {len(pos)})"
@@ -526,4 +561,8 @@ if __name__ == "__main__" and "--sim" in sys.argv:
     ap.add_argument("--ice", action="store_true", help="ice cap on top of the globe")
     ap.add_argument("--log-every", type=int, default=60)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--preset", default=None, help="gas preset name (video, ne_xe, ne, ar, kr)")
+    ap.add_argument("--track-roots", type=int, default=0, help="from this frame on, record root / foot directions and print their drift")
+    ap.add_argument("--eye", default=None, help="camera position 'x,y,z' (m); default: the 0.32 m orbit")
+    ap.add_argument("--target", default=None, help="camera target 'x,y,z' (m); default 0,0.03,0")
     raise SystemExit(run_sim(ap.parse_args()))

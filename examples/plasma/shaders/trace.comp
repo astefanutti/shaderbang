@@ -30,17 +30,12 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 const float SHEATH_SCALE    = 3.0;        // sheath radius = SHEATH_SCALE x core radius (both grow with the current)
-const vec3  SHEATH_TINT     = vec3(1.0);                 // sheath colour = core colour (a tint made the hue depend on the core/sheath mix per pixel: blue-purple patches along a filament)
-const float FUNNEL_WIDEN    = 2.0;        // sheath x3 at the mouth of the bell (the root fan carries the flare)        // sheath radius x(1 + FUNNEL_WIDEN * rootF): the root funnel (screenshots: a
                                           // soft skirt several mm wide at the bulb narrowing within a bulb radius)
-const float FUNNEL_LIGHT    = 1.5;        // sheath light x(1 + FUNNEL_LIGHT * rootF) at the root (screenshot: the
                                           // funnels saturate within a bulb radius, the haze between them stays dim)
 const float SHEATH_FRACTION = 0.40;       // share of a segment's light in the sheath: the footage shows a thin
                                           // core (1-2 mm FWHM) with a faint skirt out to ~8 mm
 const vec3  AMBIENT_RGB     = vec3(0.60, 0.30, 1.0);  // diffuse discharge / scattered light tint
 // the electrode / haze / sheath / foot colours come from the Params UBO (per gas preset; renderer.VIDEO_ANODE_COLOURS)
-const float POOL_SIGMA      = 0.0018 / 0.011;         // rad: the glow pool a root casts on the anode (1.8 mm)
-const float POOL_GAIN       = 0.002;                  // its peak per (I / 50 uA), before radScale (the bells light the base)
 const float STEM_R          = 0.004;                  // the dark rod carrying the electrode (footage: ~0.35 R1)
 const int   F_MAX           = 32;                     // tree slots (root records follow the SIG_MAX foot records)
 
@@ -62,11 +57,17 @@ layout(std140, binding = 0) uniform Params {
     vec4 knobs;          // x radiance scale, y ambient volume gain (radiance per (kW/m^3 * m)), z time, w unused
     ivec4 flags;         // x debug view, y lights on, z frame, w volume on
     vec4 gas;            // xyz unused, w gravity sign (heat shimmer direction)
-    vec4 colElectrode;   // preset colours: the glow discharge over the electrode,
-    vec4 colHalo;        //   the far haze around it,
-    vec4 colHaloNear;    //   the near haze and the sheath layer,
-    vec4 colFoot;        //   the feet and the root pools (linear rgb, max 1)
+    vec4 colElectrode;   // the preset's emission colour (max 1) at the glow layer's field (reference / debug),
+    vec4 colHalo;        //   in the gas far from the electrode (8 Td),
+    vec4 colHaloNear;    //   near it (20 Td),
+    vec4 colFoot;        //   at the feet (the foot discs on the glass)
+    vec4 emisParams;     // corona emission model: x log Te_min, y log Te_max (table range), z a, w b of Te = a (E/N)^b
+    vec4 emisParams2;    // x E/N at the electrode surface (Td, from the voltage), y E/N of the glow layer, z K_FACE, w K_SHEATH
+    vec4 emisParams3;    // x EN_ION (Townsend-like ionisation scale of the gas around the electrode)
+    vec4 emis[64];       // the gas's line colour (linear rgb, absolute table units) over log Te
 };
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const float T0 = 300.0;
 
 layout(std430, binding = 1) readonly buffer Segments { vec4 seg[]; };          // SEGS vec4 per segment
 const int SEGS = 7;
@@ -94,6 +95,76 @@ const int   SIG_MAX = 64;
 const int   VOLUME_STEPS = 32;
 const vec3  GLASS_ABSORB = vec3(0.6, 0.25, 0.9) * 8.0;    // soda-lime: faint green, per metre
 const float PI = 3.14159265;
+
+// ---- the electrode (2026-09-16 close-ups): a glass envelope of radius R1 over a dark core, the glow
+// discharge a thin luminous layer SHELL_D thick just inside the envelope. Its radiance along a view
+// ray is the layer's chord: face 1, rising as 1/mu, peaking at 2 sqrt((R1 + Rc) / (R1 - Rc)) ~ 13x
+// in a 0.5 mm line where the ray grazes the core, zero at the silhouette. The measured face -> limb
+// law (1.2, 1.6, 2.7, 6.1, 8.6 at mu 0.89 .. 0.2) and the neon globe's thin gold rim line are the
+// same layer. The roots light the layer where their currents spread (rootDensity): spots at the
+// lights the whole face (a touched ball turns pink, ordinary roots leave the face dark).
+const float SHELL_D         = 0.6e-3;                 // m: thickness of the glow layer under the envelope
+const float R_CORE          = R1 - SHELL_D;
+const float ROOT_CORE_R     = 0.45e-3;                // m: core radius at 50 uA, ~ I^0.3 (globe.CORE_RADIUS)
+
+// the gas's emission colour at electron temperature te (eV): the preset's corona-model table
+// (plasma.spectra.emission_table, absolute units), linear in log Te
+vec3 emisAt(float te) {
+    float u = (log(te) - emisParams.x) / (emisParams.y - emisParams.x) * 63.0;
+    u = clamp(u, 0.0, 62.999);
+    int j = int(u);
+    float f = u - float(j);
+    return mix(emis[j].rgb, emis[j + 1].rgb, f);
+}
+float teOf(float enTd) { return emisParams.z * pow(max(enTd, 1.0e-3), emisParams.w); }
+
+// current density (A/m^2) at x of the roots' currents spreading from their attachment points on
+// the electrode: I_k / (4 pi (d^2 + r_k^2)). On the ball this is what lights the glow layer: the
+// mean over the sphere between the roots, 13-17x that at 0.25 mm from a 40 uA root (the
+// close-ups' spots, measured 17x), and a touched 1 mA root lights the whole face around it.
+float rootDensity(vec3 x) {
+    float j = 0.0;
+    for (int t = 0; t < F_MAX; ++t) {
+        vec4 rec = sigma[2 * (SIG_MAX + t)];
+        vec4 rec2 = sigma[2 * (SIG_MAX + t) + 1];
+        if (rec2.y < 0.5 || rec.w <= 0.0) continue;
+        float ik = rec.w * 1.0e-6;                                   // rec.w: uA
+        float rk = ROOT_CORE_R * pow(rec.w / 50.0, 0.3);
+        vec3 d = x - rec.xyz * R1;
+        j += ik / (4.0 * PI * (dot(d, d) + rk * rk));
+    }
+    return j;
+}
+
+// the electrode envelope's surface charge (sigma / sigma_sat, 64 x 32 equirectangular cells packed
+// four per vec4 after the foot and root records): a dielectric-barrier discharge re-ignites where
+// charge was deposited in the previous half-cycles (the memory effect), so the glow layer also lights
+// the surface a root has just charged - the trail behind a walking root, with its true direction
+const int SIGE_NLON = 64, SIGE_NLAT = 32;
+const int SIGE_BASE = 2 * (SIG_MAX + F_MAX);
+const float J_MEM = 3.0;                                          // A/m^2 equivalent of a saturated charged surface  CHOSEN
+float sigmaEnvelope(vec3 n) {
+    float u = (atan(n.z, n.x) / 6.283185307 + 0.5) * float(SIGE_NLON) - 0.5;
+    float v = clamp((asin(clamp(n.y, -1.0, 1.0)) / 3.14159265 + 0.5) * float(SIGE_NLAT) - 0.5, 0.0, float(SIGE_NLAT - 1) - 1.0e-4);
+    int i0 = int(floor(u)); int j0 = int(floor(v));
+    float fu = u - float(i0), fv = v - float(j0);
+    int ia = ((i0 % SIGE_NLON) + SIGE_NLON) % SIGE_NLON, ib = (ia + 1) % SIGE_NLON;
+    int j1 = min(j0 + 1, SIGE_NLAT - 1);
+    int c00 = j0 * SIGE_NLON + ia, c10 = j0 * SIGE_NLON + ib, c01 = j1 * SIGE_NLON + ia, c11 = j1 * SIGE_NLON + ib;
+    float s00 = sigma[SIGE_BASE + c00 / 4][c00 % 4], s10 = sigma[SIGE_BASE + c10 / 4][c10 % 4];
+    float s01 = sigma[SIGE_BASE + c01 / 4][c01 % 4], s11 = sigma[SIGE_BASE + c11 / 4][c11 % 4];
+    return mix(mix(s00, s10, fu), mix(s01, s11, fu), fv);
+}
+
+// chord of the glow layer along a view ray hitting the envelope at incidence cosine mu, in units of
+// the face chord (SHELL_D); the dark core hides the far half of the layer where the ray meets it
+float shellChord(float mu) {
+    float b2 = R1 * R1 * (1.0 - mu * mu);                            // impact parameter squared
+    float outer = R1 * mu;                                            // sqrt(R1^2 - b^2)
+    float inner2 = R_CORE * R_CORE - b2;
+    float chord = (inner2 > 0.0) ? outer - sqrt(inner2) : 2.0 * outer;
+    return chord / SHELL_D;
+}
 
 // ---- geometry -----------------------------------------------------------------------------------
 // Both roots of a ray / sphere (centre at the origin) intersection, projection form (iq); (-1,-1) on miss.
@@ -419,68 +490,6 @@ float segDist(vec3 p, vec3 a, vec3 b) {
     return length(pa - ba * h);
 }
 
-// The root bell: a fillet between the electrode sphere and the channel. Axis a (on the surface)
-// -> b (the throat, in the channel); the fillet radius is a function of the HEIGHT above the
-// sphere h = |x| - R1 (not of the axial coordinate, so the mouth hugs the ball whatever the
-// axis tilt): rho(h) = rc + (Rb - rc) (1 - sqrt(1 - (1 - h/L)^2)), a quarter ellipse tangent to
-// the sphere at h = 0 (rho = Rb, vertical tangent) and to the channel at h = L (rho = rc, zero
-// slope). Density (1 - (d/rho)^2)^2 / rho^2 integrates over the cross-section to pi/3 whatever
-// rho, i.e. the light per unit length is constant (nimitz's width x 1/ramp, brightness x ramp):
-// the mouth is wide and soft, the throat narrow and bright; a fade over the last 30 % of the
-// height hands over to the channel's own capsule (no bead at the throat). Marched with
-// BELL_STEPS samples over the ray's overlap with the bounding cylinder about the axis (bounded
-// cost: only rays within Rb of a root). BELL_GAIN is dimensionless: light per unit length =
-// BELL_GAIN * pi/3 x this record's power (FAN_POWER ordinary segments).
-const int   BELL_STEPS = 12;
-const float BELL_R     = 6.0e-3;        // base radius at the reference core radius (0.45 mm), ~ I^0.3
-const float BELL_GAIN  = 2.0;
-float bellEmission(vec3 ro, vec3 rd, float t0, float t1, vec3 a, vec3 b, float rc) {
-    vec3 ab = b - a;
-    float L = length(ab);
-    if (L < 1e-6 || rc <= 0.0) return 0.0;
-    vec3 u = ab / L;
-    float Rb = min(BELL_R * clamp(rc / 0.45e-3, 0.5, 3.0), 4.5 * CELL);   // within the record's 5-cell CSR reach
-    float Lh = length(b) - R1;                                  // the throat's height above the sphere
-    if (Lh < 1e-4) return 0.0;
-    // overlap of the ray with the infinite cylinder of radius Rb about the axis line
-    vec3 w0 = ro - a;
-    float ru = dot(rd, u), wu = dot(w0, u);
-    vec3 rp = rd - ru * u, wq = w0 - wu * u;
-    float A = dot(rp, rp), B = dot(rp, wq), C = dot(wq, wq) - Rb * Rb;
-    float ta = t0, tb = t1;
-    if (A > 1e-9) {
-        float h = B * B - A * C;
-        if (h < 0.0) return 0.0;
-        h = sqrt(h);
-        ta = max(ta, (-B - h) / A); tb = min(tb, (-B + h) / A);
-    } else if (C > 0.0) return 0.0;
-    // axial slab: from below the mouth plane (a tilted axis puts sphere surface there) to the throat
-    if (abs(ru) > 1e-6) {
-        float s0 = (-0.6 * Rb - wu) / ru, s1 = (L - wu) / ru;
-        ta = max(ta, min(s0, s1)); tb = min(tb, max(s0, s1));
-    } else if (wu < -0.6 * Rb || wu > L) return 0.0;
-    if (tb <= ta) return 0.0;
-    float dt = (tb - ta) / float(BELL_STEPS);
-    float sum = 0.0;
-    for (int i = 0; i < BELL_STEPS; ++i) {
-        float t = ta + (float(i) + 0.5) * dt;
-        vec3 xw = ro + rd * t;
-        float hgt = length(xw) - R1;                            // height above the electrode sphere
-        if (hgt < 0.0 || hgt > Lh) continue;
-        vec3 x = xw - a;
-        float d = length(x - dot(x, u) * u);                    // distance to the axis line
-        float q = 1.0 - hgt / Lh;
-        float rho = rc + (Rb - rc) * (1.0 - sqrt(max(1.0 - q * q, 0.0)));
-        float w = d / rho;
-        if (w < 1.0) {
-            float f = 1.0 - w * w;
-            float fade = smoothstep(Lh, 0.7 * Lh, hgt);          // hand over to the channel at the throat
-            sum += fade * f * f / (rho * rho) * dt;
-        }
-    }
-    return BELL_GAIN * sum;
-}
-
 // emission along ray [t0, t1] from a capsule a-b of radius eps: cap / body / cap closed forms.
 // Interior joints of a chain get NO caps: consecutive spans share their end points, so the next
 // span's body already covers the region past b (a cap there double-counts a sphere of radius eps
@@ -591,16 +600,11 @@ Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
             if (a.w <= 0.0) continue;
             float core = a.w;
             int nodeFlags = int(seg[SEGS * s + 4].w);
-            if ((nodeFlags & 1024) != 0) {                 // NODE_BELL: a root fillet, marched, no capsule
-                r.emission += pw * bellEmission(ro, rd, t0, t1, a.xyz, b.xyz, a.w);
-                continue;
-            }
             bool chainStart = (nodeFlags & 16) != 0;       // NODE_ROOT
             bool chainEnd = (nodeFlags & 8) != 0;          // NODE_FOOT: the span ends at the glass
             // core (5/2 profile, r_k) + the diffuse glow sheath of the channel (3/2 profile,
             // SHEATH_SCALE r_k, carrying SHEATH_FRACTION of the light: the visible halo)
             vec3 nA = seg[SEGS * s + 5].xyz, nB = seg[SEGS * s + 6].xyz;
-            float rootF = seg[SEGS * s + 5].w;                      // 1 at the bulb: the root funnel
             float vis = CELL * seg[SEGS * s + 6].w;                 // this segment's CSR reach
             float dmin = raySegmentDist(ro, rd, t0, t1, a.xyz, b.xyz);
             if (dmin > vis) continue;
@@ -608,10 +612,13 @@ Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
             // core (5/2 profile, r_k) + sheath (3/2 profile, SHEATH_SCALE r_k, SHEATH_FRACTION of the
             // light), both closed-form per span and mitre-clipped at the joints
             float eCore = capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, core, 1, chainStart, chainEnd);
-            float eSheath = window * SHEATH_FRACTION * (1.0 + FUNNEL_LIGHT * rootF)
-                          * capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, SHEATH_SCALE * core * (1.0 + FUNNEL_WIDEN * rootF), 0, chainStart, chainEnd);
-            // the cooler sheath radiates more of the neutral (pink) lines than the core
-            vec3 contrib = pw * eCore + pw * SHEATH_TINT * eSheath;
+            float eSheath = window * SHEATH_FRACTION
+                          * capsuleEmission(ro, rd, t0, t1, a.xyz, b.xyz, nA, nB, SHEATH_SCALE * core, 0, chainStart, chainEnd);
+            // the sheath is cooler gas around the core: the gas's colour at a lower electron
+            // temperature (the table), at the core's luminance share
+            vec3 sc = emisAt(0.6 * max(seg[SEGS * s + 2].w, 0.8));
+            sc *= dot(pw, LUMA) / max(dot(sc, LUMA), 1.0e-9);
+            vec3 contrib = pw * eCore + sc * eSheath;
             r.emission += contrib;
             float lum = dot(contrib, vec3(0.2126, 0.7152, 0.0722));
             if (lum > r.bestLum) {
@@ -667,35 +674,6 @@ vec3 footGlow(vec3 n) {
     return sum;
 }
 
-// root spots on the electrode surface (unit direction n): every channel's attachment point glows,
-// the footage's pink-white "bulbs" at the roots; size ~ I^0.3, brightness ~ I^1.5 (the touched
-// root is white-hot), with a 4x wider dim halo that lights the ball around a strong root
-vec4 rootGlow(vec3 n) {                                              // rgb: spots; w: sum of iRel^2.5 (sheath gain)
-    vec3 sum = vec3(0.0);
-    float gain = 0.0;
-    for (int t = 0; t < F_MAX; ++t) {
-        vec4 rec = sigma[2 * (SIG_MAX + t)];
-        vec4 rec2 = sigma[2 * (SIG_MAX + t) + 1];
-        if (rec2.y < 0.5 || rec.w <= 0.0) continue;
-        float iRel = rec.w / 50.0;                                   // rec.w: uA
-        float theta = acos(clamp(dot(n, rec.xyz), -1.0, 1.0));
-        float sig = 0.0005 * pow(iRel, 0.3) / R1;                    // 0.5 mm at 50 uA, ~1 mm at 0.5 mA
-        float spot = exp(-0.5 * theta * theta / (sig * sig));
-        float halo = exp(-0.5 * theta * theta / (16.0 * sig * sig));
-        // the halo is a strong-root effect only (~I^3): thirty ordinary roots leave the ball's face
-        // dark (footage (33,13,41)), one touched root lights the whole ball pink
-        float ih = min(iRel, 20.0);
-        // the roots light the anode: a soft pool of glow (sigma ~2.5 mm) around every root, ~I, so
-        // the sphere is lit unevenly (bright where filaments attach, dim between); the ~I^3 terms
-        // make a touched root a white blob with a wide pink halo
-        float pool = exp(-0.5 * theta * theta / (POOL_SIGMA * POOL_SIGMA));
-        vec3 rootRgb = mix(colFoot.rgb, vec3(1.0), 0.35);            // the pools and the touched blob: the foot colour, whitened
-        sum += rootRgb * (POOL_GAIN * iRel * pool + (0.012 * ih * ih * ih) * spot + (6.0e-5 * ih * ih * ih) * halo);
-        gain += ih * ih * sqrt(ih);
-    }
-    return vec4(sum, gain);
-}
-
 // the stem: a vertical rod of radius STEM_R below the bulb (y < -R1/2; its top is inside the bulb)
 float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
     float a = rd.x * rd.x + rd.z * rd.z;
@@ -710,19 +688,23 @@ float stemHit(vec3 ro, vec3 rd, float tMaxHit) {
     return -1.0;
 }
 
-// Electrode halo: the diffuse glow discharge around the electrode where every filament's current
-// converges. Emission density ~ j * E ~ (R1/r)^4 (both fall as 1/r^2 around a sphere), scaled by
-// the total current (gas.x, mA), plus a thin bright surface layer (the electrode sheath); the
-// 1/r^4 tail is integrated over the ray's overlap with r < R1 + HALO_REACH by 16 samples split at
+// The gas around the electrode: the roots' currents spread from their attachment points
+// (rootDensity ~ 1/d^2), the electrons only exist where the field still ionises (Townsend-like
+// exp(-EN_ION / (E/N)), 1 at the electrode's surface), and the gas radiates its corona-model
+// spectrum at the local Te. E/N falls as (R1/r)^2 from the surface value the voltage sets and
+// rises where the gas is hot (volume texture). The close-ups' sheath (a fifth of the face at
+// +0.25 mm, nothing beyond 3.5 mm, x7.7 and twice as deep under a touched root) falls out of the
+// three factors. Integrated over the ray's overlap with r < R1 + HALO_REACH by 16 samples split at
 // the closest approach (denser near the electrode).
-const float HALO_REACH = 0.030;
+const float HALO_REACH = 0.010;
 vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
     vec2 reach = sphereRoots(ro, rd, R1 + HALO_REACH);
     if (reach.y <= t0) return vec3(0.0);
     float a0 = max(t0, reach.x), a1 = min(t1, reach.y);
     if (a1 <= a0) return vec3(0.0);
     float tc = clamp(-dot(ro, rd), a0, a1);
-    float iTot = gas.x;                                  // mA
+    float enSurf = emisParams2.x;
+    float enIon = emisParams3.x;
     vec3 sum = vec3(0.0);
     for (int side = 0; side < 2; ++side) {
         float s0 = (side == 0) ? a0 : tc;
@@ -736,18 +718,15 @@ vec3 corona(vec3 ro, vec3 rd, float t0, float t1) {
             float w1 = (side == 0) ? 1.0 - (1.0 - u1) * (1.0 - u1) : u1 * u1;
             float t = s0 + len * 0.5 * (w0 + w1);
             float dt = len * (w1 - w0);
-            float r = max(length(ro + rd * t), R1);
-            float q = R1 / r;
-            float q2 = q * q;
-            float halo = q2 * q2;                                        // (R1/r)^4
-            float sheath = exp(-(r - R1) / 0.0012);                      // electrode sheath, ~1 mm
-            // the haze is the bulb's magenta within a few mm and violet beyond (screenshot: (60,29,60) sRGB
-            // between the roots at 2-4 mm, (26,17,40) at 10 mm)
-            vec3 haloCol = mix(colHalo.rgb, colHaloNear.rgb, exp(-(r - R1) / 0.004));
-            sum += (halo * haloCol * 0.05 + sheath * colHaloNear.rgb * 0.6) * dt;   // the funnels carry the light; the haze is dim (screenshot p25 B 70-80)
+            vec3 x = ro + rd * t;
+            float r = max(length(x), R1);
+            float T = T0 + texture(volumeTex, (x + vec3(GRID_EXTENT)) / (2.0 * GRID_EXTENT)).x;
+            float en = enSurf * (R1 * R1) / (r * r) * (T / T0);
+            float ion = exp(-enIon * (1.0 / en - 1.0 / enSurf));
+            sum += (emisParams2.w * rootDensity(x) * ion) * emisAt(teOf(en)) * dt;
         }
     }
-    return sum * iTot;
+    return sum;
 }
 
 vec2 project(mat4 m, vec3 p) {
@@ -859,30 +838,33 @@ void main() {
                     hdr += wGas * tint * lit;
                     if (bestLumAll < 0.02) { layer = 2.0; hitDist = tO + glassPath + tEnd; mvPointCur = pEnd; mvPointPrev = pEnd; }
                 } else if (hitElectrode) {
-                    // dark polished electrode lit by the filaments
                     vec3 nE = pEnd / R1;
-                    // the bulb is a dark glass ball: little diffuse, a faint gloss (the footage shows a
-                    // dark centre with a bright rim and bright attachment points)
-                    vec3 albedo = vec3(0.006);
-                    vec3 lit = albedo * (flags.y == 1 ? lineLightDiffuse(pEnd, nE) : vec3(0.0)) / PI
-                             + 0.06 * lineLightSpecular(pEnd, nE, -rdGas, 0.12) + roomRadiance(pEnd, reflect(rdGas, nE)) * 0.015;   // a glassy bulb: soft filament reflections
-                    // the glow discharge covers the electrode: an emissive surface, brightness with the
-                    // total current, brighter at grazing view (thin luminous layer seen edge on)
-                    // a translucent luminous shell: bright rim (limb brightening), darker centre
                     float mu = abs(dot(rdGas, nE));
-                    // limb brightening of a thin luminous shell: dark centre, bright rim (the
-                    // photos show the electrode as a pink ring around a dark ball)
-                    // a luminous face with a modest limb (screenshot: the ring 1 mm inside the edge is only ~1.5x
-                    // the face; the bright collar around the bulb is the root funnels, not the rim)
-                    float grazing = 0.05 + 0.25 * (1.0 - mu) + 10.0 * pow(1.0 - mu, 8.0);   // dim face (the roots light it), a thin bright edge line
-                    // the glow discharge over the bulb intensifies with the strongest attached channel
-                    // (footage: the ball turns bright pink all over under a touch while I_tot barely
-                    // moves): sheath gain = sum of (I_k / 50 uA)^2.5 over the roots, 1 for ~30 x 40 uA
-                    vec4 roots = rootGlow(nE);
-                    float sheathGain = clamp(roots.w / 20.0, 0.5, 12.0);
-                    vec3 glow = (colElectrode.rgb * (0.012 * gas.x * grazing * sheathGain) + roots.rgb) * radScale;   // rim bright, not clipped (footage (118,71,157))
-                    hdr += wGas * tint * (lit + glow);
-                    emissive += wGas * tint * glow;
+                    // the glow layer under the envelope: the roots' currents spread over the ball
+                    // (rootDensity: the spots at the attachments, a touched root lighting the face
+                    // around it), excited at the layer's reduced field, radiating the gas's spectrum
+                    // there, plus the memory re-ignition of the surface the roots have charged (the
+                    // trail behind a walking root); radiance x the layer's chord along the view ray
+                    // (face 1, a thin bright line at the limb)
+                    float jLayer = rootDensity(pEnd) + J_MEM * sigmaEnvelope(nE);
+                    vec3 glowLayer = emisAt(teOf(emisParams2.y)) * (emisParams2.z * jLayer * shellChord(mu));
+                    // the envelope is glass: the filaments, the gas and the room reflect in it with
+                    // the Fresnel of glass (a second interior path along the reflected ray)
+                    float Fe = fresnelDielectric(mu, IOR);
+                    vec3 rR = reflect(rdGas, nE);
+                    float tEndR = sphereRoots(pEnd, rR, R2I).y;
+                    float tStemR = stemHit(pEnd, rR, tEndR);
+                    if (tStemR > 0.0) tEndR = tStemR;
+                    Interior inR = traceInterior(pEnd, rR, 1.0e-4, tEndR);
+                    vec3 reflEm = (inR.emission + corona(pEnd, rR, 1.0e-4, tEndR)) * radScale;
+                    vec3 refl = reflEm;
+                    if (tStemR <= 0.0) refl += 0.92 * roomRadiance(pEnd + rR * tEndR, rR);   // out through the glass to the room
+                    candTotal += inR.candidates;
+                    vec3 albedo = vec3(0.006);                                                // the dark core through the envelope
+                    vec3 lit = albedo * (flags.y == 1 ? lineLightDiffuse(pEnd, nE) : vec3(0.0)) / PI;
+                    vec3 glow = glowLayer * radScale;
+                    hdr += wGas * tint * (lit + glow + Fe * refl);
+                    emissive += wGas * tint * (glow + Fe * reflEm);
                     if (bestLumAll < 0.02) { layer = 2.0; hitDist = tO + glassPath + tEnd; mvPointCur = pEnd; mvPointPrev = pEnd; }
                 } else {
                     // far inner wall: foot discs, transmit to the room, reflect back through the gas (C)

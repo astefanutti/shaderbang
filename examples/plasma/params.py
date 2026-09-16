@@ -103,6 +103,10 @@ class PlasmaParams:
     # lifecycle toggles
     hybrid: wp.int32          # 1 = re-strike / re-route enabled, 0 = persistent only
     quincunx: wp.int32        # 1 = footprint self-inhibition (rare regime), 0 = activator footprint
+    # the electrode as a heated sphere (host-side balance of its sheath power, globe.fill_params)
+    t_ball: wp.float32        # K above ambient at the envelope's surface
+    u_bl: wp.float32          # m/s, velocity scale of its natural-convection boundary layer
+    delta_bl: wp.float32      # m, thickness of that layer
     # fingers on the glass (unit directions + contact weights); count <= MAX_FINGERS
     num_fingers: wp.int32
     finger_dir0: wp.vec3

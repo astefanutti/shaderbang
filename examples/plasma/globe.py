@@ -30,6 +30,7 @@ from shaderbang.input import Input
 
 from plasma import circuit, dbm, gas, publish
 from plasma.params import (
+    T0, FOOT_RADIUS, TAU_ENV, D_SIGMA, C_D,
     ParamsBuffer, PlasmaParams, finger_dir, R1, R2I, CHARGE_RADIUS, NODE_SPACING, FINGER_HWHM,
     VOLT0, FREQ0, Q_FINGER0, V_CH, NODE_ALIVE, NODE_ROOT, NODE_FOOT, NODE_DECAYING,
 )
@@ -37,17 +38,42 @@ from plasma.params import (
 P_GAS_NOMINAL = 0.7           # W total at 1 mA (CHOSEN top-down; gas lab: 0.6-1.3 W/m -> 1.2-1.9 cm/s fronts;
                               # with the drift weighting this gives the ~1 cm/s filament rise of PPPL-4485)
 I_TOT_NOMINAL = 1.0e-3
-VIDEO_NEUTRAL = (1.00, 0.30, 0.62)   # 'video' preset: pink (feet, electrode)               CHOSEN (footage)
-VIDEO_ION = (0.22, 0.17, 0.75)       # 'video' preset: violet-blue shaft                    CHOSEN (footage)
-X_ION_SHAFT_REF = 0.9                # ionised fraction of a typical shaft (for the preset scale below)
-SHAFT_MAX_REF = 0.74                 # the video preset's shaft brightest channel: every preset is scaled to it
-X_ION_FOOT = 0.45             # ionised-line fraction at the glass foot: pink (the footage shows magenta
-                              # feet and branches under a hand, not the pure Ne I orange)
-X_ION_ROOT = 0.35            # ionised-line fraction at the bulb (pink-white root flares)
-X_ION_ROOT_LEN = 5.0e-3      # m: blend length of the root colour
-X_ION_FOOT_LEN = 8.0e-3       # blend length before the glass (m)
+# ---- emission: the corona-model line spectrum of the gas at the local electron temperature
+# (plasma.spectra, 2026-09-16). Each node's colour is the gas mixture's spectrum at Te = a (E/N)^b,
+# with the reduced field of the channel phase EN_CH x (T / T0) (the hot channel is thinner gas)
+# raised near both ends (the sheaths at the electrode and at the dielectric, where the voltage
+# drop concentrates), plus a continuum (~ n_e^2, unit-luminance bremsstrahlung colour) whose share
+# grows with the current. The luminance of the lines (which the model makes ~30x larger at the
+# sheath fields) is NOT used along the channel: the recordings measure the brightness falling
+# towards the glass (publisher POWER_FALL), the sheath emission is transient; the table's absolute
+# scale drives the electrode glow layer and the gas around the electrode in the tracer.
+EN_CH = 3.0                   # Td: channel-phase reduced field (V_CH / L ~ 33 kV/m at 2.4e25 m^-3 is 1.4 Td; CHOSEN 3
+                              # with the channel's own heating; calibrated: a Ne/Kr/Xe channel is lavender-blue there)
+END_ROOT, L_ROOT = 15.0, 4.0e-3     # electrode-side sheath: E/N x (1 + END_ROOT exp(-d / L_ROOT))        CHOSEN
+END_FOOT, L_FOOT = 25.0, 8.0e-3     # dielectric-side sheath (cathode fall: hundreds of Td at the surface); the
+                                    # recordings' red tips run 15-20 mm                                  CHOSEN
+CORE_T_COEF = 12.0 / 50.0e-6  # K/A: steady conduction heating of the core, dT = I (V_CH/L) ln(b/r) / (2 pi k) ~ 12 K at 50 uA
+C_CONT = 1.5                  # continuum luminance / line luminance at I_CONT_REF, ~ (I / I_CONT_REF)^CONT_EXP
+CONT_EXP = 0.7                # n_e ~ I / r_core^2 with a core radius ~ I^0.15 (the conducting core is thinner than the glow)
+I_CONT_REF = 1.0e-3           # A: a touched channel: ~60 % continuum, white core (the recordings)
+EMIS_BINS = 64                # table bins over log Te (plasma.spectra.TE_GRID)
+EN_FACE = 60.0                # Td: reduced field in the glow layer under the electrode's envelope     CHOSEN (deep red face)
+# morphology per preset (2026-09-16 recordings): the pink / neon globes are 'rope' (15-30 smooth
+# unbranched channels), the green globes 'coral' (6-10 channels with 2-3 Y-forks each at 20-45 mm
+# from the electrode, branches at 0.4-0.6 of the trunk, many ending in the gas)
+MORPHOLOGY = {
+    "rope": dict(class_secondary=0.30, class_side=0.02, power_fall=0.5, foot_widen=1.0, taper=0.15, root_gain=1.15,
+                 fork_rate=0.0, fork_max=0, roots_max=32),
+    # coral: thick bright trunks at the electrode, thin sharp branches and tips (the user's target look):
+    # radius x root_gain (R1 / r)^taper along the channel (0.71x at the glass), no foot flare
+    "coral": dict(class_secondary=0.50, class_side=0.12, power_fall=0.6, foot_widen=0.0, taper=0.4, root_gain=1.5,
+                  fork_rate=5.0, fork_max=3, roots_max=10),
+}
+PRESET_MORPHOLOGY = {"coral": "coral"}                     # every other preset is a rope globe
+PRESET_POWER_FALL = {"ne": 0.2}                             # neon's feet stay bright red (r3: 96 at the glass vs 92 mid)
+PRESET_ALIASES = {"video": "tyrian"}                       # the former footage-calibrated preset
 I_STRIKE_REF = 3.0e-5
-CORE_RADIUS = 0.45e-3         # rendered core radius at 50 uA; r ~ I^0.4, clamped at 1.5 mm (the cross-section
+CORE_RADIUS = 0.45e-3         # rendered core radius at 50 uA; r ~ I^0.3, clamped at 1.5 mm (the cross-section
                               # grows with the current: a touched filament at ~20x the current is ~3x
                               # thicker, as in the reference footage)
 ETA_GLOBE = 120.0             # growth exponent for the globe (CHOSEN 2026-09-14). The potential of a tip's
@@ -79,8 +105,25 @@ E_PROP_FACTOR = 0.05          # propagation / strike threshold ratio (CHOSEN): a
 FOOT_PIN_LEN = 4.0e-3         # m: the channel does not ride the gas within this distance of the glass
 PLUME_MIN_RISE = 4.0e-3       # m/s: a channel never sinks; its own plume gives it at least this rise (before the drift
                               # weight): the recording's feet walk up the glass at up to ~6 mm/s (median 0.6)
-FOOT_CREEP = 1.0              # drift kept inside FOOT_PIN_LEN (1 = the foot walks with the channel; 0 = pinned)
-ROOT_DRIFT_GAIN = 1.8         # roots ride the plume over the bulb faster than the drift weight alone gives (recording ~2 mm/s)
+FOOT_CREEP = 0.0              # the gas velocity is zero at a wall (no-slip): an attachment does not ride the gas; it
+                              # creeps down the surface-charge gradient (K_SIG) and re-strikes. Inside FOOT_PIN_LEN the
+                              # channel's advection is damped to this share (the 2026-09-16 tracker: feet at 0.6 mm/s)
+# ---- the attachments as surface discharges on dielectrics (2026-09-16): both the outer glass and the
+# electrode's glass envelope charge under an attachment (barrier capacitance), the local field
+# collapses and the attachment creeps onto fresh surface, down the surface-charge gradient with a
+# mobility K_SIG; the channel a core radius above the surface is dragged by the surface's own thermal
+# boundary layer. The electrode is the hottest object in the globe (every current's sheath power lands
+# on it): its laminar free-convection layer carries the roots up the ball at mm/s (the recordings'
+# 7 mm/s at full power, 3 at low, 70 % upward), the outer glass sits within a kelvin of the gas.
+K_SIG = 4.5e-6                # m^2/s: creep mobility down the surface-charge gradient (sigma / sigma_sat per m -> m/s):
+                              # ~3 mm/s at the edge of a saturated 1.5 mm footprint                            CHOSEN
+V_SHEATH = 300.0              # V: electrode sheath (fall) voltage; P_ball = I_tot V_SHEATH heats the envelope      CHOSEN
+C_BL = 0.4                    # boundary-layer velocity scale U = C_BL sqrt(g beta dT 2 R1) (laminar free convection) CHOSEN
+DELTA_BL = 5.0                # layer thickness delta = DELTA_BL R1 Gr^-1/4                                        CHOSEN
+SIGE_NLON, SIGE_NLAT = 64, 32 # the envelope's surface-charge grid (equirectangular, sigma / sigma_sat)
+SIGE_FOOT_R = 1.0e-3          # m: a root's charging footprint on the envelope (the close-ups' spot e-fold 0.55 mm)
+SIGE_MEM = 1.0                # relative weight of the memory re-ignition on charged surface (tracer J_MEM)
+I_REROUTE_REF = 1.0e-3        # A: the re-strike timer's reference total current (REROUTE_MEAN at this drive)
 ROOT_SAMPLE_OFFSET = 2.0      # x h: roots ride the flow sampled this far above the electrode (the
                               # channel's attachment follows its hot column out of the no-slip layer)
 FOLLOW_LEN = 0.02             # m: the last 2 cm of a channel under a finger follow the finger (the foot
@@ -98,6 +141,7 @@ ADVECT_RADIUS = 8.0e-3        # m: node velocity = mean gas velocity over a 7-po
                               # moves at ~1/4 of the plume-core speed (gas lab: centroid 0.8-1.4 cm/s
                               # vs core 5.5-8 cm/s; PPPL measured 1 cm/s filament drift)
 F_MAX = circuit.F_MAX
+SIG_MAX = circuit.SIG_MAX
 ATTACHED = dbm.ATTACHED
 
 
@@ -113,6 +157,7 @@ def k_gas_control(params: wp.array(dtype=PlasmaParams), ctrl: wp.array(dtype=wp.
     ctrl[gas.CTRL_TIME_SCALE] = wp.where(p.running == 1, 1.0, 0.0)
     ctrl[gas.CTRL_G_SIGN] = p.g_sign
     ctrl[gas.CTRL_ICE] = float(p.ice_cap)
+    ctrl[gas.CTRL_T_ELECTRODE] = p.t_ball
 
 
 @wp.kernel
@@ -130,7 +175,8 @@ def k_engine_hooks(params: wp.array(dtype=PlasmaParams),
                    t_reroute_req: wp.array(dtype=wp.int32), t_brush_req: wp.array(dtype=wp.int32),
                    t_foot2_drop: wp.array(dtype=wp.int32),
                    finger_served: wp.array(dtype=wp.int32), tree_touch: wp.array(dtype=wp.float32),
-                   t_hold: wp.array(dtype=wp.int32)):
+                   t_hold: wp.array(dtype=wp.int32), t_stalled: wp.array(dtype=wp.int32),
+                   morph: wp.array(dtype=wp.float32), t_foot2: wp.array(dtype=wp.int32)):
     """Fingers, admission flag, per-tree currents and the circuit's finger requests (re-route,
     brush leader, brush-foot drop) into the growth engine's device arrays.
 
@@ -146,6 +192,17 @@ def k_engine_hooks(params: wp.array(dtype=PlasmaParams),
         t_reroute_req[k] = tree_reroute_req[k]
         t_brush_req[k] = tree_brush_req[k]
         t_hold[k] = wp.where(tree_touch[k] > 0.0, 1, 0)
+        # a coral globe forks its channels: a Poisson request (rate morph[0] per second per attached
+        # channel) for a fork leader while the channel has fewer than morph[1] secondary feet
+        if tree_brush_req[k] == 0 and morph[0] > 0.0 and tree_state[k] == ATTACHED:
+            rng = wp.rand_init(p.seed * 7919 + p.frame, k)
+            if wp.randf(rng) < morph[0] * p.dt:
+                nfeet = int(0)
+                for j in range(dbm.BRUSH_FEET):
+                    if t_foot2[k * dbm.BRUSH_FEET + j] >= 0:
+                        nfeet += 1
+                if float(nfeet) < morph[1]:
+                    t_brush_req[k] = 2
     if k < F_MAX * dbm.BRUSH_FEET:
         t_foot2_drop[k] = tree_foot2_drop[k]
     if k == 0:
@@ -153,7 +210,7 @@ def k_engine_hooks(params: wp.array(dtype=PlasmaParams),
         growing = int(0)
         for t in range(F_MAX):
             st = tree_state[t]
-            if st != 0 and st != ATTACHED:
+            if st != 0 and st != ATTACHED and t_stalled[t] == 0:     # a stalled partial channel does not block a strike
                 growing += 1
         nominal = circuit_out[2] > 0.5 and growing < MAX_GROWING
         # an unserved finger without a brush host admits one strike on the touched admittance
@@ -213,6 +270,108 @@ def stencil_velocity(u: wp.array3d(dtype=wp.vec3), n: int, origin: wp.vec3, inv_
     return v / 7.0
 
 
+@wp.func
+def sigma_e_cell(n: wp.vec3):
+    """Equirectangular cell coordinates (continuous) of the unit direction n on the envelope."""
+    lon = wp.atan2(n[2], n[0])                                  # (-pi, pi]
+    lat = wp.asin(wp.clamp(n[1], -1.0, 1.0))                    # [-pi/2, pi/2]
+    u = (lon / 6.283185307 + 0.5) * float(SIGE_NLON)
+    v = (lat / 3.14159265 + 0.5) * float(SIGE_NLAT)
+    return wp.vec2(u, v)
+
+
+@wp.func
+def sigma_e_sample(sig_e: wp.array(dtype=wp.float32), n: wp.vec3) -> float:
+    """Bilinear sample of the envelope's surface charge at the unit direction n (longitude wraps)."""
+    c = sigma_e_cell(n)
+    u = c[0] - 0.5
+    v = wp.clamp(c[1] - 0.5, 0.0, float(SIGE_NLAT - 1) - 1.0e-4)
+    i0 = int(wp.floor(u))
+    j0 = int(wp.floor(v))
+    fu = u - float(i0)
+    fv = v - float(j0)
+    ia = (i0 % SIGE_NLON + SIGE_NLON) % SIGE_NLON
+    ib = (ia + 1) % SIGE_NLON
+    j1 = wp.min(j0 + 1, SIGE_NLAT - 1)
+    return (sig_e[j0 * SIGE_NLON + ia] * (1.0 - fu) * (1.0 - fv) + sig_e[j0 * SIGE_NLON + ib] * fu * (1.0 - fv)
+            + sig_e[j1 * SIGE_NLON + ia] * (1.0 - fu) * fv + sig_e[j1 * SIGE_NLON + ib] * fu * fv)
+
+
+@wp.func
+def sigma_e_gradient(sig_e: wp.array(dtype=wp.float32), n: wp.vec3) -> wp.vec3:
+    """Tangential gradient of the envelope's surface charge (per metre) at the unit direction n."""
+    up = wp.vec3(0.0, 1.0, 0.0)
+    if wp.abs(n[1]) > 0.99:
+        up = wp.vec3(1.0, 0.0, 0.0)
+    t1 = wp.normalize(up - wp.dot(up, n) * n)
+    t2 = wp.cross(n, t1)
+    h = 0.5e-3 / R1                                              # 0.5 mm step, in radians
+    g1 = (sigma_e_sample(sig_e, wp.normalize(n + h * t1)) - sigma_e_sample(sig_e, wp.normalize(n - h * t1))) / (2.0 * h * R1)
+    g2 = (sigma_e_sample(sig_e, wp.normalize(n + h * t2)) - sigma_e_sample(sig_e, wp.normalize(n - h * t2))) / (2.0 * h * R1)
+    return t1 * g1 + t2 * g2
+
+
+@wp.func
+def sigma_glass_gradient(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.float32),
+                         sig_alive: wp.array(dtype=wp.int32), n: wp.vec3) -> wp.vec3:
+    """Tangential gradient (per metre) of the outer glass's surface charge at the unit direction n:
+    the sum of the feet's Gaussian footprints (radius FOOT_RADIUS) from the circuit's records."""
+    g = wp.vec3(0.0, 0.0, 0.0)
+    s2 = FOOT_RADIUS * FOOT_RADIUS
+    for j in range(SIG_MAX):
+        if sig_alive[j] == 0 or sig_amp[j] <= 0.0:
+            continue
+        d = (n - sig_dir[j]) * R2I                               # chord offset on the glass (m)
+        d = d - wp.dot(d, n) * n                                 # tangential part
+        d2 = wp.dot(d, d)
+        if d2 > 25.0 * s2:
+            continue
+        g = g - d * (sig_amp[j] * wp.exp(-0.5 * d2 / s2) / s2)
+    return g
+
+
+@wp.kernel
+def k_sigma_envelope(params: wp.array(dtype=PlasmaParams),
+                     tree_state: wp.array(dtype=wp.int32), tree_root_dir: wp.array(dtype=wp.vec3),
+                     tree_current: wp.array(dtype=wp.float32),
+                     sig_prev: wp.array(dtype=wp.float32), sig_e: wp.array(dtype=wp.float32)):
+    """The electrode envelope's surface charge (sigma / sigma_sat on an equirectangular grid): every
+    attached root deposits under its footprint at the rate its current gives (the barrier charges
+    towards saturation), the charge relaxes with TAU_ENV and spreads with D_SIGMA (Burin 2015), as
+    the outer glass's footprints do."""
+    idx = wp.tid()
+    p = params[0]
+    if p.running == 0:
+        return
+    j = idx // SIGE_NLON
+    i = idx - j * SIGE_NLON
+    lon = (float(i) + 0.5) / float(SIGE_NLON) * 6.283185307 - 3.14159265
+    lat = (float(j) + 0.5) / float(SIGE_NLAT) * 3.14159265 - 1.570796327
+    n = wp.vec3(wp.cos(lat) * wp.cos(lon), wp.sin(lat), wp.cos(lat) * wp.sin(lon))
+    dt = p.dt
+    sigma_sat = C_D * wp.max(p.voltage, 1.0)
+    g0 = 1.0 / (2.0 * 3.14159265 * SIGE_FOOT_R * SIGE_FOOT_R)
+    rate = float(0.0)
+    for k in range(F_MAX):
+        if tree_state[k] == 3 and tree_current[k] > 0.0:
+            c = wp.dot(n, tree_root_dir[k])
+            d2 = 2.0 * R1 * R1 * wp.max(1.0 - c, 0.0)             # chord distance squared on the envelope
+            if d2 < 16.0 * SIGE_FOOT_R * SIGE_FOOT_R:
+                rate += tree_current[k] * g0 / sigma_sat * wp.exp(-0.5 * d2 / (SIGE_FOOT_R * SIGE_FOOT_R))
+    # deposit towards saturation and relaxation (exact over dt), then lateral spreading
+    d = 1.0 / TAU_ENV
+    amp_eq = rate / (rate + d)
+    v = amp_eq + (sig_prev[idx] - amp_eq) * wp.exp(-(rate + d) * dt)
+    dl = R1 * 3.14159265 / float(SIGE_NLAT)                      # cell size (m) along the latitude
+    a = wp.min(D_SIGMA * dt / (dl * dl), 0.2)
+    iw = (i + SIGE_NLON - 1) % SIGE_NLON
+    ie = (i + 1) % SIGE_NLON
+    jn = wp.max(j - 1, 0)
+    js = wp.min(j + 1, SIGE_NLAT - 1)
+    lap = sig_prev[j * SIGE_NLON + iw] + sig_prev[j * SIGE_NLON + ie] + sig_prev[jn * SIGE_NLON + i] + sig_prev[js * SIGE_NLON + i] - 4.0 * sig_prev[idx]
+    sig_e[idx] = wp.clamp(v + a * lap, 0.0, 1.0)
+
+
 @wp.kernel
 def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
                    gas_u: wp.array3d(dtype=wp.vec3), gas_n: int, gas_origin: wp.vec3, gas_inv_dx: float,
@@ -221,7 +380,11 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
                    node_tree: wp.array(dtype=wp.int32),
                    node_parent: wp.array(dtype=wp.int32),
                    tree_state: wp.array(dtype=wp.int32),
-                   tree_targets: wp.array(dtype=wp.vec3)):
+                   tree_targets: wp.array(dtype=wp.vec3),
+                   tree_radius: wp.array(dtype=wp.float32),
+                   sig_e: wp.array(dtype=wp.float32),
+                   sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.float32),
+                   sig_alive: wp.array(dtype=wp.int32)):
     """Persistent channels ride the gas: x += u(x) dt; roots slide on the electrode (driven by
     the flow just above the no-slip layer), feet walk on the glass, everything stays inside the
     annulus. Under a finger the foot and the last FOLLOW_LEN of the channel are pulled towards
@@ -263,11 +426,24 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
     tp = wp.clamp((R2I - r0) / FOOT_PIN_LEN, 0.0, 1.0)
     drift = drift * (FOOT_CREEP + (1.0 - FOOT_CREEP) * tp * tp * (3.0 - 2.0 * tp))   # the foot creeps, it does not slide
     if (f & NODE_ROOT) != 0:
-        # the roots walk up the anode (recording: ~2 mm/s, 70 % of crossings upward)
-        xs = x * ((R1 + ROOT_SAMPLE_OFFSET * NODE_SPACING) / r0)
-        vr = gas.velocity(gas_u, gas_n, gas_origin, gas_inv_dx, xs)
-        vr = wp.vec3(vr[0], wp.max(vr[1] * p.g_sign, PLUME_MIN_RISE) * p.g_sign, vr[2])
-        x = x + vr * (ROOT_DRIFT_GAIN * drift * p.dt)
+        # a root is a surface discharge on the electrode's glass envelope: it creeps down the
+        # envelope's surface-charge gradient (its own footprint charges, the field there collapses,
+        # fresh surface attracts it) and the channel a core radius above the surface rides the
+        # ball's free-convection boundary layer: u = U sin(theta) 6.75 eta (1 - eta)^2, eta = r_k / delta,
+        # tangential towards the top (theta from the bottom stagnation point); the gas velocity at
+        # the surface itself is zero
+        t = node_tree[i]
+        n = x / r0
+        up = wp.vec3(0.0, p.g_sign, 0.0)
+        t_up = up - wp.dot(up, n) * n
+        sin_t = wp.length(t_up)
+        vel = wp.vec3(0.0, 0.0, 0.0)
+        if sin_t > 1.0e-4:
+            t_up = t_up / sin_t
+            eta = wp.clamp(tree_radius[t] / wp.max(p.delta_bl, 1.0e-4), 0.0, 1.0)
+            vel = t_up * (p.u_bl * sin_t * 6.75 * eta * (1.0 - eta) * (1.0 - eta))
+        vel = vel - K_SIG * sigma_e_gradient(sig_e, n)
+        x = x + vel * p.dt
         node_pos[i] = x * ((R1 + NODE_SPACING) / wp.max(wp.length(x), 1.0e-6))
         return
     v = stencil_velocity(gas_u, gas_n, gas_origin, gas_inv_dx, x)
@@ -276,6 +452,10 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
     # cold glass (-1 cm/s) must not drag it down: its vertical drift is at least PLUME_MIN_RISE
     v = wp.vec3(v[0], wp.max(v[1] * p.g_sign, PLUME_MIN_RISE) * p.g_sign, v[2])
     x = x + v * (drift * p.dt)
+    if (f & NODE_FOOT) != 0:
+        # the foot is a surface discharge on the outer glass: pinned by its own footprint charge,
+        # creeping down the gradient of the surface charge its neighbours and the old feet left
+        x = x - (K_SIG * p.dt) * sigma_glass_gradient(sig_dir, sig_amp, sig_alive, x / wp.max(wp.length(x), 1.0e-6))
     r = wp.length(x)
     if (f & NODE_FOOT) != 0:
         x = x * ((R2I - CHARGE_RADIUS) / wp.max(r, 1.0e-6))
@@ -387,24 +567,40 @@ def k_fix_source_count(src_count: wp.array(dtype=wp.int32)):
 
 
 @wp.kernel
-def k_node_xion(node_pos: wp.array(dtype=wp.vec3), node_tree: wp.array(dtype=wp.int32),
-                node_flags: wp.array(dtype=wp.int32), tree_current: wp.array(dtype=wp.float32),
-                node_xion: wp.array(dtype=wp.float32), tree_radius: wp.array(dtype=wp.float32)):
-    """Ionised-line fraction along a channel (plan 4.9) and the rendered core radius per tree."""
+def k_node_emission(node_pos: wp.array(dtype=wp.vec3), node_tree: wp.array(dtype=wp.int32),
+                    node_flags: wp.array(dtype=wp.int32), tree_current: wp.array(dtype=wp.float32),
+                    emis_rgb: wp.array(dtype=wp.vec3), emis_params: wp.array(dtype=wp.float32),
+                    node_rgb: wp.array(dtype=wp.vec3), node_te: wp.array(dtype=wp.float32),
+                    tree_radius: wp.array(dtype=wp.float32)):
+    """Per-node emission colour (unit-luminance line spectrum at the local Te + the continuum share,
+    per unit current) and the electron temperature; the rendered core radius per tree.
+
+    emis_rgb: the preset's line colour table over log Te (plasma.spectra.emission_table);
+    emis_params: [log Te_min, log Te_max, a, b] of Te = a (E/N)^b."""
     i = wp.tid()
     if i < F_MAX:
+        # the rendered core radius follows the current (2026-09-16 sweeps: width ratio 1.43 for ~3.5x current)
         tree_radius[i] = wp.clamp(CORE_RADIUS * wp.pow(wp.max(tree_current[i], 1.0e-6) / 5.0e-5, 0.3), 0.2e-3, 1.5e-3)
     if (node_flags[i] & NODE_ALIVE) == 0:
         return
-    ik = tree_current[node_tree[i]]
-    shaft = wp.clamp(0.93 + 0.05 * wp.log(wp.max(ik, 1.0e-9) / I_STRIKE_REF) / wp.log(10.0), 0.85, 0.97)
+    ik = wp.max(tree_current[node_tree[i]], 1.0e-9)
     rr = wp.length(node_pos[i])
-    # the root flares are pink-white in the footage (the neutral lines of the electrode's glow
-    # region): blend towards X_ION_ROOT within X_ION_ROOT_LEN of the bulb
-    wr = wp.clamp((rr - R1) / X_ION_ROOT_LEN, 0.0, 1.0)
-    shaft = X_ION_ROOT + (shaft - X_ION_ROOT) * wr
-    w = wp.clamp((R2I - rr) / X_ION_FOOT_LEN, 0.0, 1.0)
-    node_xion[i] = X_ION_FOOT + (shaft - X_ION_FOOT) * w
+    # reduced field along the channel: channel phase x thinner hot gas x the sheaths at both ends
+    t_gas = T0 + CORE_T_COEF * ik
+    en = EN_CH * (t_gas / T0) * (1.0 + END_ROOT * wp.exp(-wp.max(rr - R1, 0.0) / L_ROOT)
+                                 + END_FOOT * wp.exp(-wp.max(R2I - rr, 0.0) / L_FOOT))
+    te = emis_params[2] * wp.pow(en, emis_params[3])
+    # table lookup (linear in log Te)
+    u = (wp.log(te) - emis_params[0]) / (emis_params[1] - emis_params[0]) * float(EMIS_BINS - 1)
+    u = wp.clamp(u, 0.0, float(EMIS_BINS - 1) - 1.0e-3)
+    j0 = int(u)
+    fr = u - float(j0)
+    c = emis_rgb[j0] * (1.0 - fr) + emis_rgb[j0 + 1] * fr
+    lum = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    lines = c / wp.max(lum, 1.0e-9)                                    # unit-luminance line colour
+    cont = C_CONT * wp.pow(ik / I_CONT_REF, CONT_EXP)                  # continuum share (~ n_e^2 / n_e)
+    node_rgb[i] = lines + wp.vec3(1.0086, 0.9775, 1.1981) * cont       # bremsstrahlung colour (unit luminance)
+    node_te[i] = te
 
 
 @wp.kernel
@@ -440,6 +636,26 @@ class SimFlags:
         self.quincunx = quincunx
 
 
+def electrode_thermal(i_tot):
+    """(surface excess K, boundary-layer velocity scale m/s, thickness m) of the electrode heated by
+    P = I_tot V_SHEATH in neon at 740 Torr (gas constants from plasma.gas), laminar free convection."""
+    power = i_tot * V_SHEATH
+    area = 4.0 * np.pi * R1 * R1
+    beta = 1.0 / T0
+    pr = gas.NU / gas.ALPHA
+    dT = 10.0
+    for _ in range(6):
+        ra = max(gas.G * beta * dT * (2.0 * R1) ** 3 / (gas.NU * gas.ALPHA), 1e-6)
+        nu = 2.0 + 0.589 * ra ** 0.25 / (1.0 + (0.469 / pr) ** (9.0 / 16.0)) ** (4.0 / 9.0)
+        h_conv = nu * gas.K_GAS / (2.0 * R1)
+        dT = power / max(h_conv * area, 1e-9)
+    dT = float(min(dT, 400.0))
+    gr = max(gas.G * beta * dT * R1 ** 3 / gas.NU ** 2, 1e-6)
+    u_bl = C_BL * np.sqrt(gas.G * beta * dT * 2.0 * R1)
+    delta = DELTA_BL * R1 * gr ** -0.25
+    return dT, float(u_bl), float(min(delta, 0.05))
+
+
 class Globe(Input):
     """See the module docstring. ``fingers.active()`` returns unit directions on the glass;
     ``state_fn`` returns a SimFlags; ``args`` carries seed / gas_res."""
@@ -455,7 +671,7 @@ class Globe(Input):
         # D ~ 1.7 lightning trees that need ~1000 nodes to cross the 6 cm gap)  CHOSEN, plan 4.3
         self.knobs = {"voltage": VOLT0, "frequency": FREQ0, "eta": ETA_GLOBE, "gamma": dbm.GAMMA, "q_finger": Q_FINGER0}
         self.preset_index = 0
-        self.presets = ["video", "ne_xe", "ne", "ar", "kr"]
+        self.presets = ["tyrian", "ne_xe", "ne", "ar", "kr", "coral"]
         self._reset_requested = True
         self.frame = 0
         self.t = 0.0
@@ -478,10 +694,14 @@ class Globe(Input):
         self.circuit = circuit.CircuitState(d)
         self.pub = publish.Publisher(d)
         self.node_alpha = wp.ones(n, dtype=wp.float32, device=d)
-        self.node_xion = wp.zeros(n, dtype=wp.float32, device=d)
+        self.node_rgb = wp.zeros(n, dtype=wp.vec3, device=d)                 # emission colour per unit current (k_node_emission)
+        self.node_te = wp.zeros(n, dtype=wp.float32, device=d)               # electron temperature (eV)
         self.tree_radius = wp.full(F_MAX, CORE_RADIUS, dtype=wp.float32, device=d)
-        self.color_neutral = wp.zeros(F_MAX, dtype=wp.vec3, device=d)
-        self.color_ion = wp.zeros(F_MAX, dtype=wp.vec3, device=d)
+        self.emis_rgb = wp.zeros(EMIS_BINS, dtype=wp.vec3, device=d)         # the preset's line colour table over log Te
+        self.emis_params = wp.zeros(4, dtype=wp.float32, device=d)           # [log Te_min, log Te_max, a, b]
+        self.morph = wp.zeros(4, dtype=wp.float32, device=d)                # [fork rate (1/s), fork max, roots max, -] (k_engine_hooks, circuit)
+        self.sig_e = wp.zeros(SIGE_NLON * SIGE_NLAT, dtype=wp.float32, device=d)       # the envelope's surface charge
+        self.sig_e_prev = wp.zeros(SIGE_NLON * SIGE_NLAT, dtype=wp.float32, device=d)
         self.counters = wp.zeros(8, dtype=wp.float32, device=d)
         self.tree_foot2_dir = wp.zeros(F_MAX * dbm.BRUSH_FEET, dtype=wp.vec3, device=d)
         self.counters_host = wp.zeros(8, dtype=wp.float32, device="cpu", pinned=True)
@@ -489,7 +709,7 @@ class Globe(Input):
         self.nodes = _SoA()
         self.nodes.pos, self.nodes.prev_pos, self.nodes.parent = e.pos, e.prev_pos, e.parent
         self.nodes.tree, self.nodes.flags, self.nodes.s_arc = e.tree, e.flags, e.s_arc
-        self.nodes.alpha, self.nodes.x_ion = self.node_alpha, self.node_xion
+        self.nodes.alpha, self.nodes.rgb, self.nodes.te = self.node_alpha, self.node_rgb, self.node_te
         self.trees = _SoA()
         self.trees.state, self.trees.foot, self.trees.tip, self.trees.root = e.t_state, e.t_foot, e.t_tip, e.t_root
         self.trees.length, self.trees.chord = e.t_L, e.t_chord
@@ -497,35 +717,37 @@ class Globe(Input):
         self.trees.foot2 = e.t_foot2
         self.trees.current = self.circuit.tree_current
         self.trees.radius = self.tree_radius
-        self.trees.color_neutral, self.trees.color_ion = self.color_neutral, self.color_ion
         self.apply_preset()
         self.built = True
 
     def apply_preset(self):
+        """The gas preset: its corona-model emission table (plasma.spectra), the anode colours the
+        tracer's discs and spots use, and the morphology of its channels."""
+        from plasma import spectra
         name = self.presets[self.preset_index]
-        if name == "video":
-            # calibrated on the user's reference footage (linear sRGB): filament shaft violet-blue
-            # (peak ~ (120, 110, 210) 8-bit), feet and electrode pink; the spectral presets stay
-            # selectable with T
-            neutral, ion = VIDEO_NEUTRAL, VIDEO_ION
-        else:
-            try:
-                from plasma import spectra
-                pr = spectra.preset(name)
-                neutral, ion = pr["neutral_rgb"], pr["ion_rgb"]
-            except Exception:
-                neutral, ion = (2.884, 0.541, 0.0), (1.167, 0.809, 2.404)
-            # the spectral colours carry an arbitrary line-intensity scale (argon's shaft is 16x the
-            # video preset's brightest channel): normalise every preset to the same emitted scale, so
-            # the metered exposure - and with it the room's brightness - does not change with the gas
-            shaft = [n * (1.0 - X_ION_SHAFT_REF) + i * X_ION_SHAFT_REF for n, i in zip(neutral, ion)]
-            k = SHAFT_MAX_REF / max(max(shaft), 1.0e-6)
-            neutral = tuple(c * k for c in neutral)
-            ion = tuple(c * k for c in ion)
-        self.color_neutral.fill_(wp.vec3(*[float(c) for c in neutral]))
-        self.color_ion.fill_(wp.vec3(*[float(c) for c in ion]))
+        table = spectra.emission_table(name)
+        te = table["te"]
+        self.emis_rgb.assign(np.ascontiguousarray(table["rgb"], dtype=np.float32))
+        a, b = table["te_law"]
+        self.emis_params.assign(np.array([np.log(te[0]), np.log(te[-1]), a, b], np.float32))
+        self.emis_table = table                                     # host copy for the renderer's UBO
+        # the anode colours of the tracer's discs and spots (unit max): the glow layer under the
+        # envelope (EN_FACE), the gas around the electrode near (20 Td) and far (8 Td), the feet
+        def colour_at(en_td):
+            c = np.interp(np.log(a * en_td ** b), np.log(te), np.arange(te.size))
+            j = int(min(c, te.size - 2)); f = c - j
+            rgb = table["rgb"][j] * (1.0 - f) + table["rgb"][j + 1] * f
+            return tuple(float(v) for v in rgb / max(float(rgb.max()), 1e-9))
+        self.anode_rgb = (colour_at(EN_FACE), colour_at(8.0), colour_at(20.0), colour_at(EN_CH * (1.0 + END_FOOT)))
         self.preset_name = name
-        self.preset_rgb = (tuple(float(c) for c in neutral), tuple(float(c) for c in ion))
+        self.EN_FACE = EN_FACE
+        morph = dict(MORPHOLOGY[PRESET_MORPHOLOGY.get(name, "rope")])
+        morph["power_fall"] = PRESET_POWER_FALL.get(name, morph["power_fall"])
+        self.morphology = morph
+        self.pub.set_look(class_secondary=morph["class_secondary"], class_side=morph["class_side"],
+                          power_fall=morph["power_fall"], foot_widen=morph["foot_widen"],
+                          taper=morph["taper"], root_gain=morph["root_gain"])
+        self.morph.assign(np.array([morph["fork_rate"], morph["fork_max"], morph["roots_max"], 0.0], np.float32))
 
     def cycle_preset(self):
         self.preset_index = (self.preset_index + 1) % len(self.presets)
@@ -543,21 +765,26 @@ class Globe(Input):
         n = publish.N_MAX
         self.params.upload()
         wp.launch(k_gas_control, dim=1, inputs=[params, self.gas_ctrl.array], device=d)
+        wp.launch(gas.k_electrode_temperature, dim=(s0.grid.n, s0.grid.n, s0.grid.n), inputs=[s0.grid, self.gas_ctrl.array], device=d)
         self.gas.step(s0, s1, self.gas_ctrl)
         s0.assign(s1)
         circuit.launch_circuit(params, cs, e.t_state, e.t_foot_dir, e.t_L, e.t_chord, d,
-                               tree_foot2_dir=self.tree_foot2_dir)
+                               tree_foot2_dir=self.tree_foot2_dir, morph=self.morph)
         wp.launch(k_engine_hooks, dim=max(F_MAX * dbm.BRUSH_FEET, dbm.FINGER_MAX),
                   inputs=[params, cs.circuit, e.t_state, cs.tree_current, e.finger_dir, e.finger_q, e.n_fingers,
                           e.admit, e.t_I, cs.tree_reroute_req, cs.tree_brush_req, cs.tree_foot2_drop,
                           e.t_reroute_req, e.t_brush_req, e.t_foot2_drop, cs.finger_served, cs.tree_touch,
-                          e.t_hold], device=d)
+                          e.t_hold, e.t_stalled, self.morph, e.t_foot2], device=d)
         wp.launch(k_cand_inputs, dim=e.c_total,
                   inputs=[params, s0.grid, e.cand_pos, e.cand_alive, cs.sig_dir, cs.sig_amp, cs.sig_radius,
                           cs.sig_alive, cs.finger_served, e.cand_s, e.cand_T], device=d)
         e.step()                                      # prev_pos <- pos, growth, lifecycle, conductor solve
+        wp.copy(self.sig_e_prev, self.sig_e)
+        wp.launch(k_sigma_envelope, dim=SIGE_NLON * SIGE_NLAT,
+                  inputs=[params, e.t_state, e.t_root_dir, cs.tree_current, self.sig_e_prev, self.sig_e], device=d)
         wp.launch(k_advect_nodes, dim=n, inputs=[params, s0.u, s0.grid.n, s0.grid.origin, s0.grid.inv_dx, e.pos, e.flags,
-                                                 e.tree, e.parent, e.t_state, cs.tree_targets], device=d)
+                                                 e.tree, e.parent, e.t_state, cs.tree_targets, self.tree_radius, self.sig_e,
+                                                 cs.sig_dir, cs.sig_amp, cs.sig_alive], device=d)
         wp.launch(k_tree_frame_geometry, dim=F_MAX,
                   inputs=[e.t_state, e.t_foot, e.t_tip, e.t_root, e.t_L, e.pos, e.parent,
                           e.t_foot_dir, e.t_root_dir, e.t_chord, e.t_stretch, e.t_foot2, self.tree_foot2_dir], device=d)
@@ -567,7 +794,8 @@ class Globe(Input):
                           self.gas.sources.p0, self.gas.sources.p1, self.gas.sources.q, self.gas.sources.e,
                           self.gas.sources.count], device=d)
         wp.launch(k_fix_source_count, dim=1, inputs=[self.gas.sources.count], device=d)
-        wp.launch(k_node_xion, dim=n, inputs=[e.pos, e.tree, e.flags, cs.tree_current, self.node_xion, self.tree_radius], device=d)
+        wp.launch(k_node_emission, dim=n, inputs=[e.pos, e.tree, e.flags, cs.tree_current, self.emis_rgb, self.emis_params,
+                                                  self.node_rgb, self.node_te, self.tree_radius], device=d)
         self.pub.launch(nodes, trees, pack_volume=False)
         self.gas.pack_volume(s0, self.pub.volume)
         wp.launch(k_counters, dim=n, inputs=[e.flags, e.t_state, cs.circuit, self.counters], device=d)
@@ -578,7 +806,10 @@ class Globe(Input):
         self.gas.reset(*self.gas_state)
         self.circuit.zero()
         self.node_alpha.fill_(1.0)
-        self.node_xion.zero_()
+        self.node_rgb.zero_()
+        self.node_te.zero_()
+        self.sig_e.zero_()
+        self.sig_e_prev.zero_()
         self.gas.sources.count.zero_()
 
     def capture(self):
@@ -621,12 +852,24 @@ class Globe(Input):
         h["ice_cap"] = 1 if flags.ice else 0
         h["hybrid"] = 1 if flags.hybrid else 0
         h["quincunx"] = 1 if flags.quincunx else 0
+        # the electrode as a heated sphere: its sheath power P = I_tot V_SHEATH leaves by laminar free
+        # convection (Churchill's sphere correlation Nu = 2 + 0.589 Ra^1/4 / (1 + (0.469/Pr)^9/16)^4/9,
+        # solved for the surface excess), which sets the boundary layer the roots ride
+        i_prev = max(float(self.counters_host.numpy()[3]), 0.0)
+        t_ball, u_bl, delta_bl = electrode_thermal(i_prev)
+        h["t_ball"] = t_ball
+        h["u_bl"] = u_bl
+        h["delta_bl"] = delta_bl
         self.params.set_fingers(self.fingers.active())
         # engine knobs (pinned host arrays, uploaded by the first node of the engine step)
         i_sus = circuit.I_SUSTAIN_RATIO * circuit.I_STRIKE * (1.0 + ((self.knobs["frequency"] - 24.0e3) / 20.0e3) ** 2)
+        # the re-strike rate follows the drive (2026-09-16 sweeps: 3.5 / s per filament at full power,
+        # 1.5 / s at low): the Poisson mean scales with (I_ref / I_tot)^0.5 on the previous frame's total
+        i_tot = max(float(self.counters_host.numpy()[3]), 1.0e-5)
+        reroute_mean = dbm.REROUTE_MEAN * min(max((I_REROUTE_REF / i_tot) ** 0.5, 0.6), 1.8)
         self.engine.configure(V=self.knobs["voltage"], eta=self.knobs["eta"], gamma=self.knobs["gamma"],
                               hf=dbm.H_F, I_sus=i_sus, enable_reroute=1 if flags.hybrid else 0,
-                              pause=0 if running else 1)
+                              pause=0 if running else 1, reroute_mean=reroute_mean)
         return running
 
     def pre_render(self, **kwargs):

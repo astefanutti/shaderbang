@@ -88,6 +88,18 @@ def foot_admittance(omega: float, length: float, touch: float) -> float:
     return 1.0 / (R_CH * length + 1.0 / (omega * c_term))
 
 
+PARTIAL_C = 0.35            # a partial channel's capacitance to the glass per 6 cm, relative to a foot's
+PARTIAL_MIN_LEN = 0.005     # m: shorter growing channels draw nothing (a strike in progress)
+
+
+@wp.func
+def partial_admittance(omega: float, length: float) -> float:
+    """A channel that has not reached the glass still carries the displacement current of its own
+    capacitance (~ its length): a stalled channel at low drive stays lit, dimmer than an attached one."""
+    c_term = C_D * A_FOOT * PARTIAL_C * (length / 0.06)
+    return 1.0 / (R_CH * length + 1.0 / (omega * c_term))
+
+
 @wp.func
 def strike_current(frequency: float) -> float:
     """Frequency dependence of the strike current -- CHOSEN so that the filament count peaks
@@ -141,7 +153,8 @@ def k_fingers(params: wp.array(dtype=PlasmaParams),
               tree_foot2_cold: wp.array(dtype=wp.float32),
               finger_served: wp.array(dtype=wp.int32),
               tree_targets: wp.array(dtype=wp.vec3),
-              circuit: wp.array(dtype=wp.float32)):
+              circuit: wp.array(dtype=wp.float32),
+              morph: wp.array(dtype=wp.float32)):
     """Single thread: who serves which finger (``finger_served[f]`` = 1 when owned).
 
     ``tree_targets[k * (BRUSH_FEET + 1) + m]`` is the direction of the finger served by foot m of
@@ -225,13 +238,13 @@ def k_fingers(params: wp.array(dtype=PlasmaParams),
                     if tree_state[k] == TREE_ATTACHED and tree_touch[k] == 0.0:
                         if wp.acos(wp.clamp(wp.dot(tree_foot_dir[k], d), -1.0, 1.0)) < FINGER_REROUTE_ANGLE:
                             tree_reroute_req[k] = 1
-    # brush feet without a finger
+    # brush feet without a finger (a coral globe keeps its forks' feet: morph[0] > 0)
     for k in range(F_MAX):
         for j in range(BRUSH_FEET):
             fs = k * BRUSH_FEET + j
             tree_foot2_drop[fs] = 0
             d2 = tree_foot2_dir[fs]
-            if tree_state[k] == TREE_ATTACHED and wp.length_sq(d2) > 0.5:
+            if tree_state[k] == TREE_ATTACHED and wp.length_sq(d2) > 0.5 and morph[0] <= 0.0:
                 cov = float(0.0)
                 for f in range(nf):
                     cov = wp.max(cov, finger_cov(p, f, d2))
@@ -255,7 +268,8 @@ def k_current_division(params: wp.array(dtype=PlasmaParams),
                        tree_gscale: wp.array(dtype=wp.float32),
                        tree_g: wp.array(dtype=wp.float32),
                        tree_current: wp.array(dtype=wp.float32),
-                       circuit: wp.array(dtype=wp.float32)):
+                       circuit: wp.array(dtype=wp.float32),
+                       morph: wp.array(dtype=wp.float32)):
     """Single-thread kernel (F_MAX <= 32 trees): admittances, total current, per-tree shares.
 
     circuit[0] = I_tot, [1] = sum g, [2] = admit flag for a new tree, [3] = I_strike(f),
@@ -280,12 +294,16 @@ def k_current_division(params: wp.array(dtype=PlasmaParams),
             tree_g[k] = 0.0
             if tree_state[k] != TREE_FREE:
                 n_grow += 1          # growing trees reserve a nominal share in the admission test
+                if tree_state[k] == TREE_GROW and tree_length[k] > PARTIAL_MIN_LEN:
+                    g = partial_admittance(omega, tree_length[k])     # a partial (stalled) channel
+                    tree_g[k] = g
+                    sum_g += g
     drive = wp.max(p.voltage - V_CH, 0.0)
     i_tot = float(0.0)
     if sum_g > 0.0:
         i_tot = wp.min(I_SUPPLY, drive / (z_s + 1.0 / sum_g))
     for k in range(F_MAX):
-        if tree_state[k] == TREE_ATTACHED:
+        if tree_g[k] > 0.0:
             tree_current[k] = i_tot * tree_g[k] / sum_g
         else:
             tree_current[k] = 0.0
@@ -305,7 +323,9 @@ def k_current_division(params: wp.array(dtype=PlasmaParams),
         admit_touch = wp.where(i_touch >= i_str, float(unserved), 0.0)
     circuit[0] = i_tot
     circuit[1] = sum_g
-    circuit[2] = wp.where(i_new >= i_str, 1.0, 0.0)
+    roots_max = int(morph[2])                # the preset's root count cap (0 = none): a coral globe has 6-10 roots
+    admit_n = roots_max <= 0 or n_att + n_grow < roots_max
+    circuit[2] = wp.where(i_new >= i_str and admit_n, 1.0, 0.0)
     circuit[3] = i_str
     circuit[4] = I_SUSTAIN_RATIO * i_str
     circuit[5] = float(n_att)
@@ -617,6 +637,7 @@ class CircuitState:
         self.tree_gscale = wp.ones(F_MAX, dtype=wp.float32, device=device)
         self.tree_reroute_req = z(wp.int32)
         self.tree_brush_req = z(wp.int32)
+        self.no_morph = wp.zeros(4, dtype=wp.float32, device=device)     # launch_circuit without a preset morphology
         self.tree_foot2_drop = z(wp.int32, F_MAX * BRUSH_FEET)
         self.tree_foot2_cold = z(wp.float32, F_MAX * BRUSH_FEET)
         self.no_foot2_dir = z(wp.vec3, F_MAX * BRUSH_FEET)
@@ -634,17 +655,18 @@ class CircuitState:
             a.zero_()
 
 
-def launch_circuit(params, cs, tree_state, tree_foot_dir, tree_length, tree_chord, device, tree_foot2_dir=None):
+def launch_circuit(params, cs, tree_state, tree_foot_dir, tree_length, tree_chord, device, tree_foot2_dir=None, morph=None):
     """The per-frame circuit slice: fingers -> current division -> sigma records -> lifecycle."""
     wp.launch(k_fingers, dim=1,
               inputs=[params, tree_state, tree_foot_dir,
                       tree_foot2_dir if tree_foot2_dir is not None else cs.no_foot2_dir,
                       cs.tree_touch, cs.tree_gscale, cs.tree_reroute_req, cs.tree_brush_req,
-                      cs.tree_foot2_drop, cs.tree_foot2_cold, cs.finger_served, cs.tree_targets, cs.circuit],
+                      cs.tree_foot2_drop, cs.tree_foot2_cold, cs.finger_served, cs.tree_targets, cs.circuit,
+                      morph if morph is not None else cs.no_morph],
               device=device)
     wp.launch(k_current_division, dim=1,
               inputs=[params, tree_state, tree_length, cs.tree_touch, cs.tree_gscale, cs.tree_g, cs.tree_current,
-                      cs.circuit],
+                      cs.circuit, morph if morph is not None else cs.no_morph],
               device=device)
     wp.launch(k_sigma_records, dim=SIG_MAX,
               inputs=[params, tree_state, tree_foot_dir, cs.tree_current, cs.tree_touch,

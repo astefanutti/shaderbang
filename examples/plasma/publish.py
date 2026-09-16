@@ -8,7 +8,7 @@ Everything runs inside the frame graph on fixed-capacity device arrays (plan 5.1
 
 * ``segments`` -- one 112-byte record per live node (the corner-cut span of the link parent ->
   node, see ``k_segments``), as 7 vec4: ``[p0.xyz, radius] [p1.xyz, pack(tree, class, alpha)]
-  [rgb_power.xyz, x_ion] [prev_p0.xyz, tree] [prev_p1.xyz, flags] [n_start.xyz, 0] [n_end.xyz, 0]``.
+  [rgb_power.xyz, Te_eV] [prev_p0.xyz, tree] [prev_p1.xyz, flags] [n_start.xyz, 0] [n_end.xyz, 0]``.
   Node ids are stable across frames, so ``prev_p0/prev_p1`` are the same span built from the
   previous positions: exact per-segment motion vectors for the temporal upscale. ``n_start`` /
   ``n_end`` are the mitre planes at the joints (bisectors of consecutive span directions): the
@@ -45,17 +45,17 @@ from plasma.params import (
 N_MAX = 8192                 # node capacity (must match plasma.dbm)
 F_MAX = 32
 FAN_K = 6                    # (slot layout) F_MAX x FAN_K x 2 root slots after the node segments; one per tree
-FAN_SLOTS = 32 * FAN_K * 2   # is used by k_root_bells
+FAN_SLOTS = 32 * FAN_K * 2   # root record slots (kept in the layout; the bells were dropped 2026-09-16)
 SEG_MAX = N_MAX + FAN_SLOTS  # one segment per node + the root records
-FAN_LEN = 1.2e-3             # m: the bell's throat is this far beyond the root node (bell length ~2.9 mm)
+FAN_LEN = 0.2e-3             # m: the bell's throat is this far beyond the root node (bell height ~1.7 mm: the close-ups flare the channel over its last millimetre)
 FAN_POWER = 1.5              # light of a bell relative to one ordinary segment of its channel (per unit length, constant)
 SEG_STRIDE = 7               # vec4 per segment record (see k_segments)
 ROOT_R = 0.011                # electrode radius (plasma.params.R1)
-ROOT_FLARE = 2.5              # extra brightness at the root (x3.5 at the bulb surface)
-ROOT_FLARE_LEN = 2.5e-3       # m: e-folding length of the root flare
+ROOT_FLARE = 1.0              # extra brightness at the root (x2 at the bulb surface: the 2026-09-16 close-ups
+                              # measure the channel 1.5x its shaft brightness at the wall, 0.73x at 8 mm)
+ROOT_FLARE_LEN = 6.0e-3       # m: e-folding length of the root flare
 ROOT_WIDEN = 0.8              # extra core radius at the bulb surface (x1.8 at the mouth of the bell; the fan carries the flare)
 ROOT_WIDEN_LEN = 1.5e-3       # m: s0 of the core bell
-ROOT_FUNNEL_LEN = 1.5e-3      # m: s0 of the sheath bell (s0 / (s + s0))^2 at the root (tracer FUNNEL_*)
 GRID_N = 96
 GRID_CELLS = GRID_N * GRID_N * GRID_N
 GRID_EXTENT = R2I            # grid covers [-R2I, R2I]^3
@@ -74,10 +74,17 @@ AMBIENT_RADIUS = 8.0e-3      # m, wide splat for the volume glow (the diffuse di
 CLASS_MAIN = 1.0
 CLASS_SECONDARY = 0.30       # the foot brush at the glass shares the foot's current; the transient
 CLASS_SIDE = 0.02            # streamer branches of a strike are faint (Kim & Lin: 0.25 / 0.06 for lightning)
+# the per-preset look (Publisher.look, set from the gas preset's morphology): the branch classes
+# above are the rope defaults; a coral globe (2026-09-16 recordings) lights its forks at 0.4-0.6 of
+# the trunk and its faint streamers at 0.1-0.2, and the brightness of every channel falls along the
+# shaft as (R1 / r)^POWER_FALL (0.55x root -> mid-radius measured; the excitation follows the field)
+LOOK_SECONDARY, LOOK_SIDE, LOOK_POWER_FALL, LOOK_FOOT_WIDEN, LOOK_TAPER, LOOK_ROOT_GAIN, LOOK_COUNT = range(7)
+FOOT_WIDEN_LEN = 6.0e-3      # m: the foot flare (x1.7-2.4 over the last 8-10 mm in every recording)
+TIP_FADE_NODES = 4           # a dead-end branch fades over its last nodes (a streamer tip, not a cut)
 BRUSH_R = R2I - 0.012        # off-main nodes beyond this radius are brush (see dbm.FOOT_BRUSH)
 SECONDARY_MIN_DESCENDANTS = 8
 NODE_MAIN = 128              # transient flag bit: node is on a main channel this frame
-NODE_BELL = 1024             # segment-record flag: a root bell (a fillet of revolution, see k_root_bells)
+NODE_BELL = 1024             # segment-record flag of the former root bells (unused)
 NODE_BRUSH = 256             # transient flag bit: node is on a brush-foot chain (the channel's current is
                              # split between the trunk's foot and its brush feet)
 
@@ -186,15 +193,15 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
                node_next: wp.array(dtype=wp.int32),
                node_alpha: wp.array(dtype=wp.float32),
                node_desc: wp.array(dtype=wp.int32),
-               node_xion: wp.array(dtype=wp.float32),
+               node_rgb: wp.array(dtype=wp.vec3),
+               node_te: wp.array(dtype=wp.float32),
                tree_current: wp.array(dtype=wp.float32),
                tree_radius: wp.array(dtype=wp.float32),
                tree_nfeet: wp.array(dtype=wp.int32),
-               color_neutral: wp.array(dtype=wp.vec3),
-               color_ion: wp.array(dtype=wp.vec3),
                segments: wp.array(dtype=wp.vec4),
                seg_valid: wp.array(dtype=wp.int32),
-               node_class: wp.array(dtype=wp.float32)):
+               node_class: wp.array(dtype=wp.float32),
+               look: wp.array(dtype=wp.float32)):
     """One segment record per live node with a parent; invalid slots get radius 0.
 
     The rendered polyline is the corner-cut (one Chaikin pass) of the node chain: node i emits
@@ -213,31 +220,44 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
         node_class[i] = 0.0
         return
     t = node_tree[i]
-    cls = CLASS_SIDE
+    cls = look[LOOK_SIDE]
     if (f & NODE_MAIN) != 0:
         cls = CLASS_MAIN
     elif node_desc[i] >= SECONDARY_MIN_DESCENDANTS or ((f & NODE_DECAYING) == 0 and wp.length(node_pos[i]) > BRUSH_R):
-        cls = CLASS_SECONDARY
+        cls = look[LOOK_SECONDARY]
+    if (f & NODE_MAIN) == 0:
+        # a dead-end branch fades over its last nodes: a streamer tip, not a cut end
+        cls = cls * wp.min(1.0, float(node_desc[i] + 1) / float(TIP_FADE_NODES))
     node_class[i] = cls
     alpha = float(1.0)
     if (f & NODE_DECAYING) != 0:
         alpha = node_alpha[i]
     cur = tree_current[t]
-    radius = tree_radius[t]
+    r_node = wp.length(node_pos[i])
+    # a side branch carries the share of the current its class says: the matching thinner core
+    # (r ~ I^0.3; the recordings' forks are thinner than their trunk, the streamers thinner still);
+    # the channel tapers from the electrode outwards, x root_gain (R1 / r)^taper (the look the
+    # recordings give: thick bright trunks, thin sharp tips)
+    radius = tree_radius[t] * wp.pow(wp.max(cls, 1.0e-3), 0.3) \
+        * look[LOOK_ROOT_GAIN] * wp.pow(ROOT_R / wp.max(r_node, ROOT_R), look[LOOK_TAPER])
     if (f & NODE_BRUSH) != 0:
         # a brush branch carries its share of the channel's current: 1/(feet) of the power and
-        # the matching thinner core (r ~ I^0.4)
+        # the matching thinner core
         share = 1.0 / float(tree_nfeet[t])
         cur = cur * share
-        radius = radius * wp.pow(share, 0.4)
-    x_ion = node_xion[i]
-    col = color_neutral[t] * (1.0 - x_ion) + color_ion[t] * x_ion
-    # radiance grows faster than the current (a hotter channel): P ~ I^1.5; the footage's touched
-    # channel (~1 mA) saturates all three camera channels while a 40 uA one is a thin violet line
-    power = cls * cur * alpha * wp.sqrt(wp.max(cur, 1.0e-9) / 5.0e-5)
+        radius = radius * wp.pow(share, 0.3)
+    # the node's emission colour per unit current: the corona-model line spectrum at its electron
+    # temperature plus the continuum share that whitens a strong channel (globe.k_node_emission);
+    # the line light is linear in the current, the continuum term inside node_rgb carries the
+    # superlinear part
+    col = node_rgb[i]
+    power = cls * cur * alpha
     # root flare: the first millimetres of a channel at the electrode are brighter (the footage's
     # pink-white flares where the filaments leave the bulb), e-folding ROOT_FLARE_LEN
-    power = power * (1.0 + ROOT_FLARE * wp.exp(-(wp.length(node_pos[i]) - ROOT_R) / ROOT_FLARE_LEN))
+    power = power * (1.0 + ROOT_FLARE * wp.exp(-(r_node - ROOT_R) / ROOT_FLARE_LEN))
+    # the brightness falls along the shaft (the excitation follows the field, strongest at the
+    # electrode): (R1 / r)^POWER_FALL, 0.5 for the rope globes (0.55x at mid-radius), less for neon
+    power = power * wp.pow(ROOT_R / wp.max(r_node, ROOT_R), look[LOOK_POWER_FALL])
     g = node_parent[p]
     xi = chain_smooth(node_pos, node_parent, node_next, node_flags, i)
     xp = chain_smooth(node_pos, node_parent, node_next, node_flags, p)
@@ -259,6 +279,10 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
     # the base of a channel widens into the bulb's glow layer (the footage: roots like a tree's)
     bell0 = ROOT_WIDEN_LEN / (wp.max(wp.length(p0) - ROOT_R, 0.0) + ROOT_WIDEN_LEN)
     radius = radius * (1.0 + ROOT_WIDEN * bell0 * bell0)          # the core flares like the bell too
+    # the foot flares at the glass (the surface discharge spreads the channel: x1.7-2.4 over the
+    # last 8-10 mm in the recordings), s0 FOOT_WIDEN_LEN
+    bell1 = FOOT_WIDEN_LEN / (wp.max(R2I - wp.length(p1), 0.0) + FOOT_WIDEN_LEN)
+    radius = radius * (1.0 + look[LOOK_FOOT_WIDEN] * bell1 * bell1)
     # mitre planes: bisectors between this span and its neighbours (flat cut where there is none)
     u = p1 - p0
     u = u / wp.max(wp.length(u), 1.0e-9)
@@ -289,20 +313,11 @@ def k_segments(node_pos: wp.array(dtype=wp.vec3),
         n_b = u
     segments[base + 0] = wp.vec4(p0[0], p0[1], p0[2], radius)
     segments[base + 1] = wp.vec4(p1[0], p1[1], p1[2], pack_tree_class_alpha(t, cls, alpha))
-    segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, x_ion)
+    segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, node_te[i])
     segments[base + 3] = wp.vec4(q0[0], q0[1], q0[2], float(t))
     segments[base + 4] = wp.vec4(q1[0], q1[1], q1[2], float(f))
-    # root funnel factor (1 at the bulb, e-fold ROOT_FUNNEL_LEN): the tracer widens and brightens
-    # the sheath of these spans; their CSR footprint is dilated 2 more cells to hold the wider skirt
-    mid_r = wp.length(0.5 * (p0 + p1))
-    # a trumpet bell: (s0 / (s + s0))^2 flares abruptly at the mouth (1 at the bulb, 1/4 at s0, 1/16 at 3 s0)
-    bell = ROOT_FUNNEL_LEN / (wp.max(mid_r - ROOT_R, 0.0) + ROOT_FUNNEL_LEN)
-    root_f = bell * bell
-    dil = float(DILATION)
-    if root_f > 0.3:
-        dil = float(DILATION + 2)
-    segments[base + 5] = wp.vec4(n_a[0], n_a[1], n_a[2], root_f)
-    segments[base + 6] = wp.vec4(n_b[0], n_b[1], n_b[2], dil)
+    segments[base + 5] = wp.vec4(n_a[0], n_a[1], n_a[2], 0.0)
+    segments[base + 6] = wp.vec4(n_b[0], n_b[1], n_b[2], float(DILATION))
 
 
 @wp.func
@@ -334,64 +349,6 @@ def in_cube(c: wp.vec3i, p: wp.vec3i, d: int) -> bool:
 def hash01(a: int, b: int) -> float:
     st = wp.rand_init(a * 7919 + 13, b)
     return wp.randf(st)
-
-
-@wp.kernel
-def k_root_bells(tree_state: wp.array(dtype=wp.int32), tree_root: wp.array(dtype=wp.int32),
-                 node_pos: wp.array(dtype=wp.vec3), node_next: wp.array(dtype=wp.int32),
-                 node_flags: wp.array(dtype=wp.int32), node_xion: wp.array(dtype=wp.float32),
-                 tree_current: wp.array(dtype=wp.float32), tree_radius: wp.array(dtype=wp.float32),
-                 color_neutral: wp.array(dtype=wp.vec3), color_ion: wp.array(dtype=wp.vec3),
-                 segments: wp.array(dtype=wp.vec4), seg_valid: wp.array(dtype=wp.int32)):
-    """The root bell of an attached channel: one record per tree (slot N_MAX + t), a segment from
-    the electrode surface to FAN_LEN beyond the root node flagged NODE_BELL. The tracer renders it
-    as a continuous fillet of revolution about that axis (tangent to the sphere at the base,
-    tangent to the channel at the throat) instead of a capsule: the time-integrated glow of an
-    attachment point that wanders over its footprint (radius ~ core radius ~ I^0.3), with the
-    light per unit length held constant so the wide mouth is softer than the throat."""
-    t = wp.tid()
-    base0 = N_MAX + t * FAN_K * 2
-    for k in range(1, FAN_K * 2):                              # only the first slot is used
-        seg_valid[base0 + k] = 0
-        segments[SEG_STRIDE * (base0 + k)] = wp.vec4(0.0)
-    root = tree_root[t]
-    ok = tree_state[t] == 3 and root >= 0
-    if ok:
-        ok = (node_flags[root] & NODE_ALIVE) != 0 and tree_current[t] > 0.0
-    if not ok:
-        seg_valid[base0] = 0
-        segments[SEG_STRIDE * base0] = wp.vec4(0.0)
-        return
-    xr = node_pos[root]
-    nr = xr / wp.max(wp.length(xr), 1.0e-6)
-    u = nr
-    nx = node_next[root]
-    if nx >= 0:
-        v = node_pos[nx] - xr
-        if wp.length(v) > 1.0e-6:
-            u = v / wp.length(v)
-            if wp.dot(u, nr) < 0.3:
-                u = nr
-    a = nr * (ROOT_R + 0.0002)
-    b = xr + u * FAN_LEN
-    uu = b - a
-    uu = uu / wp.max(wp.length(uu), 1.0e-9)
-    cur = tree_current[t]
-    radius = tree_radius[t]
-    x_ion = node_xion[root]
-    col = color_neutral[t] * (1.0 - x_ion) + color_ion[t] * x_ion
-    power = FAN_POWER * cur * wp.sqrt(wp.max(cur, 1.0e-9) / 5.0e-5)
-    pack = pack_tree_class_alpha(t, CLASS_MAIN, 1.0)
-    flags = float(NODE_BELL)
-    base = SEG_STRIDE * base0
-    seg_valid[base0] = 1
-    segments[base] = wp.vec4(a[0], a[1], a[2], radius)
-    segments[base + 1] = wp.vec4(b[0], b[1], b[2], pack)
-    segments[base + 2] = wp.vec4(col[0] * power, col[1] * power, col[2] * power, x_ion)
-    segments[base + 3] = wp.vec4(a[0], a[1], a[2], float(t))
-    segments[base + 4] = wp.vec4(b[0], b[1], b[2], flags)
-    segments[base + 5] = wp.vec4(uu[0], uu[1], uu[2], 1.0)
-    segments[base + 6] = wp.vec4(uu[0], uu[1], uu[2], float(DILATION + 3))   # the bell's mouth reaches ~7 mm
 
 
 @wp.kernel
@@ -578,6 +535,7 @@ class Publisher:
         self.no_foot2 = wp.full(F_MAX * BRUSH_FEET, -1, dtype=wp.int32, device=device)
         self.tree_nfeet = wp.ones(F_MAX, dtype=wp.int32, device=device)
         self.node_class = z(wp.float32, N_MAX)
+        self.look = wp.array([CLASS_SECONDARY, CLASS_SIDE, 0.5, 1.0, 0.15, 1.15], dtype=wp.float32, device=device)
         self.cell_count = z(wp.int32, GRID_CELLS)
         self.cell_start = z(wp.int32, GRID_CELLS)   # exclusive prefix sum; end of cell c = start[c] + count[c]
         self.cell_fill = z(wp.int32, GRID_CELLS)
@@ -588,6 +546,15 @@ class Publisher:
         self.volume = z(wp.vec4h, (GRID_N, GRID_N, GRID_N))
         # warm up the scan's temporary storage before any graph capture
         wp.utils.array_scan(self.cell_count, self.cell_start, inclusive=False)
+
+    def set_look(self, class_secondary=None, class_side=None, power_fall=None, foot_widen=None, taper=None, root_gain=None):
+        """Per-preset publisher look (outside a graph capture): branch classes, shaft falloff, foot
+        flare, the radius taper along the channel and its gain at the electrode."""
+        v = self.look.numpy()
+        for i, x in enumerate((class_secondary, class_side, power_fall, foot_widen, taper, root_gain)):
+            if x is not None:
+                v[i] = x
+        self.look.assign(v)
 
     def launch(self, nodes, trees, temperature=None, speed=None, pack_volume=True):
         """nodes / trees: objects exposing the arrays named below (plasma.dbm's SoA)."""
@@ -601,13 +568,8 @@ class Publisher:
         wp.launch(k_count_descendants, dim=N_MAX, inputs=[nodes.flags, nodes.parent, self.node_desc], device=d)
         wp.launch(k_segments, dim=N_MAX,
                   inputs=[nodes.pos, nodes.prev_pos, nodes.parent, nodes.tree, nodes.flags, self.node_next,
-                          nodes.alpha, self.node_desc, nodes.x_ion, trees.current, trees.radius, self.tree_nfeet,
-                          trees.color_neutral, trees.color_ion,
-                          self.segments, self.seg_valid, self.node_class], device=d)
-        wp.launch(k_root_bells, dim=F_MAX,
-                  inputs=[trees.state, trees.root, nodes.pos, self.node_next, nodes.flags, nodes.x_ion,
-                          trees.current, trees.radius, trees.color_neutral, trees.color_ion,
-                          self.segments, self.seg_valid], device=d)
+                          nodes.alpha, self.node_desc, nodes.rgb, nodes.te, trees.current, trees.radius, self.tree_nfeet,
+                          self.segments, self.seg_valid, self.node_class, self.look], device=d)
         self.cell_count.zero_()
         self.cell_fill.zero_()
         wp.launch(k_csr_count, dim=SEG_MAX, inputs=[self.segments, self.seg_valid, self.cell_count], device=d)
@@ -678,7 +640,8 @@ def synthetic_star(n_trees=13, n_nodes=150, seed=1, device="cuda:0"):
     nodes.flags = wp.array(flags, dtype=wp.int32, device=device)
     nodes.alpha = wp.ones(N_MAX, dtype=wp.float32, device=device)
     nodes.s_arc = wp.array(s_arc, dtype=wp.float32, device=device)
-    nodes.x_ion = wp.full(N_MAX, 0.7, dtype=wp.float32, device=device)
+    nodes.rgb = wp.full(N_MAX, wp.vec3(1.0, 0.6, 0.9), dtype=wp.vec3, device=device)
+    nodes.te = wp.full(N_MAX, 3.0, dtype=wp.float32, device=device)
     trees = _SoA()
     trees.state = wp.array(t_state, dtype=wp.int32, device=device)
     trees.foot = wp.array(t_foot, dtype=wp.int32, device=device)
@@ -693,8 +656,6 @@ def synthetic_star(n_trees=13, n_nodes=150, seed=1, device="cuda:0"):
     trees.length = wp.array(t_len, dtype=wp.float32, device=device)
     trees.current = wp.full(F_MAX, 5e-5, dtype=wp.float32, device=device)
     trees.radius = wp.full(F_MAX, 5e-4, dtype=wp.float32, device=device)
-    trees.color_neutral = wp.full(F_MAX, wp.vec3(1.0, 0.45, 0.2), dtype=wp.vec3, device=device)
-    trees.color_ion = wp.full(F_MAX, wp.vec3(0.4, 0.5, 1.0), dtype=wp.vec3, device=device)
     return nodes, trees, nid
 
 

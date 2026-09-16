@@ -687,3 +687,225 @@ second). Bells: base radius 3 → 4.5 mm, gain 4 → 2 (wider, dimmer mouths).
   simulated filaments (tracer branch on `knobs.w`, `nimitzInterior`/`nzFlow`/`nzNoise`, the
   present pass's `passthrough`, the `look` knob, `--nimitz`, key `M`) is gone; the physical path
   is the only renderer. The reference shader file `examples/plasma_globe.glsl` stays.
+
+### Twenty-first pass — strip lights and a wall, presets on one scale, camera default (2026-09-15/16)
+
+* **Room.** The four corner panels became a studio set: two long strips left and right of the
+  globe (`RECT_C` ±0.75 m, 0.45 m up, half size 0.60 × 0.06 m), a large soft overhead panel and a
+  dim back rim strip above a dark wall at z = −0.9 m (`WALL_Z`, albedo 0.16); crisp reflections
+  (no blur) after a blurred variant read as odd; a cheap wall path for the reflections (the full
+  shading cost 10 ms when evaluated through the glass).
+* **Presets on one scale.** The spectral presets carried arbitrary line-intensity scales (argon's
+  shaft 16× the video preset's), so switching gas changed the metered exposure and darkened the
+  room. Every preset is now scaled so that its shaft's brightest channel equals the video preset's
+  (`SHAFT_MAX_REF` 0.74 at `X_ION_SHAFT_REF` 0.9). `PRESET_LOOK` gives each gas its shaft ion
+  fraction and a continuum (white) share; neon at 0.06 / 0.12 is orange-red with whitish cores.
+* **Camera.** The default pose comes from a Ctrl+S dump the user chose (`Camera.DEFAULT_EYE`
+  (0.155, −0.031, 0.267), target (0.011, −0.022, 0.020)); `H` prints the key table while running;
+  the uv header runs the checkout (`shaderbang = { path = "..", editable = true }`).
+
+### Twenty-second pass — the anode from the close-ups (2026-09-16)
+
+Five new recordings (`~/Videos/Screencasts/Screencast from 2026-09-16 …`): r1 `12-41-16` (pink
+"Tyrian purple" globe, anode close-ups 40-98 s, hand 56-88 s), r2 `12-44-56` and r4 `12-51-51`
+(two green globes each, FULL / MEDIUM / LOW power captions), r3 `12-47-03` (red neon, dome
+electrode, close-ups 44-66 s), r5 `12-55-11` (a seven-globe gallery). 29.5 fps, no duplicated
+frames (`-fps_mode passthrough`); 150 mm globes assumed for the scales.
+
+Measured on r1/r3 (electrode radius 11 mm assumed; all mm scale with it):
+
+| feature | measurement |
+|---|---|
+| face colour | sRGB (70, 18, 30) → linear (1.00, 0.105, 0.225); limb (186, 73, 120); neon face (176, 46, 37) |
+| limb law | Y(μ)/Y(1) = 1.2, 1.6, 2.7, 6.1, 8.6 at μ = 0.89, 0.71, 0.51, 0.34, 0.20; root-free limb/face 2.8× |
+| off-surface gas | Y 0.0044 at +0.25 mm, 0.0015 at +1.25, 0.0004 at +3, 0 beyond +3.5 mm (p25 = 0 from 4 to 15 mm) |
+| roots | spots 17× the face at 0.25 mm, e-fold 0.55 mm, tails along the surface 3-4 mm; 8 blobs of ~3.4 mm cover 34 % of the disc at > 1.5× |
+| channel at the root | FWHM 1.3-2.4 mm at 0.5 mm, 0.6-1.1 mm beyond 2 mm; peak 1.5× the shaft at the wall, 0.73× at 8 mm |
+| touch | face ×5, limb ×1.5, off-surface background ×7.7, sheath extent 3.5 → 7 mm; a moderate root changes nothing |
+| r3 dome | glow on the cap only, a 0.3-0.5 mm gold limb line (250, 215, 130) 0.4 mm inside the silhouette, rim/face 14.7× |
+
+The model that fits all of it: a glass envelope of radius `R1` over a dark core, the glow discharge
+a luminous layer `SHELL_D` (0.6 mm) thick just inside the envelope. Its radiance along a view ray is
+the layer's chord (`shellChord`): 1 at the face, rising as 1/μ, peaking at 2√((R1+Rc)/(R1−Rc)) ≈ 13×
+in a thin line where the ray grazes the core, zero at the silhouette — the pink globe's μ law and
+the neon globe's gold rim line are the same layer (a 0.5 mm layer gives 1.13, 1.44, 2.1, 3.9, 8.9
+against the measured 1.2, 1.6, 2.7, 6.1, 8.6). Tracer changes (`trace.comp`):
+
+* the electrode branch: `colElectrode × shellChord(μ) × √(I_tot / 1 mA) × marble`, `E_SHELL`
+  0.0022 (≈ 4 % of a shaft core), value-noise marbling ±30 % at 2.5 mm drifting up 5 mm/s; the
+  `grazing` limb polynomial, the room reflection and the strong gloss are gone (a matte luminous
+  body; the old gloss drew the touched filament's reflection with a hard horizon across the ball);
+* `rootGlow`: per root a spot `SPOT_K` 25 × (I/50 µA)^1.5 × exp(−d/0.55 mm), a tail along the
+  surface (direction = the channel's lean over its first `TAIL_NODES` 4 nodes projected on the
+  tangent plane, published in the bell record's slot 6; e-fold `TAIL_LEN` 2 mm, half width 0.35 mm
+  growing 0.15 per mm), and a creeping-discharge term `SURF_K` 0.012 × Σ(I/50 µA)² with σ 8 mm
+  that lights the face under a strong root (×5 at 1 mA) and nothing under ordinary ones; the
+  isotropic pools (`POOL_*`) are gone;
+* `corona`: sheath e-fold 1 mm, amplitude 0.02 (a fifth of the face just outside the limb, where
+  it used to be 8× the face), doubling in extent and ×7 in brightness under a strong root
+  (`touchF` from Σ(I/50 µA)^2.5); the (R1/r)^4 haze only in that state; `HALO_REACH` 30 → 10 mm;
+* bells: `BELL_R` 6 → 1.5 mm, `BELL_GAIN` 2 → 0.8, `FAN_LEN` 1.2 → 0.2 mm (height ~1.7 mm),
+  `FUNNEL_WIDEN` 2 → 1, `FUNNEL_LIGHT` 1.5 → 0.5, `ROOT_FLARE` 2.5 → 1.0 over 6 mm;
+* colours: the electrode is the gas's neutral line colour (video (1.00, 0.105, 0.225)), the violet
+  stays in `colHaloNear`.
+
+Measured on our own renders (headless close-up, eye 10 cm, exposure metered): face (68, 41, 64),
+rim annulus (120, 58, 90), touched face ×1.2 with a 457 µA root (the footage's ×5 is a ~1 mA root;
+the term scales as I²). The green and blue excess on the face is the glow pass (+24, +19, +32 at
+this zoom, where the kernel scales to the projected globe radius) and the filaments in front.
+
+### Twenty-third pass — rope and coral morphology, power and dynamics from the sweeps (2026-09-16)
+
+Ring census on r2/r4 (FULL / MEDIUM / LOW) and r1/r3 (FWHM in mm, 8-bit peaks):
+
+| rec / power | roots (12.7 mm) | N at 41 mm | N at 70 mm | w root | w mid | w glass | I root / mid / glass |
+|---|---|---|---|---|---|---|---|
+| r2 FULL / MED / LOW | 7.0 / 6.9 / 6.4 | 10.4 / 8.7 / 3.7 | 2.4 / 2.6 / 0.8 | 1.4-1.6 | 1.6-1.9 | 3.3-6.1 | 186/100/50 → 183/46/9 |
+| r4 FULL / LOW | 7.2 / 7.4 | 16.7 / 6.3 | 9.0 / 1.4 | 1.55 / 1.11 | 1.44 / 1.01 | 2.4 / 1.7 | 218/116/52 → 187/59/28 |
+| r1 / r3 overview | 8.2 / 7.3 | 22.1 / 14.6 | 19.0 / 13.6 | 1.47 / 1.35 | 1.58 / 1.30 | 1.70 | 210/140/85, 168/92/96 |
+
+No radius taper along the shaft (±15 %); the "coral" impression is brightness (0.55× root → mid,
+0.5× mid → glass) plus Y-forks (2-3 per channel at 20-45 mm, full angle 40-55°, branches at
+0.4-0.6 of the trunk, faint streamers at 0.1-0.2, many ending in the gas); feet flare ×1.7-2.4
+over the last 8-10 mm; neon feet stay bright. Power changes the reach, not the root count
+(glass-reaching 2.4 → 0.8 while the roots stay ~7); shaft width 1.44 / 1.30 / 1.01 mm fits
+r ∝ I^0.3. Ring tracker: roots walk up at 7.3 mm/s (66-70 % up) at full power, 2.9 mm/s at low;
+feet 0.6 mm/s (pinned) with re-strike jumps; re-strikes 3.5 / s per filament at full, 1.5 at low.
+
+Changes:
+
+* **Publisher look per preset** (`Publisher.look`, `Globe.MORPHOLOGY`): branch classes
+  (rope 1 / 0.30 / 0.02, coral 1 / 0.50 / 0.12), a dead-end tip fade over the last
+  `TIP_FADE_NODES` 4 nodes, side branches thinner as cls^0.3, brightness along the shaft
+  × (R1/r)^`POWER_FALL` (rope 0.5, coral 0.3, neon 0.2), a foot bell (`FOOT_WIDEN` 1 over
+  `FOOT_WIDEN_LEN` 6 mm), `X_ION_FOOT_LEN` 8 → 15 mm; the I^0.4 comments corrected to the 0.3 the
+  code uses.
+* **Coral forks** (`dbm`): a Poisson fork request per attached channel (`fork_rate` 5 / s while it
+  has fewer than `fork_max` 3 secondary feet, `k_engine_hooks`) arms a brush-type leader at
+  `FORK_CORAL_LO..HI` 0.30-0.65 of the arc; half the forks (`FORK_DEAD_P`) get a two-frame growth
+  budget and end in the gas, the others reach the glass as secondary feet. Fork nodes carry the
+  `CORAL` flag (512) and survive the post-attachment prune while their chain reaches the main
+  channel through coral or main nodes; a coral globe keeps its secondary feet (the finger logic's
+  brush-foot drop is off when `morph[0] > 0`); `roots_max` 10 caps the admission. Preset `coral`
+  (green-white neutral (0.55, 1.0, 0.72), pale blue ion, shaft fraction 0.45, continuum 0.25).
+  Measured: 10 channels, 6-15 secondary feet, 300-800 coral nodes at any time.
+* **Reach, not count** (`dbm`, `circuit`): a growing channel that has not reached the glass by
+  `STALL_AGE` 0.2 s stops growing (`t_stalled`, its candidates are ignored) and stays lit as a
+  partial channel — the circuit gives it `partial_admittance` (capacitance `PARTIAL_C` 0.35 of a
+  foot's per 6 cm) — until its Poisson timer runs out, then retracts; stalled channels do not block
+  the admission of new strikes. Without the stop a channel that cannot cross bushed out around the
+  electrode until the node capacity was full (3 kV: 8192 live nodes in 4 trees). Measured (rope,
+  400 frames): 5 kV 31 trees / 30 attached, 4 kV 31 / 23-29, 3 kV ~10 / 0 (short dim channels).
+* **Dynamics**: the re-strike timer's mean scales with (1 mA / I_tot)^0.5 (`reroute_mean` engine
+  parameter, 0.6-1.8×), roots ride the plume with `ROOT_DRIFT_GAIN` 5 × clamp(I_tot / 1 mA)
+  (measured 5.1 mm/s median, 100 % up, against 7.3 and 70 %), feet pinned (`FOOT_CREEP` 0.1:
+  0.3 mm/s measured, 0.6 in the footage).
+* **Harness**: `plasma.headless_render --sim` gained `--eye/--target`, `--preset`, `--track-roots`
+  (root and foot drift from the arrays) and prints the morphology counters; the analysis scripts
+  of this pass live in `/tmp/plasma_rec/{anode,dyn}/` (ring tracker, census, radial profiles).
+
+Not done from the plan: the optional dome electrode and stem threads; the seven-globe gallery
+(WP3) waits for the review of these two passes.
+
+### Twenty-fourth pass — a physical emission model, a glass envelope, coral taper (2026-09-16)
+
+The user's review of the two passes above: dynamics better; the anode not much improved, its root
+tails wrong, no reflections in what is a glass envelope, the gas around it still hand-shaped; the
+coral shape not visible (wanted: thick at the roots, thin and sharp at the feet); neon poor; and a
+question — are the filament colours artistic or physical? They were half and half (NIST species
+chromaticities, blended by a chosen "ion fraction" law of current and position). Replaced:
+
+* **Emission model** (`plasma/spectra.py`, `data/nist_asd_lines.json`). The colour of every
+  emitting region is the gas mixture's corona-model line spectrum at the local electron
+  temperature: line power ∝ X_k(Te) (A_ki / A_k) hν with X_k ∝ g_k exp(−E_k / Te) (excitation
+  from the ground state, radiative cascade — corona equilibrium, n_e far below the LTE
+  threshold), summed over the species with their mole fractions, folded with the CIE functions.
+  Level energies, weights and transition probabilities come from the NIST ASD lines table
+  (Ne I, Ar I, Kr I, Xe I, 200–2000 nm, so each level's total decay rate is known); the pure
+  statistical distribution over-weights neon's green/yellow lines (level-specific cross-sections
+  are not in the data), so within a species the total is distributed over the lines following the
+  Handbook's observed glow-discharge intensities (neon: its persistent lines) extrapolated with
+  each line's Boltzmann factor. Ion lines are left out (∝ n_e² with n_e / n_gas ~ 1e-9). A
+  bremsstrahlung-shaped continuum (∝ n_e²) adds a white share ∝ (I / 1 mA)^0.7 (`C_CONT` 1.5:
+  a touched channel ~60 % white, an ordinary one ~15 %). Te = a (E/N)^b per gas (a: Ne 1.9,
+  Ar 1.5, Kr 1.3, Xe 1.1; b 0.25 — a two-parameter stand-in for Boltzmann-solver swarm data,
+  CHOSEN / calibrated so that a Ne/Kr/Xe channel is lavender-blue at the channel field).
+  Predicted swatches: neon (255,120,0) at every Te; Ne + 2 % Xe lavender-blue at 2 eV, pink at
+  2.5, orange-red from 4; argon violet; krypton lavender.
+* **Where the temperature comes from.** Along a channel (`globe.k_node_emission`):
+  E/N = `EN_CH` 3 Td × (T / T0) × (1 + 15 e^(−d_root / 4 mm) + 25 e^(−d_glass / 8 mm)) — the
+  channel-phase field, the thinner hot gas (steady conduction heating, 12 K per 50 µA), and the
+  sheaths at both ends where the voltage drop concentrates. The table's *chromaticity* is used
+  along the channel; its luminance (30× larger at the sheath fields) is not — the recordings
+  measure the brightness falling towards the glass and the sheath light is transient — so the
+  brightness keeps the measured `POWER_FALL`, now linear in the current with the continuum
+  term carrying the superlinear part. The lavender-blue shafts, pink roots and crimson feet of
+  the pink globe come out of this profile with no per-region colour. The filament sheath draws
+  the gas's colour at 0.6 Te (cooler gas around the core).
+* **Presets.** `tyrian` (Ne 0.85 / Kr 0.05 / Xe 0.10, CHOSEN for the recordings' pink globe;
+  default, `video` is an alias), `ne_xe` (PPPL's Ne + 2 % Xe), `ne`, `ar`, `kr`, `coral`
+  (green cannot come from noble-gas lines: krypton's brightness law with a fixed green-white
+  chromaticity, stated as such). The old x_ion / `PRESET_LOOK` / spectral normalisation code is
+  gone.
+* **The anode, physically** (`trace.comp`). The glow layer under the envelope radiates the gas's
+  spectrum at `EN_FACE` 60 Td, excited by the roots' currents spreading over the ball,
+  j(x) = Σ I_k / (4π (d² + r_k²)) (`rootDensity`): the mean between the roots, 13–17× that at
+  0.25 mm from a 40 µA root (the measured spots), the whole face lit around a touched root — no
+  spot, tail or "surface" terms any more. The envelope is glass: the Fresnel share of a second
+  interior path along the reflected ray (filaments, gas, and the room through the far glass)
+  gives the mirror images of the filaments the recordings show (the touched channel's white
+  streak across the ball) in place of any gloss. The gas around the electrode: the same
+  spreading current, electrons only where the field still ionises (Townsend-like
+  exp(−`EN_ION` 100 Td / (E/N)), E/N = the surface value the voltage sets (concentric spheres,
+  22 Td at 5 kV) × (R1/r)² × T/T0 from the gas grid), radiating the spectrum at the local Te —
+  the thin sheath and its touched-root thickening fall out; the hand-shaped halo, `HALO_REACH`
+  tail and sheath constants are gone. Two calibrated gains remain (`K_FACE` 1e-4, `K_SHEATH`
+  5e-3); root funnels narrowed (`FUNNEL_WIDEN` 0.5, `FUNNEL_LIGHT` 0.3, `BELL_GAIN` 0.6).
+* **Coral taper** (`publish.k_segments`): radius × `root_gain` (R1 / r)^`taper` (coral 1.5 /
+  0.4 → 0.71× at the glass, rope 1.15 / 0.15), no foot flare for coral, brightness falloff 0.6:
+  thick bright trunks, thin sharp branches and tips.
+* Measured on our renders (close-up, tyrian): face (72, 54, 69) untouched → (96, 75, 92) with a
+  457 µA root, rim (136, 106, 133); the face is pinker and less saturated than the recorded
+  (70, 18, 30) — the mixture's reddest state is (255, 146, 148) at 9 eV, so either the real
+  fill is redder or the envelope itself is tinted; noted, not tuned. Whole frame median 5.6 ms
+  (unchanged). The remaining haze in close-ups is the glow pass, whose kernel scales with the zoom.
+
+### Twenty-fifth pass — surfaces that charge and heat (2026-09-16)
+
+The user's review: the physical colours and the envelope reflections are right; the gas around the
+anode and the roots' dynamics and rendering are not, and a trail remained. Asked how the roots were
+simulated: they rode the gas velocity sampled one node above the ball × a gain of 5, floored at
+4 mm/s up — not physics. Agreed direction: the surfaces participate in the charging and the heating,
+on both spheres, and the gas around the electrode follows from its heat, no cap.
+
+* **The electrode is a heated sphere.** Its sheath power P = I_tot `V_SHEATH` (300 V, CHOSEN)
+  leaves by laminar free convection (Churchill's sphere correlation, solved for the surface excess
+  on the host each frame, `electrode_thermal`): 1.2 mA → +20 K, 0.1 mA → +2.3 K. The gas solver's
+  electrode cells hold that temperature (`k_electrode_temperature`, `CTRL_T_ELECTRODE`) so the ball
+  has a plume and thinner gas around it; the tracer's corona reads the grid temperature.
+* **Attachments are surface discharges on dielectrics**, the same rule on both spheres: the barrier
+  under an attachment charges (rate ∝ current, saturation σ_sat = C_d V, relaxation `TAU_ENV`,
+  spreading `D_SIGMA`, as the outer glass's footprints), the attachment creeps down the surface-charge
+  gradient onto fresh dielectric with a mobility `K_SIG` (4.5e-6 m²/s, CHOSEN: ~3 mm/s at the edge of
+  a saturated footprint), and the gas velocity at the wall is zero, so an attachment is dragged only
+  through the channel a core radius above the surface by that surface's own thermal boundary layer.
+  The envelope gets a 64 × 32 equirectangular surface-charge grid (`k_sigma_envelope`); the outer
+  glass reuses the circuit's footprint records (`sigma_glass_gradient`). Roots ride the ball's
+  laminar layer u = U sin θ · 6.75 η (1 − η)², η = r_k / δ, U = `C_BL` √(g β ΔT 2R1),
+  δ = `DELTA_BL` R1 Gr^−1/4 (1.2 mA: U 48 mm/s, δ 11 mm, 13 mm/s at a 0.5 mm core radius on the
+  equator; 0.1 mA: 16 mm/s, 20 mm, 2.6 mm/s); `ROOT_DRIFT_GAIN`, the roots' plume floor and `FOOT_CREEP` (now 0: pinned by the
+  no-slip wall, creep only) are gone. Measured (tyrian, 5 kV): roots 5.7 mm/s median, 100 % up,
+  p10–p90 +0.7 … +9.3 (recordings 7.3, 70 % up); feet 0.1 mm/s (0.6). The feet's pinning is now
+  a consequence, not a constant: the outer glass sits within a kelvin of the gas.
+* **The memory effect renders the trail.** A dielectric-barrier discharge re-ignites where charge
+  was deposited in the previous half-cycles, so the glow layer also lights the surface a root has
+  just charged: `J_MEM` (3 A/m², CHOSEN) × the envelope's surface charge, packed after the foot and
+  root records in the sigma SSBO. The trail has the root's true direction and fades with `TAU_ENV`.
+  The procedural marbling is gone.
+* **Bells and funnels are gone** (`k_root_bells`, `bellEmission`, `FUNNEL_*`, `ROOT_FUNNEL_LEN`):
+  the close-ups' root is the channel's 2× flare over its last millimetre (`ROOT_WIDEN`, kept) plus
+  the spreading-current spots; the stubs were the likeliest "trailing" the user saw.
+* **The lens glare is fixed in angle** (pixels), as a lens's is; it no longer scales with the
+  projected globe (close-ups were bathed in it).
+* Not done: nitrogen / molecular bands and a mixture-design mode (the user's next wish: green
+  globes use nitrogen; the corona model needs band spectra for that), the gallery (WP3).

@@ -130,6 +130,9 @@ DT = 1.0 / 60.0
 RETRACT_SPEED = 0.02        # m / frame
 STARVE_STEPS = 3
 STARVE_AGE = 0.5            # s
+STALL_AGE = 0.2             # s: a growing channel that has not reached the glass by then stops growing (its
+                            # candidates are ignored) and stays lit as a partial channel until its timer runs
+                            # out; without the stop a channel that cannot cross bushes out around the electrode
 DECAY_TIME = 0.1            # s
 REGROW_TIMEOUT = 0.25       # s: grace period of a re-route; if no leader has reached the glass by then
                             # the stretched old channel extinguishes anyway (pruned, tree -> GROW)
@@ -144,6 +147,10 @@ FOOT_BRUSH = 0.012          # m: branches that leave the main channel within thi
 RESTRIKE_P = 0.3            # share of timer events that end the filament (retract) instead of re-routing
 REROUTE_MEAN = 0.25         # s: mean of the Poisson re-route timer (the footage: a filament keeps its path
                             # for ~0.1-0.3 s, then jumps to a nearby one; plan 4.4 said 2 s)
+FORK_CORAL_LO, FORK_CORAL_HI = 0.30, 0.65   # a coral fork leaves the trunk in this arc fraction range (the green
+                            # globes of 2026-09-16: Y-forks 20-45 mm from the electrode, full angle 40-55 deg)
+FORK_DEAD_P = 0.5           # share of coral forks that end in the gas (t_brush 3): their leader grows for
+FORK_DEAD_FRAMES = 2        # this many frames (<= 32 nodes, ~5 cm) and stops; the others reach the glass
 FORK_LO, FORK_HI = 0.10, 0.60   # fork arc fraction range: most of the channel regrows (a whole-path jump)
                             # it: a fresh strike then lands where the electrode is least screened, so
                             # roots keep spreading instead of collecting where the gas carries them
@@ -168,6 +175,8 @@ ROOT = 16
 
 # --- tree states ---------------------------------------------------------------------------------
 
+CORAL = 512     # node flag: grown by a coral fork leader (a Y-branch of the channel); such branches survive the
+                # post-attachment prune while their chain reaches the main channel through coral / main nodes
 FREE = 0
 SEED = 1        # the electrode pool stage (a claimed tree slot enters GROW directly)
 GROW = 2
@@ -179,7 +188,7 @@ FROZEN = 6      # lab only: keeps the nodes charged, no growth (sequential-pool 
 # --- float params (device array P) ---------------------------------------------------------------
 
 P_R1, P_R2, P_H, P_A, P_V, P_T0, P_E_BD0, P_E_PROP0, P_ETA, P_GAMMA, P_HF, P_DT, \
-    P_RETRACT_SPEED, P_STARVE_AGE, P_I_SUS, P_DECAY_TIME, P_BORN_GAIN, P_E_CH, P_COUNT = range(19)
+    P_RETRACT_SPEED, P_STARVE_AGE, P_I_SUS, P_DECAY_TIME, P_BORN_GAIN, P_E_CH, P_REROUTE_MEAN, P_COUNT = range(20)
 
 # --- int params (device array IP) ----------------------------------------------------------------
 
@@ -351,10 +360,12 @@ def step_seed(seed: int, step: int, salt: int):
 
 
 @wp.func
-def reroute_timer(seed: int, step: int, t: int, salt: int):
-    """Poisson re-route floor (plan 4.4 trigger c): exponential, mean REROUTE_MEAN."""
+def reroute_timer(seed: int, step: int, t: int, salt: int, mean: float):
+    """Poisson re-route floor (plan 4.4 trigger c): exponential, mean P[P_REROUTE_MEAN] (REROUTE_MEAN
+    scaled by the app with the drive: the 2026-09-16 sweeps re-strike 3.5 / s per filament at full
+    power and 1.5 / s at low power)."""
     st = wp.rand_init(step_seed(seed, step, salt), t)
-    return -REROUTE_MEAN * wp.log(wp.max(wp.randf(st), 1.0e-6))
+    return -mean * wp.log(wp.max(wp.randf(st), 1.0e-6))
 
 
 @wp.func
@@ -464,7 +475,7 @@ def k_tree_frame(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
                  t_reroute_req: wp.array(dtype=int),
                  t_foot2: wp.array(dtype=int), t_brush: wp.array(dtype=int),
                  t_brush_req: wp.array(dtype=int), t_foot2_drop: wp.array(dtype=int),
-                 t_hold: wp.array(dtype=int),
+                 t_hold: wp.array(dtype=int), t_stalled: wp.array(dtype=int),
                  t_free_snapshot: wp.array(dtype=int), t_new: wp.array(dtype=int),
                  stage_min: wp.array(dtype=float), stage_max: wp.array(dtype=float),
                  slot: wp.array(dtype=wp.int64)):
@@ -533,10 +544,12 @@ def k_tree_frame(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
         rg = t_regrow[t]
         if (rg == 1 or rg == 3) and float(frame - t_regrow_frame[t]) * dt > REGROW_TIMEOUT:
             if t_brush[t] != 0:
-                # a brush leader that never made it: prune it, the channel stays as it is
+                # a brush leader that never made it: prune it, the channel stays as it is; a coral
+                # fork leader stays as a dead-end branch (the recordings' branches ending in the gas)
+                if t_brush[t] == 1:
+                    t_prune_side[t] = 1
                 t_brush[t] = 0
                 t_regrow[t] = 0
-                t_prune_side[t] = 1
                 rg = 0
             else:
                 t_regrow[t] = 4          # grace over: the stretched channel extinguishes now
@@ -577,19 +590,39 @@ def k_tree_frame(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
                 # the footage's touched channel keeps changing shape but never disappears
                 t_timer[t] = t_timer[t] - dt * wp.where(t_hold[t] == 0, 1.0, 0.25)
             stretched = t_stretch[t] > STRETCH_TRIGGER
+            if rg == 3 and t_brush[t] >= 2:
+                # a starved coral fork leader stops where it is: a dead-end branch
+                t_brush[t] = 0
+                t_regrow[t] = 0
+                rg = 0
+            if rg == 1 and t_brush[t] == 3 and frame - t_leader_frame[t] >= FORK_DEAD_FRAMES:
+                # a dead-end coral fork: its growth budget is spent, the branch ends in the gas
+                t_brush[t] = 0
+                t_regrow[t] = 0
+                rg = 0
             brush = (rg == 3 and t_brush[t] != 0) or (rg == 0 and breq != 0)
             if brush:
                 free = int(0)
                 for j in range(BRUSH_FEET):
                     if t_foot2[t * BRUSH_FEET + j] < 0:
                         free = 1
+                coral = breq == 2
                 if free != 0 and t_L[t] > BRUSH_FORK + 2.0 * P[P_H]:
-                    t_fork_s[t] = t_L[t] - BRUSH_FORK
+                    if coral:
+                        # a coral fork: the leader leaves the trunk between FORK_CORAL_LO and _HI of its arc
+                        stc = wp.rand_init(step_seed(IP[IP_SEED], frame, SALT_FORK), t)
+                        t_fork_s[t] = (FORK_CORAL_LO + (FORK_CORAL_HI - FORK_CORAL_LO) * wp.randf(stc)) * t_L[t]
+                    else:
+                        t_fork_s[t] = t_L[t] - BRUSH_FORK
                     if rg == 0:
                         t_regrow_frame[t] = frame
                     t_regrow[t] = 1
                     t_leader_frame[t] = frame
-                    t_brush[t] = 1
+                    kind = int(1)
+                    if coral:
+                        stk = wp.rand_init(step_seed(IP[IP_SEED], frame, SALT_FORK), t + 7)
+                        kind = wp.where(wp.randf(stk) < FORK_DEAD_P, 3, 2)
+                    t_brush[t] = kind
                 else:
                     t_brush[t] = 0
                     if rg == 3:
@@ -638,12 +671,21 @@ def k_tree_frame(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
                         n2 = pn2
                         steps2 += 1
                 t_fork_s[t] = fork_s
-                t_timer[t] = -REROUTE_MEAN * wp.log(wp.max(wp.randf(st), 1.0e-6))
+                t_timer[t] = -P[P_REROUTE_MEAN] * wp.log(wp.max(wp.randf(st), 1.0e-6))
                 t_stretch[t] = 1.0
                 if rg == 0:
                     t_regrow_frame[t] = frame
                 t_regrow[t] = 1
                 t_leader_frame[t] = frame
+    if state == GROW and IP[IP_ENABLE_REROUTE] != 0:
+        # a growing channel that stalls (no gated site: the field along its path is below the
+        # propagation threshold) stays lit as a partial channel until this timer runs out, then
+        # retracts and the count law strikes elsewhere: at low drive the roots keep their number
+        # while the reach collapses (the 2026-09-16 power sweeps: 7 roots at every power, the
+        # glass-reaching share 0.9 -> 0.15). Past STALL_AGE it stops growing altogether.
+        t_timer[t] = t_timer[t] - dt
+        if float(cnt[CNT_FRAME] - t_birth[t]) * dt > STALL_AGE:
+            t_stalled[t] = 1
     if state == RETRACT:
         t_retract_len[t] = t_retract_len[t] + P[P_RETRACT_SPEED]
 
@@ -711,6 +753,19 @@ def k_node_frame(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
                         break
                     n = parent[n]
                     steps += 1
+            if spare == 0 and (f & CORAL) != 0:
+                # a coral branch survives while its chain reaches the main channel through coral
+                # or main nodes (a branch of the pruned distal channel goes with it)
+                n = parent[i]
+                steps = int(0)
+                while n >= 0 and steps < 256:
+                    if main_mark[n] == frame:
+                        spare = 1
+                        break
+                    if (flags[n] & CORAL) == 0:
+                        break
+                    n = parent[n]
+                    steps += 1
             if spare == 0:
                 flags[i] = (f | DECAYING) & ~(CHARGED | FOOT)
                 q[i] = 0.0
@@ -747,6 +802,7 @@ def k_free_finish(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arr
                   t_prune_side: wp.array(dtype=int), t_foot: wp.array(dtype=int),
                   t_foot_dir: wp.array(dtype=wp.vec3), t_starve: wp.array(dtype=int),
                   t_foot2: wp.array(dtype=int), t_brush: wp.array(dtype=int),
+                  t_stalled: wp.array(dtype=int),
                   c_f: int, k: int, n_max: int):
     """Closes the free-list push, the RETRACT -> FREE transition and the re-route bookkeeping.
 
@@ -768,6 +824,7 @@ def k_free_finish(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arr
         # grace over (k_node_frame pruned the old distal channel): the tree loses its foot and
         # current and goes on growing its leader, or retracts if that starves
         t_state[t] = GROW
+        t_stalled[t] = 0
         t_foot[t] = -1
         t_foot_dir[t] = wp.vec3(0.0, 0.0, 0.0)
         t_L[t] = t_fork_s[t]
@@ -987,7 +1044,7 @@ def k_update_key(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
                  cand_pos: wp.array(dtype=wp.vec3), cand_phi: wp.array(dtype=float),
                  cand_alive: wp.array(dtype=int), cand_stamp: wp.array(dtype=int),
                  cand_s: wp.array(dtype=float), cand_T: wp.array(dtype=float),
-                 t_regrow: wp.array(dtype=int),
+                 t_regrow: wp.array(dtype=int), t_stalled: wp.array(dtype=int),
                  hot_p0: wp.array(dtype=wp.vec3), hot_p1: wp.array(dtype=wp.vec3),
                  hot_r: wp.array(dtype=float), hot_T: wp.array(dtype=float),
                  stage_min: wp.array(dtype=float), stage_max: wp.array(dtype=float),
@@ -1007,7 +1064,7 @@ def k_update_key(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.arra
     if pool == f_max:
         if s != 0:
             return
-    elif not growing(t_state[pool], IP[IP_GROW_AFTER_ATTACH], t_regrow[pool]):
+    elif (not growing(t_state[pool], IP[IP_GROW_AFTER_ATTACH], t_regrow[pool])) or t_stalled[pool] != 0:
         return
     frame = cnt[CNT_FRAME]
     step = frame * s_max + s
@@ -1095,6 +1152,7 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
                    t_regrow: wp.array(dtype=int), t_regrow_frame: wp.array(dtype=int),
                    t_leader_frame: wp.array(dtype=int), t_prune_side: wp.array(dtype=int),
                    t_foot2: wp.array(dtype=int), t_brush: wp.array(dtype=int),
+                   t_stalled: wp.array(dtype=int),
                    stage_min: wp.array(dtype=float), stage_max: wp.array(dtype=float),
                    slot: wp.array(dtype=wp.int64),
                    c_f: int, f_max: int, k: int, s_max: int, s: int):
@@ -1146,7 +1204,8 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
             t_new[t] = -1
             if growing(t_state[t], IP[IP_GROW_AFTER_ATTACH], t_regrow[t]):
                 t_starve[t] = t_starve[t] + 1
-                if t_state[t] == GROW and t_starve[t] >= IP[IP_STARVE_STEPS] and \
+                stalled_ok = IP[IP_ENABLE_REROUTE] != 0 and t_timer[t] > 0.0     # a partial channel outlives its stall
+                if t_state[t] == GROW and t_starve[t] >= IP[IP_STARVE_STEPS] and not stalled_ok and \
                         float(frame - t_birth[t]) * P[P_DT] > P[P_STARVE_AGE]:
                     t_state[t] = RETRACT
                     t_retract_len[t] = 0.0
@@ -1223,12 +1282,13 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
             t_foot[t] = -1
             t_foot_dir[t] = wp.vec3(0.0, 0.0, 0.0)
             t_stretch[t] = 1.0
-            t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP)
+            t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP, P[P_REROUTE_MEAN])
             t_regrow[t] = 0
             t_regrow_frame[t] = 0
             t_leader_frame[t] = 0
             t_prune_side[t] = 0
             t_brush[t] = 0
+            t_stalled[t] = 0
             for j in range(BRUSH_FEET):
                 t_foot2[t * BRUSH_FEET + j] = -1
             t_committed[f_max] = 1 + t
@@ -1236,7 +1296,7 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
             pp = cand_parent[my_c]
             parent[i] = pp
             s_arc[i] = s_arc[pp] + wp.length(x0 - pos[pp])
-            flags[i] = ALIVE | CHARGED
+            flags[i] = ALIVE | CHARGED | wp.where(t_brush[t] >= 2, CORAL, 0)     # a coral fork leader's node
             t_nodes[t] = t_nodes[t] + 1
             t_L[t] = wp.max(t_L[t], s_arc[i])
             t_committed[t] = 1
@@ -1248,12 +1308,13 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
             flags[i] = flags[i] | FOOT
             if t_state[t] != ATTACHED:
                 t_state[t] = ATTACHED
+                t_stalled[t] = 0
                 t_foot[t] = i
                 t_foot_dir[t] = wp.normalize(x0)
                 t_ring_age[t] = 0.0
                 t_chord[t] = wp.length(x0 - pos[t_root[t]])
                 t_stretch[t] = 1.0
-                t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP)
+                t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP, P[P_REROUTE_MEAN])
                 t_prune_side[t] = 1
             elif t_regrow[t] == 1 and t_brush[t] != 0:
                 # a brush leader reached the glass: a secondary foot of the same channel; the
@@ -1278,7 +1339,7 @@ def k_commit_spawn(P: wp.array(dtype=float), IP: wp.array(dtype=int), cnt: wp.ar
                 t_chord[t] = wp.length(x0 - pos[t_root[t]])
                 t_L[t] = s_arc[i]
                 t_stretch[t] = 1.0
-                t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP)
+                t_timer[t] = reroute_timer(IP[IP_SEED], step, t, SALT_TIMER_STEP, P[P_REROUTE_MEAN])
                 t_regrow[t] = 2
                 t_prune_side[t] = 1
     # spawn candidate kk of the new node
@@ -1587,7 +1648,7 @@ class Dbm:
         self.configure(E_ch=0.0, r1=r1, r2=r2, h=h, a=a_over_h * h, V=V_DEFAULT, T0=T0, E_bd0=E_BD0,
                        E_prop0=E_PROP0, eta=ETA, gamma=GAMMA, hf=H_F, dt=DT,
                        retract_speed=RETRACT_SPEED, starve_age=STARVE_AGE, I_sus=0.0,
-                       decay_time=DECAY_TIME, born_gain=BORN_GAIN, seed=seed, global_norm=0,
+                       decay_time=DECAY_TIME, born_gain=BORN_GAIN, reroute_mean=REROUTE_MEAN, seed=seed, global_norm=0,
                        use_sigma=0,
                        grow_after_attach=1, pause=0, enable_reroute=0, starve_steps=STARVE_STEPS,
                        images=images)
@@ -1653,6 +1714,7 @@ class Dbm:
         self.t_brush_req = wp.zeros(self.f_max, dtype=i32)
         self.t_foot2_drop = wp.zeros(self.f_max * BRUSH_FEET, dtype=i32)
         self.t_hold = wp.zeros(self.f_max, dtype=i32)
+        self.t_stalled = wp.zeros(self.f_max, dtype=i32)
         self.main_mark = wp.zeros(n, dtype=i32)
         self.t_tail = wp.zeros(self.f_max, dtype=i32)
         self.t_free_snapshot = wp.zeros(self.f_max, dtype=i32)
@@ -1697,7 +1759,7 @@ class Dbm:
                         self.t_ring_age, self.t_timer, self.t_starve, self.t_retract_len,
                         self.t_fork_s, self.t_fork_key, self.t_regrow, self.t_regrow_frame,
                         self.t_leader_frame, self.t_prune_side, self.main_mark, self.t_reroute_req,
-                        self.t_brush, self.t_brush_req, self.t_foot2_drop, self.t_hold, self.t_tail,
+                        self.t_brush, self.t_brush_req, self.t_foot2_drop, self.t_hold, self.t_stalled, self.t_tail,
                         self.t_free_snapshot,
                         self.t_committed, self.slot, self.cg, self.cg_b, self.cg_r, self.cg_z, self.cg_p, self.cg_Ap,
                         self.cg_part]
@@ -1714,7 +1776,7 @@ class Dbm:
     _P_KEYS = dict(r1=P_R1, r2=P_R2, h=P_H, a=P_A, V=P_V, T0=P_T0, E_bd0=P_E_BD0, E_prop0=P_E_PROP0,
                    eta=P_ETA, gamma=P_GAMMA, hf=P_HF, dt=P_DT, retract_speed=P_RETRACT_SPEED,
                    starve_age=P_STARVE_AGE, I_sus=P_I_SUS, decay_time=P_DECAY_TIME,
-                   born_gain=P_BORN_GAIN, E_ch=P_E_CH)
+                   born_gain=P_BORN_GAIN, E_ch=P_E_CH, reroute_mean=P_REROUTE_MEAN)
     _IP_KEYS = dict(seed=IP_SEED, global_norm=IP_GLOBAL_NORM, use_sigma=IP_USE_SIGMA,
                     grow_after_attach=IP_GROW_AFTER_ATTACH, pause=IP_PAUSE,
                     enable_reroute=IP_ENABLE_REROUTE, starve_steps=IP_STARVE_STEPS,
@@ -1837,7 +1899,7 @@ class Dbm:
                 self.t_L, self.t_chord, self.t_ring_age, self.t_timer, self.t_retract_len,
                 self.t_fork_s, self.t_stretch, self.t_fork_key, self.t_regrow, self.t_regrow_frame,
                 self.t_leader_frame, self.t_prune_side, self.main_mark, self.t_reroute_req,
-                self.t_foot2, self.t_brush, self.t_brush_req, self.t_foot2_drop, self.t_hold,
+                self.t_foot2, self.t_brush, self.t_brush_req, self.t_foot2_drop, self.t_hold, self.t_stalled,
                 self.t_free_snapshot, self.t_new, self.stage_min, self.stage_max, self.slot])
             wp.launch(k_node_frame, dim=n, inputs=[
                 self.P, self.IP, self.cnt, self.flags, self.tree, self.s_arc, self.stamp, self.q,
@@ -1851,7 +1913,7 @@ class Dbm:
                 self.cand_parent, self.cand_alive, self.cand_stamp, self.t_state, self.t_nodes,
                 self.t_L, self.t_fork_s, self.t_fork_key, self.t_tip, self.t_tail, self.t_new,
                 self.t_regrow, self.t_leader_frame, self.t_prune_side, self.t_foot, self.t_foot_dir,
-                self.t_starve, self.t_foot2, self.t_brush, c_f, k, n])
+                self.t_starve, self.t_foot2, self.t_brush, self.t_stalled, c_f, k, n])
             wp.launch(k_electrode_pool, dim=self.e_pool, inputs=[
                 self.P, self.IP, self.cnt, self.cand_pos, self.cand_parent, self.cand_alive,
                 self.cand_stamp, c_max, self.e_pool])
@@ -1884,7 +1946,7 @@ class Dbm:
         wp.launch(k_update_key, dim=self.c_total, inputs=[
             self.P, self.IP, self.cnt, self.pos, self.q, self.t_state, self.t_new, self.t_committed,
             self.t_tail, self.t_free_snapshot, self.cand_pos, self.cand_phi, self.cand_alive,
-            self.cand_stamp, self.cand_s, self.cand_T, self.t_regrow, self.hot_p0, self.hot_p1,
+            self.cand_stamp, self.cand_s, self.cand_T, self.t_regrow, self.t_stalled, self.hot_p0, self.hot_p1,
             self.hot_r, self.hot_T, self.stage_min, self.stage_max, self.slot, c_f, c_max, f, k, s_max, s])
         wp.launch_tiled(k_commit_spawn, dim=[f * k], block_dim=SPAWN_TILE, inputs=[
             self.P, self.IP, self.cnt, self.admit, self.pos, self.prev_pos, self.parent, self.tree,
@@ -1895,7 +1957,7 @@ class Dbm:
             self.t_ring_age, self.t_starve, self.t_starve_I, self.t_retract_len, self.t_fork_s,
             self.t_timer, self.t_stretch, self.t_tail, self.t_new, self.t_free_snapshot,
             self.t_committed, self.t_regrow, self.t_regrow_frame, self.t_leader_frame, self.t_prune_side,
-            self.t_foot2, self.t_brush, self.stage_min, self.stage_max, self.slot, c_f, f, k, s_max, s])
+            self.t_foot2, self.t_brush, self.t_stalled, self.stage_min, self.stage_max, self.slot, c_f, f, k, s_max, s])
 
     def _matvec(self, v, out, init):
         wp.launch_tiled(k_matvec, dim=[self.n_max // ROWS], block_dim=TILE, inputs=[

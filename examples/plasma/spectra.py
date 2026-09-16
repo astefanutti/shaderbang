@@ -465,3 +465,277 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---- corona emission model: colour and brightness versus electron temperature ----------------------
+#
+# The renderer's colours come from a corona-model line spectrum instead of a neutral / ion blend
+# (2026-09-16, at the user's request for a physical colour law). In a weakly ionised channel the
+# emissivity of a line k -> i is
+#
+#     eps_ki = n_e n_0 X_k(Te) (A_ki / sum_j A_kj) h nu_ki / 4 pi
+#
+# with X_k the electron-impact excitation rate coefficient of the upper level k from the ground
+# state and A_ki / sum_j A_kj the branching ratio (corona equilibrium: every excitation is followed
+# by a radiative cascade, collisional de-excitation is negligible at n_e ~ 1e13-1e14 cm^-3, far
+# below the ~1e17 cm^-3 LTE threshold for the np levels). X_k is taken as C g_k exp(-E_k / Te)
+# (threshold behaviour of the excitation cross-sections, statistical weight of the level; the
+# level-dependent prefactors of the true cross-sections are not available and are the main
+# approximation). The spectrum of a gas mixture at electron temperature Te is then
+#
+#     S(lambda; Te) = sum_species x_s sum_lines g_k exp(-E_k / Te) (A_ki / A_k) (hc / lambda) delta(lambda - lambda_ki)
+#
+# per unit n_e n_gas C, folded with the CIE colour matching functions -> XYZ -> linear sRGB. The
+# ion lines (Ne II, Xe II ...) are left out: their emissivity carries an extra factor
+# n_ion / n_0 ~ n_e / n_gas ~ 1e-9 in the time-averaged channel, so the visible light of a
+# noble-gas globe is neutral-line light plus a continuum. The continuum (bremsstrahlung and
+# radiative recombination, ~ n_e^2) is a second table entry: eps_lambda ~ lambda^-2 exp(-hc / (lambda Te)),
+# normalised to unit luminance; its gain relative to the lines is the one CHOSEN constant of the
+# model (``globe.C_CONT``), set so that a ~1 mA touched channel goes white.
+#
+# Electron temperature: Te = TE_LAW[gas].a * (E/N in Td)^TE_LAW[gas].b (eV). A two-parameter fit
+# standing in for the mean electron energy of a Boltzmann solver (BOLSIG+ style swarm data):
+# exponent 0.25 for every gas, prefactors in the order Ne > Ar > Kr > Xe (the heavier gases lose
+# energy to lower-lying levels). CHOSEN / calibrated: the neon prefactor is set so that a Ne + 2 %
+# Xe channel at the channel-phase field (~3 Td) is violet (Xe I blue ~ Ne I red), as the pink
+# globe of the recordings shows; the same law then makes the high-field regions (electrode glow
+# layer, feet) neon-red and the cool sheath bluer, which is what the close-ups measure.
+#
+# Data: ``data/nist_asd_lines.json`` = NIST Atomic Spectra Database lines (Kramida, Ralchenko,
+# Reader and the ASD team), query lines1.pl with format=2 (CSV), 200-2000 nm, Ne I / Ar I / Kr I /
+# Xe I, columns obs_wl_air, Aki, Ei, Ek (eV), g_i, g_k; ``fetch_asd()`` regenerates it. The full
+# wavelength range is needed for each level's total decay rate A_k (branching ratios); only the
+# 380-780 nm lines enter the colour.
+
+ASD_PATH = str(Path(__file__).resolve().parent / "data" / "nist_asd_lines.json")
+ASD_SPECIES = ("Ne I", "Ar I", "Kr I", "Xe I")
+ASD_URL = ("https://physics.nist.gov/cgi-bin/ASD/lines1.pl?spectra={spectra}&limits_type=0&low_w=200&upp_w=2000"
+           "&unit=1&submit=Retrieve+Data&de=0&format=2&line_out=0&en_unit=1&output=0&bibrefs=1&page_size=15"
+           "&show_obs_wl=1&show_calc_wl=1&unc_out=1&order_out=0&max_low_enrg=&show_av=2&max_upp_enrg="
+           "&tsb_value=0&min_str=&A_out=0&intens_out=on&max_str=&allowed_out=1&forbid_out=1&min_accur="
+           "&min_intens=&conf_out=on&term_out=on&enrg_out=on&J_out=on&g_out=on")
+MIXTURES = {                 # mole fractions per preset
+    "tyrian": {"Ne": 0.85, "Kr": 0.05, "Xe": 0.10},   # the recordings' pink "Tyrian purple" globe: fill unknown; CHOSEN so
+                                                      # that the channel (~2.5 eV) is lavender-blue and the hot regions
+                                                      # (electrode layer, feet, 5-9 eV) pink-red as the close-ups measure
+    "ne_xe": {"Ne": 0.98, "Xe": 0.02},          # PPPL-4485: Ne + a few % Xe
+    "ne": {"Ne": 1.0},
+    "ar": {"Ar": 1.0},
+    "kr": {"Kr": 1.0},
+    "xe": {"Xe": 1.0},
+    "coral": {"Kr": 1.0},                       # the green-white forking globes: no noble-gas line spectrum is green
+                                                # (a phosphor or another gas); krypton's brightness law with a CHOSEN
+                                                # fixed green-white chromaticity (CORAL_RGB) stands in
+}
+CORAL_RGB = (0.55, 1.00, 0.72)
+TE_LAW = {"Ne": (1.9, 0.25), "Ar": (1.5, 0.25), "Kr": (1.3, 0.25), "Xe": (1.1, 0.25)}   # Te (eV) = a (E/N Td)^b
+TE_GRID = np.exp(np.linspace(np.log(0.8), np.log(20.0), 64))       # eV, log-spaced table
+HC_EV_NM = 1239.84                                                   # h c in eV nm
+
+
+def _asd_cell(cell):
+    cell = cell.strip()
+    if cell.startswith('="'):
+        cell = cell[2:]
+    return cell.strip('"').strip()
+
+
+def parse_asd_csv(text):
+    """Rows [wl_nm, Aki, Ei_eV, Ek_eV, g_i, g_k, rel_int] of an ASD lines1.pl CSV (format=2) answer
+    (rel_int: NIST's observed relative intensity, letters stripped, 0 when absent); lines without an
+    observed wavelength or a transition probability are skipped."""
+    import csv
+    import io
+    rows = []
+    reader = csv.reader(io.StringIO(text))
+    header = None
+    for raw in reader:
+        if not raw:
+            continue
+        if header is None:
+            if raw[0].startswith("obs_wl"):
+                header = [h.strip() for h in raw]
+                idx = {name: header.index(name) for name in ("obs_wl_air(nm)", "Aki(s^-1)", "Ei(eV)", "Ek(eV)", "g_i", "g_k", "intens")}
+            continue
+        try:
+            wl = float(_asd_cell(raw[idx["obs_wl_air(nm)"]]))
+            aki = float(_asd_cell(raw[idx["Aki(s^-1)"]]))
+            ei = float(_asd_cell(raw[idx["Ei(eV)"]]).rstrip("?+x[]()"))
+            ek = float(_asd_cell(raw[idx["Ek(eV)"]]).rstrip("?+x[]()"))
+            gi = float(_asd_cell(raw[idx["g_i"]]) or 0.0)
+            gk = float(_asd_cell(raw[idx["g_k"]]) or 0.0)
+            digits = "".join(ch for ch in _asd_cell(raw[idx["intens"]]) if ch.isdigit() or ch == ".")
+            rel = float(digits) if digits else 0.0
+        except (ValueError, IndexError):
+            continue
+        if aki <= 0.0 or gk <= 0.0 or ek <= ei:
+            continue
+        rows.append([wl, aki, ei, ek, gi, gk, rel])
+    return rows
+
+
+def fetch_asd(path=ASD_PATH, timeout=120.0, cached_dir=None):
+    """Download the ASD line lists of ``ASD_SPECIES`` (or read them from ``cached_dir`` /<Sp_I>.csv)
+    and write ``path`` with provenance."""
+    import urllib.parse
+    out = {"provenance": {"source": "NIST Atomic Spectra Database (ver. 5), lines, A. Kramida, Yu. Ralchenko, J. Reader and NIST ASD Team, https://physics.nist.gov/asd",
+                          "query": ASD_URL, "fetched": datetime.date.today().isoformat(),
+                          "columns": ["obs_wl_air_nm", "Aki_s-1", "Ei_eV", "Ek_eV", "g_i", "g_k", "rel_int"],
+                          "range_nm": [200, 2000], "note": "lines without Aki or observed wavelength dropped"},
+           "lines": {}}
+    for sp in ASD_SPECIES:
+        if cached_dir is not None:
+            with open(Path(cached_dir) / (sp.replace(" ", "_") + ".csv"), "r", encoding="latin-1") as f:
+                text = f.read()
+        else:
+            url = ASD_URL.format(spectra=urllib.parse.quote_plus(sp))
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                text = r.read().decode("latin-1")
+        out["lines"][sp] = parse_asd_csv(text)
+    with open(path, "w") as f:
+        json.dump(out, f)
+    return out
+
+
+_ASD_CACHE = None
+
+
+def load_asd(path=ASD_PATH):
+    global _ASD_CACHE
+    if _ASD_CACHE is None:
+        with open(path, "r") as f:
+            _ASD_CACHE = json.load(f)
+    return _ASD_CACHE
+
+
+TE_REF = 3.0                 # eV: the electron temperature the NIST relative intensities are taken to describe
+
+
+def species_lines(element, data=None):
+    """(wl_nm, gk, Ek_eV, branching A_ki / A_k, rel_int) of the visible lines of the neutral
+    ``element``; A_k sums every listed decay of the upper level (levels identified by their energy)."""
+    data = data or load_asd()
+    rows = np.asarray(data["lines"][element + " I"], dtype=np.float64)
+    ek = np.round(rows[:, 3], 4)
+    a_tot = {}
+    for e, a in zip(ek, rows[:, 1]):
+        a_tot[e] = a_tot.get(e, 0.0) + a
+    vis = (rows[:, 0] >= 380.0) & (rows[:, 0] <= 780.0)
+    wl = rows[vis, 0]
+    gk = rows[vis, 5]
+    ekv = ek[vis]
+    branch = rows[vis, 1] / np.array([a_tot[e] for e in ekv])
+    return wl, gk, ekv, branch, rows[vis, 6]
+
+
+HANDBOOK_SELECTION = {"Ne": "persistent", "Ar": "all", "Kr": "all", "Xe": "all"}   # as the preset colours before
+
+
+def handbook_weights(element, wl_asd, tol_nm=0.08, data=None):
+    """NIST Handbook relative intensities (data/nist_lines.json, one curated reference per species,
+    the persistent lines for neon) matched by wavelength onto the ASD visible lines ``wl_asd``;
+    0 for unmatched lines. The ASD 'intens' column mixes references on different scales, the
+    Handbook table is the consistent one within a species."""
+    try:
+        hb = lines(element, 1, HANDBOOK_SELECTION.get(element, "all"), data)
+    except FileNotFoundError:
+        return np.zeros_like(wl_asd)
+    w = np.zeros_like(wl_asd)
+    for wl, rel in hb:
+        d = np.abs(wl_asd - wl)
+        j = int(np.argmin(d))
+        if d[j] <= tol_nm:
+            w[j] = max(w[j], rel)
+    return w
+
+
+def species_spectrum(element, te_ev, data=None):
+    """(wl_nm, power per line) of the neutral ``element`` at electron temperature(s) ``te_ev``
+    (array (T,) -> (T, L)), per unit n_e n_gas C.
+
+    Two ingredients: the corona model sets the species' total visible emission,
+    S(Te) = sum_k g_k exp(-E_k / Te) (A_ki / A_k) hc / lambda (statistical excitation, radiative
+    cascade), which is what makes neon and a 2 % xenon admixture comparable; the distribution of
+    that total over the lines follows the NIST Handbook's observed relative intensities (a glow /
+    arc discharge, taken to be at TE_REF; ``handbook_weights``) extrapolated to Te with each line's
+    Boltzmann factor,
+    w_ki(Te) = rel_ki exp(-E_k (1/Te - 1/TE_REF)). The pure statistical distribution over-weights
+    neon's green and yellow 3p -> 3s lines (level-specific excitation cross-sections differ by an
+    order of magnitude; they are not in the data), which the observed intensities correct."""
+    te = np.atleast_1d(np.asarray(te_ev, dtype=np.float64))
+    wl, gk, ek, branch, _rel_asd = species_lines(element, data)
+    rel = handbook_weights(element, wl)
+    corona = (gk * branch * HC_EV_NM / wl)[None, :] * np.exp(-ek[None, :] / te[:, None])          # (T, L)
+    total = corona.sum(axis=1, keepdims=True)
+    has = rel > 0.0
+    if has.sum() >= 3:
+        w = np.where(has[None, :], rel[None, :] * np.exp(-ek[None, :] * (1.0 / te[:, None] - 1.0 / TE_REF)), 0.0)
+        w = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-300)
+        return wl, total * w
+    return wl, corona
+
+
+def emission_xyz(mixture, te_ev, data=None):
+    """XYZ of the line spectrum of ``mixture`` ({element: mole fraction}) at ``te_ev`` (scalar or
+    array), per unit n_e n_gas C (see ``species_spectrum``)."""
+    te = np.atleast_1d(np.asarray(te_ev, dtype=np.float64))
+    xyz = np.zeros((3, te.size))
+    for element, x in mixture.items():
+        wl, power = species_spectrum(element, te, data)
+        xyz += x * (cmf(wl) @ power.T)
+    return xyz if np.ndim(te_ev) else xyz[:, 0]
+
+
+def continuum_rgb(te_ev=3.0):
+    """Unit-luminance linear sRGB of a bremsstrahlung-shaped continuum at ``te_ev``:
+    eps_lambda ~ lambda^-2 exp(-hc / (lambda Te)) over 380-780 nm."""
+    wl = np.linspace(380.0, 780.0, 401)
+    s = wl ** -2.0 * np.exp(-HC_EV_NM / (wl * te_ev))
+    return normalise(gamut_map(xyz_to_rgb(cmf(wl) @ s)))
+
+
+def te_of(gas, en_td):
+    a, b = TE_LAW[gas]
+    return a * np.power(np.maximum(en_td, 1e-3), b)
+
+
+def majority_gas(name):
+    m = MIXTURES[name]
+    return max(m, key=m.get)
+
+
+def emission_table(name, te_grid=TE_GRID, data=None):
+    """{'te': (N,), 'rgb': (N, 3) linear sRGB line emission per unit n_e n_gas (gamut-mapped,
+    absolute scale shared by every mixture), 'cont': (3,) unit-luminance continuum colour,
+    'te_law': (a, b)} for the preset ``name``."""
+    global EMISSION_UNIT
+    if EMISSION_UNIT is None:
+        EMISSION_UNIT = _emission_unit()
+    xyz = emission_xyz(MIXTURES[name], te_grid, data)                 # (3, N)
+    rgb = np.stack([gamut_map(xyz_to_rgb(xyz[:, i])) for i in range(te_grid.size)])
+    if name == "coral":
+        rgb = np.array([normalise(np.asarray(CORAL_RGB)) * luminance(c) for c in rgb])
+    return {"te": np.asarray(te_grid), "rgb": rgb / EMISSION_UNIT, "cont": continuum_rgb(),
+            "te_law": TE_LAW[majority_gas(name)]}
+
+
+def _emission_unit():
+    """Luminance of the Ne + 2 % Xe spectrum at 3 eV: the unit of every table (numbers O(1))."""
+    try:
+        return luminance(gamut_map(xyz_to_rgb(emission_xyz(MIXTURES["ne_xe"], 3.0))))
+    except Exception:
+        return 1.0
+
+
+EMISSION_UNIT = None
+
+
+def print_emission_table(names=("tyrian", "ne_xe", "ne", "ar", "kr", "coral"), tes=(1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.0, 10.0), stream=sys.stdout):
+    print("corona-model colours (sRGB swatch, luminance per unit n_e n_gas relative to ne_xe at 3 eV):", file=stream)
+    for name in names:
+        t = emission_table(name, np.array(tes, dtype=np.float64))
+        cells = [f"{te:>4.1f} eV {srgb8(rgb)} Y {luminance(rgb):8.3g}" for te, rgb in zip(tes, t["rgb"])]
+        print(f"  {name:6s} Te law a {t['te_law'][0]} b {t['te_law'][1]}", file=stream)
+        for c in cells:
+            print("     " + c, file=stream)
+    print(f"  continuum swatch {srgb8(continuum_rgb())}", file=stream)

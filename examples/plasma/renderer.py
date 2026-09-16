@@ -32,14 +32,18 @@ from shaderbang.input import Input
 
 from plasma import publish, interop
 from plasma.circuit import SIG_MAX, F_MAX
+SIGE_CELLS = 64 * 32                             # plasma.globe.SIGE_NLON * SIGE_NLAT
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-PARAMS_BYTES = 320                               # Params UBO: 16 vec4 (camera, matrices, knobs) + 4 preset colours
-VIDEO_ANODE_COLOURS = ((0.52, 0.20, 1.00),        # electrode glow discharge (footage face (125,82,168) sRGB)
-                       (0.20, 0.08, 1.00),        # far haze around the bulb (deep violet)
-                       (0.55, 0.12, 1.00),        # near haze / sheath layer (violet-magenta)
-                       (1.00, 0.34, 0.72))        # feet and root pools (magenta)
+PARAMS_BYTES = 320 + 48 + 64 * 16                 # Params UBO: 16 vec4 (camera, matrices, knobs) + 4 anode colours
+                                                 # + 3 emission parameter vec4 + the 64-bin emission colour table
+# the corona emission model in the tracer (electrode glow layer, gas around the electrode):
+N0 = 98659.0 / (1.380649e-23 * 300.0)           # gas number density at 740 Torr, 300 K (m^-3)
+EN_ION = 100.0                                   # Td: Townsend-like ionisation scale of the gas around the electrode:
+                                                 # electrons ~ exp(-EN_ION / (E/N)); the close-ups' glow ends within 3.5 mm  CHOSEN
+K_FACE = 1.0e-4                                  # radiance of the glow layer per (A/m^2 x table unit)           CALIBRATED
+K_SHEATH = 0.005                                 # radiance per metre of the gas per (A/m^2 x table unit)         CALIBRATED
 GLOW_LEVELS = 6
 GLOW_TABLE_PX = (24, 32, 48, 64, 96, 128, 192)   # glow kernels fitted once; interpolated with the zoom
 R2O_M = 0.0775                                   # plasma.params.R2O: the globe's outer radius (m)
@@ -255,8 +259,10 @@ class Renderer(Input):
         self.buf_cell_items = GLBuffer(GL_SHADER_STORAGE_BUFFER, publish.ITEMS_MAX * 4, 4, wp.int32, (publish.ITEMS_MAX,))
         self.buf_lights = GLBuffer(GL_SHADER_STORAGE_BUFFER, publish.LIGHT_MAX * 3 * 16, 5, wp.vec4, (publish.LIGHT_MAX * 3,))
         # SIG_MAX foot records + F_MAX root records, 2 vec4 each
-        self.buf_sigma = GLBuffer(GL_SHADER_STORAGE_BUFFER, (SIG_MAX + F_MAX) * 2 * 16, 6, wp.vec4, ((SIG_MAX + F_MAX) * 2,))
-        self.sigma_pack = wp.zeros((SIG_MAX + F_MAX) * 2, dtype=wp.vec4, device=pub.device)
+        n_sig = (SIG_MAX + F_MAX) * 2 + SIGE_CELLS // 4
+        self.buf_sigma = GLBuffer(GL_SHADER_STORAGE_BUFFER, n_sig * 16, 6, wp.vec4, (n_sig,))
+        # foot records, root records, then the electrode envelope's surface-charge grid (64 x 32 floats)
+        self.sigma_pack = wp.zeros((SIG_MAX + F_MAX) * 2 + SIGE_CELLS // 4, dtype=wp.vec4, device=pub.device)
         # volume: the float16 RGBA staging grid is copied straight into the registered 3D texture
         n3 = publish.GRID_N
         self.tex_volume = texture3d(n3, GL_RGBA16F)
@@ -335,31 +341,33 @@ class Renderer(Input):
         counters = getattr(self.globe, "counters_now", None)
         i_tot_ma = float(counters()["i_tot"]) * 1e3 if counters is not None else 1.0
         blob[60:64] = (i_tot_ma, 0.0, 0.0, -1.0 if flags.invert else 1.0)
-        # the electrode glow, the haze around it, the sheath layer and the foot / root-pool colours
-        # follow the gas preset (the 'video' preset keeps the values calibrated on the footage)
-        for k, c in enumerate(self._preset_colours()):
+        # the anode colours the tracer's discs and spots use (from the preset's emission table at
+        # the glow-layer, far / near sheath and foot fields), then the emission model itself: the
+        # Te law, the electrode's surface reduced field from the voltage (concentric spheres:
+        # E = V R2 / (R1 (R2 - R1)) at R1, in Td), and the 64-bin colour table over log Te
+        for k, c in enumerate(getattr(self.globe, "anode_rgb", ((1.0, 0.1, 0.2), (0.6, 0.4, 1.0), (0.6, 0.4, 1.0), (1.0, 0.3, 0.6)))):
             blob[64 + 4 * k:67 + 4 * k] = c
+        table = getattr(self.globe, "emis_table", None)
+        if table is not None:
+            te = table["te"]; a, b = table["te_law"]
+            volts = float(self.globe.knobs.get("voltage", 5000.0))
+            r1, r2 = 0.011, 0.075
+            en_surf = volts * r2 / (r1 * (r2 - r1)) / N0 / 1.0e-21
+            blob[80:84] = (np.log(te[0]), np.log(te[-1]), a, b)
+            blob[84:88] = (en_surf, self.globe.EN_FACE, K_FACE, K_SHEATH)
+            blob[88:92] = (EN_ION, 0.0, 0.0, 0.0)
+            rgb = np.asarray(table["rgb"], np.float32)
+            blob[92:92 + 4 * rgb.shape[0]].reshape(-1, 4)[:, :3] = rgb
         return blob
-
-    def _preset_colours(self):
-        """(electrode, halo far, halo near / sheath, foot) linear rgb for the current gas preset."""
-        name = getattr(self.globe, "preset_name", "video")
-        if name == "video" or not hasattr(self.globe, "preset_rgb"):
-            return VIDEO_ANODE_COLOURS
-        neutral, ion = (np.asarray(c, np.float64) for c in self.globe.preset_rgb)
-        def unit(c):
-            c = np.maximum(c, 0.0); return c / max(float(c.max()), 1e-6)
-        n, i = unit(neutral), unit(ion)
-        return (unit(0.35 * n + 0.65 * i), i, unit(0.5 * n + 0.5 * i), n)
 
     def upload(self):
         """P0b: publish-stage arrays -> GL buffers / 3D texture (device-to-device)."""
         pub, cs = self.globe.pub, self.globe.circuit
         t = self.timers["upload"]; t.begin()
         e = self.globe.engine
-        wp.launch(self._sigma_pack_kernel, dim=SIG_MAX + F_MAX,
+        wp.launch(self._sigma_pack_kernel, dim=SIG_MAX + F_MAX + SIGE_CELLS // 4,
                   inputs=[cs.sig_dir, cs.sig_amp, cs.sig_radius, cs.sig_age, cs.sig_alive, cs.sig_I,
-                          e.t_state, e.t_root_dir, cs.tree_current, self.sigma_pack],
+                          e.t_state, e.t_root_dir, cs.tree_current, self.globe.sig_e, self.sigma_pack],
                   device=pub.device)
         sources = (pub.segments, pub.cell_start, pub.cell_count, pub.cell_items, pub.lights, self.sigma_pack)
         m = self.batch.map()
@@ -407,9 +415,10 @@ class Renderer(Input):
         dist = max(float(np.linalg.norm(eye_p)), 1e-3)
         r_px = (R2O_M / dist) / max(float(np.linalg.norm(cv_p)), 1e-6) * (self.ih / 2.0)
         self.ref_area = float(np.pi * r_px * r_px)
-        zoom = r_px / (GLOBE_REF_FRACTION * self.ih)
-        self._glow_gain_scale = min(1.0, zoom)
-        kernel = float(min(max(self.knobs["glow_width"] * zoom, 24.0), 192.0))
+        # the glare is the lens's, fixed in angle (pixels) whatever the zoom (it used to scale with the
+        # projected globe, which bathed close-ups in haze)
+        self._glow_gain_scale = 1.0
+        kernel = float(min(max(self.knobs["glow_width"], 24.0), 192.0))
         if abs(kernel - self._glow_kernel_now) > 0.06 * self._glow_kernel_now:
             self.glow_weights = self._glow_weights_for(kernel)
             self._glow_kernel_now = kernel
@@ -527,8 +536,14 @@ def _k_pack_sigma(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.f
                   sig_radius: wp.array(dtype=wp.float32), sig_age: wp.array(dtype=wp.float32),
                   sig_alive: wp.array(dtype=wp.int32), sig_I: wp.array(dtype=wp.float32),
                   tree_state: wp.array(dtype=wp.int32), tree_root_dir: wp.array(dtype=wp.vec3),
-                  tree_current: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.vec4)):
+                  tree_current: wp.array(dtype=wp.float32), sig_e: wp.array(dtype=wp.float32),
+                  out: wp.array(dtype=wp.vec4)):
     i = wp.tid()
+    if i >= SIG_MAX + F_MAX:
+        # the envelope's surface charge, four cells per vec4 after the records
+        c = (i - SIG_MAX - F_MAX) * 4
+        out[2 * (SIG_MAX + F_MAX) + (i - SIG_MAX - F_MAX)] = wp.vec4(sig_e[c], sig_e[c + 1], sig_e[c + 2], sig_e[c + 3])
+        return
     if i < SIG_MAX:
         d = sig_dir[i]
         out[2 * i] = wp.vec4(d[0], d[1], d[2], sig_amp[i])
