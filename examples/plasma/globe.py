@@ -30,7 +30,7 @@ from shaderbang.input import Input
 
 from plasma import circuit, dbm, gas, publish
 from plasma.params import (
-    T0, FOOT_RADIUS, TAU_ENV, D_SIGMA, C_D,
+    T0, FOOT_RADIUS, TAU_ENV, D_SIGMA, C_D, TAU_FINGER,
     ParamsBuffer, PlasmaParams, finger_dir, R1, R2I, CHARGE_RADIUS, NODE_SPACING, FINGER_HWHM,
     VOLT0, FREQ0, Q_FINGER0, V_CH, NODE_ALIVE, NODE_ROOT, NODE_FOOT, NODE_DECAYING,
 )
@@ -115,8 +115,11 @@ FOOT_CREEP = 0.0              # the gas velocity is zero at a wall (no-slip): an
 # boundary layer. The electrode is the hottest object in the globe (every current's sheath power lands
 # on it): its laminar free-convection layer carries the roots up the ball at mm/s (the recordings'
 # 7 mm/s at full power, 3 at low, 70 % upward), the outer glass sits within a kelvin of the gas.
-K_SIG = 4.5e-6                # m^2/s: creep mobility down the surface-charge gradient (sigma / sigma_sat per m -> m/s):
-                              # ~3 mm/s at the edge of a saturated 1.5 mm footprint                            CHOSEN
+K_SIG = 1.0e-5                # m^2/s: creep mobility down the surface-charge gradient (sigma / sigma_sat per m -> m/s).
+                              # The attachment re-ignites where the field is highest; its own footprint (radius ~1 mm)
+                              # charges in ~70 ms at 40 uA, so it steps a footprint radius per charging time: r^2 / tau
+                              # ~ 1.4e-5 m^2/s; a saturated footprint edge (gradient 1/mm) then moves it at ~10 mm/s
+                              # relative to the flow, where the recordings show the feet (weakly) wandering       DERIVED
 V_SHEATH = 150.0              # V: electrode sheath (fall) voltage, the normal cathode fall of neon (~130-150 V);
                               # P_ball = I_tot V_SHEATH heats the envelope                                          CHOSEN
 EPS_GLASS = 0.9               # emissivity of the envelope (radiative loss alongside the convection)
@@ -133,6 +136,8 @@ L_BASE = 15.0e-3              # m: the channel this close to the electrode re-fo
                               # attachment walks at the foot's tangential speed x R1 / (R1 + L_BASE): ~7 mm/s
 DELTA_BL = 5.0                # layer thickness delta = DELTA_BL R1 Gr^-1/4                                        CHOSEN
 SIGE_NLON, SIGE_NLAT = 64, 32 # the envelope's surface-charge grid (equirectangular, sigma / sigma_sat)
+SIGG_NLON, SIGG_NLAT = 160, 80    # the outer glass's surface-charge grid (2.9 mm cells at the equator): the feet
+                                  # charge it, the fingers drain it, the feet creep on it
 SIGE_FOOT_R = 1.0e-3          # m: a root's charging footprint on the envelope (the close-ups' spot e-fold 0.55 mm)
 SIGE_MEM = 1.0                # relative weight of the memory re-ignition on charged surface (tracer J_MEM)
 I_REROUTE_REF = 1.0e-3        # A: the re-strike timer's reference total current (REROUTE_MEAN at this drive)
@@ -283,63 +288,95 @@ def stencil_velocity(u: wp.array3d(dtype=wp.vec3), n: int, origin: wp.vec3, inv_
 
 
 @wp.func
-def sigma_e_cell(n: wp.vec3):
-    """Equirectangular cell coordinates (continuous) of the unit direction n on the envelope."""
+def sigma_grid_sample(sig: wp.array(dtype=wp.float32), nlon: int, nlat: int, n: wp.vec3) -> float:
+    """Bilinear sample of an equirectangular surface-charge grid at the unit direction n (longitude wraps)."""
     lon = wp.atan2(n[2], n[0])                                  # (-pi, pi]
     lat = wp.asin(wp.clamp(n[1], -1.0, 1.0))                    # [-pi/2, pi/2]
-    u = (lon / 6.283185307 + 0.5) * float(SIGE_NLON)
-    v = (lat / 3.14159265 + 0.5) * float(SIGE_NLAT)
-    return wp.vec2(u, v)
-
-
-@wp.func
-def sigma_e_sample(sig_e: wp.array(dtype=wp.float32), n: wp.vec3) -> float:
-    """Bilinear sample of the envelope's surface charge at the unit direction n (longitude wraps)."""
-    c = sigma_e_cell(n)
-    u = c[0] - 0.5
-    v = wp.clamp(c[1] - 0.5, 0.0, float(SIGE_NLAT - 1) - 1.0e-4)
+    u = (lon / 6.283185307 + 0.5) * float(nlon) - 0.5
+    v = wp.clamp((lat / 3.14159265 + 0.5) * float(nlat) - 0.5, 0.0, float(nlat - 1) - 1.0e-4)
     i0 = int(wp.floor(u))
     j0 = int(wp.floor(v))
     fu = u - float(i0)
     fv = v - float(j0)
-    ia = (i0 % SIGE_NLON + SIGE_NLON) % SIGE_NLON
-    ib = (ia + 1) % SIGE_NLON
-    j1 = wp.min(j0 + 1, SIGE_NLAT - 1)
-    return (sig_e[j0 * SIGE_NLON + ia] * (1.0 - fu) * (1.0 - fv) + sig_e[j0 * SIGE_NLON + ib] * fu * (1.0 - fv)
-            + sig_e[j1 * SIGE_NLON + ia] * (1.0 - fu) * fv + sig_e[j1 * SIGE_NLON + ib] * fu * fv)
+    ia = (i0 % nlon + nlon) % nlon
+    ib = (ia + 1) % nlon
+    j1 = wp.min(j0 + 1, nlat - 1)
+    return (sig[j0 * nlon + ia] * (1.0 - fu) * (1.0 - fv) + sig[j0 * nlon + ib] * fu * (1.0 - fv)
+            + sig[j1 * nlon + ia] * (1.0 - fu) * fv + sig[j1 * nlon + ib] * fu * fv)
 
 
 @wp.func
-def sigma_e_gradient(sig_e: wp.array(dtype=wp.float32), n: wp.vec3) -> wp.vec3:
-    """Tangential gradient of the envelope's surface charge (per metre) at the unit direction n."""
+def sigma_grid_gradient(sig: wp.array(dtype=wp.float32), nlon: int, nlat: int, radius: float, n: wp.vec3) -> wp.vec3:
+    """Tangential gradient (per metre) of a surface-charge grid on a sphere of ``radius`` at the unit direction n."""
     up = wp.vec3(0.0, 1.0, 0.0)
     if wp.abs(n[1]) > 0.99:
         up = wp.vec3(1.0, 0.0, 0.0)
     t1 = wp.normalize(up - wp.dot(up, n) * n)
     t2 = wp.cross(n, t1)
-    h = 0.5e-3 / R1                                              # 0.5 mm step, in radians
-    g1 = (sigma_e_sample(sig_e, wp.normalize(n + h * t1)) - sigma_e_sample(sig_e, wp.normalize(n - h * t1))) / (2.0 * h * R1)
-    g2 = (sigma_e_sample(sig_e, wp.normalize(n + h * t2)) - sigma_e_sample(sig_e, wp.normalize(n - h * t2))) / (2.0 * h * R1)
+    h = 0.5e-3 / radius                                          # 0.5 mm step, in radians
+    g1 = (sigma_grid_sample(sig, nlon, nlat, wp.normalize(n + h * t1)) - sigma_grid_sample(sig, nlon, nlat, wp.normalize(n - h * t1))) / (2.0 * h * radius)
+    g2 = (sigma_grid_sample(sig, nlon, nlat, wp.normalize(n + h * t2)) - sigma_grid_sample(sig, nlon, nlat, wp.normalize(n - h * t2))) / (2.0 * h * radius)
     return t1 * g1 + t2 * g2
 
 
 @wp.func
-def sigma_glass_gradient(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.float32),
-                         sig_alive: wp.array(dtype=wp.int32), n: wp.vec3) -> wp.vec3:
-    """Tangential gradient (per metre) of the outer glass's surface charge at the unit direction n:
-    the sum of the feet's Gaussian footprints (radius FOOT_RADIUS) from the circuit's records."""
-    g = wp.vec3(0.0, 0.0, 0.0)
-    s2 = FOOT_RADIUS * FOOT_RADIUS
-    for j in range(SIG_MAX):
-        if sig_alive[j] == 0 or sig_amp[j] <= 0.0:
-            continue
-        d = (n - sig_dir[j]) * R2I                               # chord offset on the glass (m)
-        d = d - wp.dot(d, n) * n                                 # tangential part
-        d2 = wp.dot(d, d)
-        if d2 > 25.0 * s2:
-            continue
-        g = g - d * (sig_amp[j] * wp.exp(-0.5 * d2 / s2) / s2)
-    return g
+def sigma_e_gradient(sig_e: wp.array(dtype=wp.float32), n: wp.vec3) -> wp.vec3:
+    return sigma_grid_gradient(sig_e, SIGE_NLON, SIGE_NLAT, R1, n)
+
+
+@wp.func
+def sigma_glass_gradient(sig_g: wp.array(dtype=wp.float32), n: wp.vec3) -> wp.vec3:
+    return sigma_grid_gradient(sig_g, SIGG_NLON, SIGG_NLAT, R2I, n)
+
+
+@wp.kernel
+def k_sigma_glass(params: wp.array(dtype=PlasmaParams),
+                  tree_state: wp.array(dtype=wp.int32), tree_foot_dir: wp.array(dtype=wp.vec3),
+                  tree_current: wp.array(dtype=wp.float32), tree_touch: wp.array(dtype=wp.float32),
+                  sig_prev: wp.array(dtype=wp.float32), sig_g: wp.array(dtype=wp.float32)):
+    """The outer glass's surface charge (sigma / sigma_sat, equirectangular): every attached foot
+    deposits under its footprint at the rate its current gives (radius FOOT_RADIUS, wider under a
+    finger whose contact spreads the surface discharge), a finger drains the barrier under it with
+    TAU_FINGER, the charge relaxes with TAU_ENV and spreads with D_SIGMA (Burin 2015). The feet creep
+    down its gradient; the circuit's footprint records stay for the growth weights."""
+    idx = wp.tid()
+    p = params[0]
+    if p.running == 0:
+        return
+    j = idx // SIGG_NLON
+    i = idx - j * SIGG_NLON
+    lon = (float(i) + 0.5) / float(SIGG_NLON) * 6.283185307 - 3.14159265
+    lat = (float(j) + 0.5) / float(SIGG_NLAT) * 3.14159265 - 1.570796327
+    n = wp.vec3(wp.cos(lat) * wp.cos(lon), wp.sin(lat), wp.cos(lat) * wp.sin(lon))
+    dt = p.dt
+    sigma_sat = C_D * wp.max(p.voltage, 1.0)
+    rate = float(0.0)
+    for k in range(F_MAX):
+        if tree_state[k] == 3 and tree_current[k] > 0.0:
+            c = wp.dot(n, tree_foot_dir[k])
+            d2 = 2.0 * R2I * R2I * wp.max(1.0 - c, 0.0)           # chord distance squared on the glass
+            rf = FOOT_RADIUS * (1.0 + 2.0 * wp.min(tree_touch[k], 1.0))
+            if d2 < 16.0 * rf * rf:
+                g0 = 1.0 / (2.0 * 3.14159265 * rf * rf)
+                rate += tree_current[k] * g0 / sigma_sat * wp.exp(-0.5 * d2 / (rf * rf))
+    # finger drain: the fingertip's conductivity bleeds the barrier under its contact patch
+    w = FINGER_HWHM / R2I
+    drain = float(0.0)
+    for f in range(p.num_fingers):
+        cf = wp.clamp(wp.dot(n, finger_dir(p, f)), -1.0, 1.0)
+        th = wp.acos(cf)
+        drain += wp.exp(-0.6931472 * (th / w) * (th / w))
+    d = 1.0 / TAU_ENV + drain / TAU_FINGER
+    amp_eq = rate / (rate + d)
+    v = amp_eq + (sig_prev[idx] - amp_eq) * wp.exp(-(rate + d) * dt)
+    dl = R2I * 3.14159265 / float(SIGG_NLAT)
+    a = wp.min(D_SIGMA * dt / (dl * dl), 0.2)
+    iw = (i + SIGG_NLON - 1) % SIGG_NLON
+    ie = (i + 1) % SIGG_NLON
+    jn = wp.max(j - 1, 0)
+    js = wp.min(j + 1, SIGG_NLAT - 1)
+    lap = sig_prev[j * SIGG_NLON + iw] + sig_prev[j * SIGG_NLON + ie] + sig_prev[jn * SIGG_NLON + i] + sig_prev[js * SIGG_NLON + i] - 4.0 * sig_prev[idx]
+    sig_g[idx] = wp.clamp(v + a * lap, 0.0, 1.0)
 
 
 @wp.func
@@ -461,9 +498,7 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
                    tree_state: wp.array(dtype=wp.int32),
                    tree_targets: wp.array(dtype=wp.vec3),
                    tree_radius: wp.array(dtype=wp.float32),
-                   sig_e: wp.array(dtype=wp.float32),
-                   sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.float32),
-                   sig_alive: wp.array(dtype=wp.int32)):
+                   sig_e: wp.array(dtype=wp.float32), sig_g: wp.array(dtype=wp.float32)):
     """Persistent channels ride the gas: x += u(x) dt; roots slide on the electrode (driven by
     the flow just above the no-slip layer), feet walk on the glass, everything stays inside the
     annulus. Under a finger the foot and the last FOLLOW_LEN of the channel are pulled towards
@@ -531,7 +566,7 @@ def k_advect_nodes(params: wp.array(dtype=PlasmaParams),
     if (f & NODE_FOOT) != 0:
         # the foot is a surface discharge on the outer glass: pinned by its own footprint charge,
         # creeping down the gradient of the surface charge its neighbours and the old feet left
-        x = x - (K_SIG * p.dt) * sigma_glass_gradient(sig_dir, sig_amp, sig_alive, x / wp.max(wp.length(x), 1.0e-6))
+        x = x - (K_SIG * p.dt) * sigma_glass_gradient(sig_g, x / wp.max(wp.length(x), 1.0e-6))
     r = wp.length(x)
     if (f & NODE_FOOT) != 0:
         x = x * ((R2I - CHARGE_RADIUS) / wp.max(r, 1.0e-6))
@@ -779,6 +814,8 @@ class Globe(Input):
         self.morph = wp.zeros(4, dtype=wp.float32, device=d)                # [fork rate (1/s), fork max, roots max, -] (k_engine_hooks, circuit)
         self.sig_e = wp.zeros(SIGE_NLON * SIGE_NLAT, dtype=wp.float32, device=d)       # the envelope's surface charge
         self.sig_e_prev = wp.zeros(SIGE_NLON * SIGE_NLAT, dtype=wp.float32, device=d)
+        self.sig_g = wp.zeros(SIGG_NLON * SIGG_NLAT, dtype=wp.float32, device=d)         # the outer glass's surface charge
+        self.sig_g_prev = wp.zeros(SIGG_NLON * SIGG_NLAT, dtype=wp.float32, device=d)
         self.counters = wp.zeros(8, dtype=wp.float32, device=d)
         self.tree_foot2_dir = wp.zeros(F_MAX * dbm.BRUSH_FEET, dtype=wp.vec3, device=d)
         self.counters_host = wp.zeros(8, dtype=wp.float32, device="cpu", pinned=True)
@@ -859,9 +896,12 @@ class Globe(Input):
         wp.copy(self.sig_e_prev, self.sig_e)
         wp.launch(k_sigma_envelope, dim=SIGE_NLON * SIGE_NLAT,
                   inputs=[params, e.t_state, e.t_root_dir, cs.tree_current, self.sig_e_prev, self.sig_e], device=d)
+        wp.copy(self.sig_g_prev, self.sig_g)
+        wp.launch(k_sigma_glass, dim=SIGG_NLON * SIGG_NLAT,
+                  inputs=[params, e.t_state, e.t_foot_dir, cs.tree_current, cs.tree_touch, self.sig_g_prev, self.sig_g], device=d)
         wp.launch(k_advect_nodes, dim=n, inputs=[params, s0.u, s0.grid.n, s0.grid.origin, s0.grid.inv_dx, e.pos, e.flags,
                                                  e.tree, e.parent, e.t_state, cs.tree_targets, self.tree_radius, self.sig_e,
-                                                 cs.sig_dir, cs.sig_amp, cs.sig_alive], device=d)
+                                                 self.sig_g], device=d)
         wp.launch(k_base_restrike, dim=F_MAX,
                   inputs=[params, e.t_state, e.t_root, e.t_foot, e.t_tip, e.pos, e.parent, e.s_arc, self.sig_e], device=d)
         wp.launch(k_tree_frame_geometry, dim=F_MAX,
@@ -889,6 +929,8 @@ class Globe(Input):
         self.node_te.zero_()
         self.sig_e.zero_()
         self.sig_e_prev.zero_()
+        self.sig_g.zero_()
+        self.sig_g_prev.zero_()
         self.gas.sources.count.zero_()
 
     def capture(self):

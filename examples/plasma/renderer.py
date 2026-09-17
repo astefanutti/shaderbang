@@ -32,6 +32,7 @@ from shaderbang.input import Input
 
 from plasma import publish, interop
 from plasma.circuit import SIG_MAX, F_MAX
+from plasma.params import FOOT_RADIUS
 SIGE_CELLS = 64 * 32                             # plasma.globe.SIGE_NLON * SIGE_NLAT
 
 SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shaders")
@@ -367,7 +368,7 @@ class Renderer(Input):
         e = self.globe.engine
         wp.launch(self._sigma_pack_kernel, dim=SIG_MAX + F_MAX + SIGE_CELLS // 4,
                   inputs=[cs.sig_dir, cs.sig_amp, cs.sig_radius, cs.sig_age, cs.sig_alive, cs.sig_I,
-                          e.t_state, e.t_root_dir, cs.tree_current, self.globe.sig_e, self.sigma_pack],
+                          e.t_state, e.t_root_dir, cs.tree_current, cs.tree_touch, self.globe.sig_e, self.sigma_pack],
                   device=pub.device)
         sources = (pub.segments, pub.cell_start, pub.cell_count, pub.cell_items, pub.lights, self.sigma_pack)
         m = self.batch.map()
@@ -536,8 +537,8 @@ def _k_pack_sigma(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.f
                   sig_radius: wp.array(dtype=wp.float32), sig_age: wp.array(dtype=wp.float32),
                   sig_alive: wp.array(dtype=wp.int32), sig_I: wp.array(dtype=wp.float32),
                   tree_state: wp.array(dtype=wp.int32), tree_root_dir: wp.array(dtype=wp.vec3),
-                  tree_current: wp.array(dtype=wp.float32), sig_e: wp.array(dtype=wp.float32),
-                  out: wp.array(dtype=wp.vec4)):
+                  tree_current: wp.array(dtype=wp.float32), tree_touch: wp.array(dtype=wp.float32),
+                  sig_e: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.vec4)):
     i = wp.tid()
     if i >= SIG_MAX + F_MAX:
         # the envelope's surface charge, four cells per vec4 after the records
@@ -547,7 +548,13 @@ def _k_pack_sigma(sig_dir: wp.array(dtype=wp.vec3), sig_amp: wp.array(dtype=wp.f
     if i < SIG_MAX:
         d = sig_dir[i]
         out[2 * i] = wp.vec4(d[0], d[1], d[2], sig_amp[i])
-        out[2 * i + 1] = wp.vec4(sig_radius[i], float(sig_alive[i]), sig_age[i], sig_I[i] * 1.0e6)   # w: uA
+        # x: the foot's deposition radius for the tree records (FOOT_RADIUS, spread over the finger's
+        # contact under a touch: the fresh charge the barrier discharge re-ignites on), the ring
+        # radius for the orphans; w: the foot's current (uA)
+        rad = sig_radius[i]
+        if i < F_MAX:
+            rad = FOOT_RADIUS * (1.0 + 2.0 * wp.min(tree_touch[i], 1.0))
+        out[2 * i + 1] = wp.vec4(rad, float(sig_alive[i]), sig_age[i], sig_I[i] * 1.0e6)
     else:
         # root records: [root dir, I (uA)] [0, attached, 0, 0]
         t = i - SIG_MAX

@@ -652,24 +652,21 @@ Interior traceInterior(vec3 ro, vec3 rd, float t0, float t1) {
     return r;
 }
 
-// surface-charge foot discs on the inner glass at a wall hit point (unit direction n)
+// the feet on the inner glass at a wall hit point (unit direction n): a barrier discharge re-ignites
+// on the charge it deposited in the last half-cycles, so the glow on the glass is the foot's fresh
+// deposition footprint - the same Gaussian the surface-charge model deposits (radius FOOT_RADIUS,
+// spread over the finger's contact under a touch, amplitude proportional to the current), in the
+// gas's colour at the foot's field; the accumulated, spread charge (centimetres wide) does not glow
+const float K_FOOT = 0.08;                                        // radiance per (I / 40 uA) at the footprint's centre, before radScale  CALIBRATED
 vec3 footGlow(vec3 n) {
     vec3 sum = vec3(0.0);
-    for (int i = 0; i < SIG_MAX; ++i) {
+    for (int i = 0; i < F_MAX; ++i) {                                // the tree records (the orphans no longer deposit)
         vec4 rec = sigma[2 * i];
         vec4 rec2 = sigma[2 * i + 1];
-        if (rec2.y < 0.5 || rec.w <= 0.0) continue;
-        float theta = acos(clamp(dot(n, rec.xyz), -1.0, 1.0));
-        // the surface discharge at the foot: size and brightness follow the foot's current (rec2.w,
-        // uA): a thin filament ends in a faint 1.5 mm spot, a touched one in a bright ~6 mm blob
-        float iRel = rec2.w / 50.0;
-        if (iRel <= 0.0) continue;
-        float sig = clamp(0.002 * pow(iRel, 0.6), 0.0012, 0.012) / R2I;   // 1.7 mm at 40 uA; ~6 mm under a finger (the footage's pink patch on the glass)
-        float disc = exp(-0.5 * theta * theta / (sig * sig));
-        // no negative light: the old "dark annulus" term subtracted a grey ring from whatever lay in
-        // front of the far wall, which clipped the red and green of dim filament pixels to zero and
-        // left pure-blue patches along the filaments (the blue/purple striping)
-        sum += disc * colFoot.rgb * (0.08 * iRel);
+        if (rec2.y < 0.5 || rec2.w <= 0.0) continue;
+        float d2 = 2.0 * R2I * R2I * max(1.0 - dot(n, rec.xyz), 0.0);   // chord distance squared on the glass
+        float rf = max(rec2.x, 1.0e-4);
+        sum += colFoot.rgb * (K_FOOT * (rec2.w / 40.0) * exp(-0.5 * d2 / (rf * rf)));
     }
     return sum;
 }

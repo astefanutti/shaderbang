@@ -933,3 +933,27 @@ discharge re-bridges the region radially, from the envelope to the foot of the a
   hot, U 21 mm/s, δ 15 mm.
 * Measured (tyrian, 5 kV, 180 frames): roots 8.6 mm/s median, 99 % up, p10–p90 +1.4 … +12.2
   (recordings 7.3, 70 % up); feet 0.1 mm/s.
+
+### Twenty-seventh pass — the outer glass as a charged surface (2026-09-16)
+
+Of the three items tried after pass 26 the user kept this one; the others (the glow layer from the
+majority gas's normal cathode fall and the halo from Townsend's excitation constant, a negative-glow
+layer continuous into the gas, a 7/2 channel profile for the sheath, a lower glare share) read worse
+live and sit in a stash with their measurements; the analysis they came from stands: the light in
+the gas around the anode is the filaments (real ring 1.05–1.3 R1: 36 % of the azimuth below half the
+median, floor 1/500 of the peaks; ours had a uniform floor at 1/20 from the channel profile's
+power-law wings and the glare).
+
+* **The outer glass charges** (`k_sigma_glass`, 160 × 80 equirectangular cells): every attached foot
+  deposits under its footprint (`FOOT_RADIUS`, 3× wider under a finger whose contact spreads the
+  surface discharge), the fingers drain (`TAU_FINGER`), the charge relaxes and spreads (`TAU_ENV`,
+  `D_SIGMA`); the feet creep on its gradient (the Gaussian-record gradient is gone; the circuit's
+  footprint records stay for the growth weights). One grid sampler / gradient serves both spheres.
+* **The glow on the glass is the fresh deposition footprint**: a barrier discharge re-ignites on the
+  charge of the last half-cycles, not on the centimetre-wide spread charge (which rendered as pink
+  blotches when tried), so `footGlow` draws the same Gaussian the model deposits, amplitude ∝ the
+  foot's current, radius carried in the tree records (wider under a touch), in the gas's colour at the
+  foot's field; the old size-versus-current law is gone.
+* **Creep mobility derived**: `K_SIG` 4.5e-6 → 1e-5 m²/s (footprint radius² over its charging time).
+  Measured: roots 8.3 mm/s median, 99 % up; feet 0.1 mm/s, 62 % up (was 86 %): the feet wander, the
+  recordings' 30 % downward root motion still does not appear.
